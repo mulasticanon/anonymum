@@ -7,8 +7,16 @@
 //! are ported from `crates/core/tests/protocol.rs`.
 //!
 //! Differences from the in-process simulation, stated plainly:
-//! * Escrow is a balance hold (`HoldReason::ContactEscrow`), the reward pool
-//!   is the pallet's account, and burns reduce total issuance.
+//! * Escrow and storage deposits are balance holds (`HoldReason`), the
+//!   reward pool is the pallet's account, and burns reduce total issuance.
+//! * Invite proofs: the crates verify with `ed25519-dalek`'s
+//!   `verify_strict`; this pallet uses the host function
+//!   `sp_io::crypto::ed25519_verify`, which accepts some signatures that
+//!   `verify_strict` rejects (e.g. non-canonical encodings). Only the invite's
+//!   owner chooses the key, so this is not exploitable today, but the two
+//!   are not byte-for-byte the same check (audit F6).
+//! * Balances are `u128` in the simulation, this pallet's mock and the dev
+//!   runtime. (The runtime used `u64` until audit F6.)
 //! * Accounts must keep the existential deposit: payments use
 //!   `Preservation::Preserve`.
 //! * Expiry uses a queue per block instead of scanning every request, so at
@@ -18,6 +26,8 @@
 //!   the chain's own transaction (inclusion) fee is still charged, as on any
 //!   Substrate chain.
 //! * Weights are placeholders, not benchmarks.
+//! * If returning or burning a held amount ever fails (it should not), the
+//!   call carries on, logs an error and emits `HoldNotReleased` (audit F5).
 //!
 //! Storage is deliberately thin: roadmap step 5 (shielded channel opening)
 //! replaces the channel, request and block tables.
@@ -57,6 +67,8 @@ pub const SEALED_NOTE_LEN: u32 = 427;
 
 /// Basis points per whole (100%).
 pub const BPS_DENOMINATOR: u16 = 10_000;
+
+const LOG_TARGET: &str = "runtime::anonymum";
 
 #[frame::pallet]
 pub mod pallet {
@@ -115,6 +127,16 @@ pub mod pallet {
         /// Most requests that may expire in one block.
         #[pallet::constant]
         type MaxRequestsPerBlock: Get<u32>;
+        /// Refundable deposit held for each registered invite (audit F3).
+        #[pallet::constant]
+        type InviteDeposit: Get<BalanceOf<Self>>;
+        /// Refundable deposit held for each block entry, including the one
+        /// `close_channel` creates.
+        #[pallet::constant]
+        type BlockDeposit: Get<BalanceOf<Self>>;
+        /// Refundable deposit held for a published messaging key.
+        #[pallet::constant]
+        type KeyDeposit: Get<BalanceOf<Self>>;
     }
 
     #[pallet::pallet]
@@ -124,6 +146,12 @@ pub mod pallet {
     pub enum HoldReason {
         /// A stranger's payment, held until the recipient answers.
         ContactEscrow,
+        /// Deposit for a registered invite.
+        InviteDeposit,
+        /// Deposit for a block entry.
+        BlockDeposit,
+        /// Deposit for a published messaging key.
+        KeyDeposit,
     }
 
     #[derive(Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo, Clone, Copy, PartialEq, Eq, Debug)]
@@ -147,10 +175,20 @@ pub mod pallet {
     }
 
     #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-    pub struct Invite<BlockNumber> {
+    pub struct Invite<BlockNumber, Balance> {
         pub expires_at: Option<BlockNumber>,
         /// Only an invite issued after a block can lift it.
         pub seq: u64,
+        /// Held from the owner; returned when used, revoked or removed.
+        pub deposit: Balance,
+    }
+
+    #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
+    pub struct BlockEntry<Balance> {
+        /// When the block was made (see `Invite::seq`).
+        pub seq: u64,
+        /// Held from the blocker; returned when the block is lifted or cleared.
+        pub deposit: Balance,
     }
 
     #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
@@ -171,9 +209,11 @@ pub mod pallet {
     }
 
     #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-    pub struct PublishedKey<Signature> {
+    pub struct PublishedKey<Signature, Balance> {
         pub key: MessagingKey,
         pub binding: Signature,
+        /// Held from the owner; carried over when the key is replaced.
+        pub deposit: Balance,
     }
 
     type RequestOf<T> = ContactRequest<
@@ -190,7 +230,7 @@ pub mod pallet {
 
     #[pallet::storage]
     pub type MessagingKeys<T: Config> =
-        StorageMap<_, Blake2_128Concat, T::AccountId, PublishedKey<T::Signature>>;
+        StorageMap<_, Blake2_128Concat, T::AccountId, PublishedKey<T::Signature, BalanceOf<T>>>;
 
     #[pallet::storage]
     /// (owner, invite key) -> invite. Keyed by owner too, so nobody can
@@ -201,7 +241,7 @@ pub mod pallet {
         T::AccountId,
         Blake2_128Concat,
         InviteKey,
-        Invite<BlockNumberFor<T>>,
+        Invite<BlockNumberFor<T>, BalanceOf<T>>,
     >;
 
     #[pallet::storage]
@@ -235,7 +275,7 @@ pub mod pallet {
     /// (blocker, blocked) -> sequence number when the block was made.
     #[pallet::storage]
     pub type Blocks<T: Config> =
-        StorageDoubleMap<_, Blake2_128Concat, T::AccountId, Blake2_128Concat, T::AccountId, u64>;
+        StorageDoubleMap<_, Blake2_128Concat, T::AccountId, Blake2_128Concat, T::AccountId, BlockEntry<BalanceOf<T>>>;
 
     #[pallet::storage]
     pub type NextId<T> = StorageValue<_, u64, ValueQuery>;
@@ -251,6 +291,10 @@ pub mod pallet {
         MessagingKeyPublished { who: T::AccountId, key: MessagingKey },
         InviteRegistered { owner: T::AccountId, key: InviteKey },
         InviteRevoked { owner: T::AccountId, key: InviteKey },
+        ExpiredInviteRemoved { owner: T::AccountId, key: InviteKey, by: T::AccountId },
+        /// A held amount could not be returned or burned as expected. The
+        /// call went on; the hold is still on `who`'s account (audit F5).
+        HoldNotReleased { who: T::AccountId, amount: BalanceOf<T> },
         ContactRequested {
             request: RequestId,
             from: T::AccountId,
@@ -300,6 +344,8 @@ pub mod pallet {
         NotBlocked,
         /// Too many requests already expire in the target block.
         ExpiryQueueFull,
+        /// The invite has no expiry, or it has not passed yet.
+        InviteNotExpired,
     }
 
     #[pallet::hooks]
@@ -359,7 +405,13 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(binding.verify(&key_binding_message(&key)[..], &who), Error::<T>::BadKeyBinding);
-            MessagingKeys::<T>::insert(&who, PublishedKey { key, binding });
+            // One deposit per key: return the old one, hold the current one.
+            if let Some(old) = MessagingKeys::<T>::get(&who) {
+                Self::release_hold(HoldReason::KeyDeposit, &who, old.deposit);
+            }
+            let deposit = T::KeyDeposit::get();
+            Self::hold(HoldReason::KeyDeposit, &who, deposit)?;
+            MessagingKeys::<T>::insert(&who, PublishedKey { key, binding, deposit });
             Self::deposit_event(Event::MessagingKeyPublished { who, key });
             Ok(())
         }
@@ -374,8 +426,10 @@ pub mod pallet {
         ) -> DispatchResult {
             let owner = ensure_signed(origin)?;
             ensure!(!Invites::<T>::contains_key(&owner, key), Error::<T>::InviteAlreadyRegistered);
+            let deposit = T::InviteDeposit::get();
+            Self::hold(HoldReason::InviteDeposit, &owner, deposit)?;
             let seq = Self::take_seq();
-            Invites::<T>::insert(&owner, key, Invite { expires_at, seq });
+            Invites::<T>::insert(&owner, key, Invite { expires_at, seq, deposit });
             Self::deposit_event(Event::InviteRegistered { owner, key });
             Ok(())
         }
@@ -386,8 +440,28 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             // Only the owner's own entry can be found, so only the owner can
             // revoke it.
-            ensure!(Invites::<T>::take(&who, key).is_some(), Error::<T>::UnknownInvite);
+            let invite = Invites::<T>::take(&who, key).ok_or(Error::<T>::UnknownInvite)?;
+            Self::release_hold(HoldReason::InviteDeposit, &who, invite.deposit);
             Self::deposit_event(Event::InviteRevoked { owner: who, key });
+            Ok(())
+        }
+
+        /// Anyone may remove an invite past its `expires_at`; the deposit
+        /// goes back to the owner, not the caller.
+        #[pallet::call_index(12)]
+        #[pallet::weight(placeholder::<T>(1, 2))]
+        pub fn remove_expired_invite(
+            origin: OriginFor<T>,
+            owner: T::AccountId,
+            key: InviteKey,
+        ) -> DispatchResult {
+            let by = ensure_signed(origin)?;
+            let invite = Invites::<T>::get(&owner, key).ok_or(Error::<T>::UnknownInvite)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(invite.expires_at.is_some_and(|deadline| now > deadline), Error::<T>::InviteNotExpired);
+            Invites::<T>::remove(&owner, key);
+            Self::release_hold(HoldReason::InviteDeposit, &owner, invite.deposit);
+            Self::deposit_event(Event::ExpiredInviteRemoved { owner, key, by });
             Ok(())
         }
 
@@ -408,8 +482,8 @@ pub mod pallet {
             let invite = Invites::<T>::get(&recipient, key).ok_or(Error::<T>::UnknownInvite)?;
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(invite.expires_at.map_or(true, |deadline| now <= deadline), Error::<T>::InviteExpired);
-            if let Some(blocked_at) = Blocks::<T>::get(&recipient, &opener) {
-                ensure!(invite.seq >= blocked_at, Error::<T>::Blocked);
+            if let Some(block) = Blocks::<T>::get(&recipient, &opener) {
+                ensure!(invite.seq >= block.seq, Error::<T>::Blocked);
             }
             let message = invite_message(&opener.encode(), &recipient.encode());
             ensure!(
@@ -421,7 +495,9 @@ pub mod pallet {
                 Error::<T>::BadInviteProof
             );
             Self::pay_network_fee(&opener, T::InviteOpenFee::get())?;
+            // One-time use: the invite goes, its deposit returns to the owner.
             Invites::<T>::remove(&recipient, key);
+            Self::release_hold(HoldReason::InviteDeposit, &recipient, invite.deposit);
             if let Some(id) = RequestByPair::<T>::get(pair::<T>(&opener, &recipient)) {
                 Self::refund(id, RefundReason::Superseded);
             }
@@ -514,7 +590,9 @@ pub mod pallet {
             ensure!(who == ch.a || who == ch.b, Error::<T>::NotParticipant);
             let other = if who == ch.a { ch.b.clone() } else { ch.a.clone() };
             Self::remove_channel(channel, &ch, who.clone());
-            Self::add_block(who, other);
+            // The automatic block takes a deposit like any other block; if the
+            // closer cannot pay it, the whole call fails and nothing changes.
+            Self::add_block(who, other)?;
             Ok(())
         }
 
@@ -546,7 +624,7 @@ pub mod pallet {
                     Self::refund(id, reason);
                 }
             }
-            Self::add_block(who, target);
+            Self::add_block(who, target)?;
             Ok(())
         }
 
@@ -554,7 +632,8 @@ pub mod pallet {
         #[pallet::weight(placeholder::<T>(1, 1))]
         pub fn unblock(origin: OriginFor<T>, target: T::AccountId) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            ensure!(Blocks::<T>::take(&who, &target).is_some(), Error::<T>::NotBlocked);
+            let entry = Blocks::<T>::take(&who, &target).ok_or(Error::<T>::NotBlocked)?;
+            Self::release_hold(HoldReason::BlockDeposit, &who, entry.deposit);
             Self::deposit_event(Event::Unblocked { by: who, target, reason: UnblockReason::Lifted });
             Ok(())
         }
@@ -614,10 +693,17 @@ pub mod pallet {
                 }
             };
             let amount = req.price - burned;
-            let reason_hold = HoldReason::ContactEscrow.into();
-            // Both cannot fail: exactly `price` is on hold for this request.
-            let _ = T::Currency::burn_held(&reason_hold, &req.from, burned, Precision::Exact, Fortitude::Force);
-            let _ = T::Currency::release(&reason_hold, &req.from, amount, Precision::Exact);
+            // Exactly `price` is on hold for this request, so neither step
+            // should fail. If one does, carry on (this may run in
+            // `on_initialize`, which cannot fail) but make it visible.
+            let escrow = HoldReason::ContactEscrow.into();
+            if let Err(error) =
+                T::Currency::burn_held(&escrow, &req.from, burned, Precision::Exact, Fortitude::Force)
+            {
+                log::error!(target: LOG_TARGET, "request {id}: burning the decline fee failed: {error:?}");
+                Self::deposit_event(Event::HoldNotReleased { who: req.from.clone(), amount: burned });
+            }
+            Self::release_hold(HoldReason::ContactEscrow, &req.from, amount);
             Self::deposit_event(Event::RequestRefunded { request: id, to: req.from, amount, burned, reason });
         }
 
@@ -625,7 +711,8 @@ pub mod pallet {
         fn open_channel(a: T::AccountId, b: T::AccountId, via: OpenedVia) {
             let (a, b) = pair::<T>(&a, &b);
             for (blocker, target) in [(&a, &b), (&b, &a)] {
-                if Blocks::<T>::take(blocker, target).is_some() {
+                if let Some(entry) = Blocks::<T>::take(blocker, target) {
+                    Self::release_hold(HoldReason::BlockDeposit, blocker, entry.deposit);
                     Self::deposit_event(Event::Unblocked {
                         by: blocker.clone(),
                         target: target.clone(),
@@ -646,10 +733,28 @@ pub mod pallet {
             Self::deposit_event(Event::ChannelClosed { channel, by });
         }
 
-        fn add_block(blocker: T::AccountId, target: T::AccountId) {
+        fn add_block(blocker: T::AccountId, target: T::AccountId) -> DispatchResult {
+            let deposit = T::BlockDeposit::get();
+            Self::hold(HoldReason::BlockDeposit, &blocker, deposit)?;
             let seq = Self::take_seq();
-            Blocks::<T>::insert(&blocker, &target, seq);
+            Blocks::<T>::insert(&blocker, &target, BlockEntry { seq, deposit });
             Self::deposit_event(Event::Blocked { by: blocker, target });
+            Ok(())
+        }
+
+        /// Hold a deposit; an account that cannot afford it gets
+        /// `InsufficientFunds` (and the whole call is rolled back).
+        fn hold(reason: HoldReason, who: &T::AccountId, amount: BalanceOf<T>) -> DispatchResult {
+            T::Currency::hold(&reason.into(), who, amount).map_err(|_| Error::<T>::InsufficientFunds.into())
+        }
+
+        /// Return a held amount. Should never fail; if it does, log it and
+        /// emit `HoldNotReleased` instead of failing (audit F5).
+        fn release_hold(reason: HoldReason, who: &T::AccountId, amount: BalanceOf<T>) {
+            if let Err(error) = T::Currency::release(&reason.into(), who, amount, Precision::Exact) {
+                log::error!(target: LOG_TARGET, "returning a {reason:?} hold of {amount:?} failed: {error:?}");
+                Self::deposit_event(Event::HoldNotReleased { who: who.clone(), amount });
+            }
         }
 
         fn take_id() -> u64 {

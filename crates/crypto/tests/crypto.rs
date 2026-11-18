@@ -15,6 +15,7 @@ fn real_invite_opens_channel_on_chain() {
     let (alice, bob) = (Identity::generate(), Identity::generate());
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
     chain.mint(alice.address(), 10 * COIN);
+    chain.mint(bob.address(), COIN); // invite deposit
 
     let invite = InviteSecret::generate();
     chain.apply(bob.address(), Tx::RegisterInvite { key: invite.public(), expires_at: None }).unwrap();
@@ -40,6 +41,7 @@ fn copied_or_tampered_invite_proof_fails() {
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
     chain.mint(mallory.address(), 10 * COIN);
     chain.mint(alice.address(), 10 * COIN);
+    chain.mint(bob.address(), COIN); // invite deposit
     let invite = InviteSecret::generate();
     chain.apply(bob.address(), Tx::RegisterInvite { key: invite.public(), expires_at: None }).unwrap();
     let proof = invite.sign_for(&alice.address(), &bob.address());

@@ -76,6 +76,7 @@ fn tampered_or_truncated_notes_are_rejected() {
 fn chain_accepts_a_real_binding_and_rejects_someone_elses() {
     let (bob, carol) = (Identity::generate(), Identity::generate());
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
+    chain.mint(bob.address(), COIN); // messaging-key deposit
 
     // Carol tries to publish Bob's key (with Bob's valid binding) as her own.
     let err = chain.apply(carol.address(), bob.publish_key_tx()).unwrap_err();
@@ -90,6 +91,7 @@ fn chain_accepts_a_real_binding_and_rejects_someone_elses() {
 fn stranger_flow_through_the_chain_with_real_keys() {
     let (bob, carol) = (Identity::generate(), Identity::generate());
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
+    chain.mint(bob.address(), COIN); // messaging-key deposit
     chain.mint(carol.address(), 10 * COIN);
     chain.apply(bob.address(), bob.publish_key_tx()).unwrap();
 

@@ -14,5 +14,8 @@ cd ~/anonymum-node
 cp "$wasm" runtime.wasm
 ./polkadot-omni-node chain-spec-builder -c chain_spec.json create -t development -c dev -p 1000 \
   -n "Anonymum Dev" -i anonymum_dev --runtime runtime.wasm named-preset development
+# DEV ONLY. RPC listens on localhost with the node's default CORS policy.
+# `--rpc-cors all` was dropped (audit F7): it let any web page open in a
+# browser talk to the node. Add `--rpc-cors <origin>` only for a browser UI.
 exec ./polkadot-omni-node --chain chain_spec.json --dev-block-time 6000 --tmp \
-  --rpc-port 9944 --rpc-cors all --name anonymum-dev
+  --rpc-port 9944 --name anonymum-dev

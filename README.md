@@ -10,11 +10,10 @@ Three crates, plus a Substrate port in `substrate/`:
 
 | Crate | What it is | Verified how |
 |---|---|---|
-| `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, client-side admission, rate limits. No dependencies. | 45 tests |
+| `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
 | `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing. | 25 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 (see below). Not an automated test. |
-
-| `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 45 tests (43 rule tests ported from the core crate); runtime ran on a local dev node with real transactions, 2026-11-18 |
+| `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
 
@@ -68,7 +67,7 @@ would retry on a slower schedule.
 cannot disturb the pinned Nym crates.
 
     cd substrate
-    cargo test -p pallet-anonymum                 # 45 tests, mock runtime
+    cargo test -p pallet-anonymum                 # 57 tests, mock runtime
     cargo build --release -p anonymum-runtime     # native + WebAssembly runtime
 
 On Windows (Rust 1.100, 8 cores, 7.7 GB RAM, `-j 4`): the first release
@@ -94,11 +93,22 @@ other side, and total issuance falling by exactly the burns plus transaction
 fees. All checks passed on 2026-11-18 (three runs on fresh chains).
 
 Differences from the in-process simulation:
-- Escrow is a balance hold; the reward pool is the pallet's account.
+- Escrow and storage deposits are balance holds; the reward pool is the
+  pallet's account.
 - Accounts must keep the existential deposit, so payments cannot empty them.
 - A failed transaction changes no pallet state and takes no pallet fee, but
-  the chain's own transaction fee is still charged (1 unit in this demo
-  runtime), as on any Substrate chain.
+  the chain's own transaction fee is still charged, as on any Substrate
+  chain. It scales with weight and size: measured on the dev node, about
+  0.007 coin for a contact request and 0.003 coin for opening with an
+  invite. Both rates are placeholders, and the weights behind them are not
+  benchmarked yet.
+- Invite proofs: the crates check with `ed25519-dalek`'s `verify_strict`,
+  the pallet with the runtime's `ed25519_verify` host function, which is
+  more permissive (it accepts some non-canonical signatures). Only the
+  invite's owner picks the key, so this is not exploitable today, but the
+  two checks differ.
+- Balances are `u128` everywhere: simulation, pallet mock and dev runtime
+  (the runtime used `u64` until 2026-11-18).
 - Expiry uses one queue per block; at most `MaxRequestsPerBlock` (256)
   requests can expire in one block, and a request that would overflow it
   fails without charge.
@@ -108,6 +118,18 @@ Differences from the in-process simulation:
 - Dev accounts are sr25519 (Substrate's default); the binding check accepts
   any Substrate signature type, while `anonymum-crypto` wallets are Ed25519.
 
+**DEV ONLY — must not leave the laptop:**
+- Sudo, with the public `//Alice` dev key as the sudo key.
+- The well-known dev accounts (`//Alice`, `//Bob`, …) endowed at genesis;
+  their private keys are public knowledge.
+- `TestDefaultConfig` settings for System, Balances, Sudo, Timestamp and
+  TransactionPayment (existential deposit of 1 unit, test limits).
+- The stub Aura API in the runtime (6 s slots, no authorities, no Aura).
+- Manual seal (`--dev-block-time`), a single node, `--tmp` storage.
+- Placeholder weights, fee rates, deposits and network fees.
+- The RPC endpoint: `run-node.sh` keeps the default CORS policy, so web
+  pages cannot reach the node; `--rpc-cors all` was removed. Add a specific
+  `--rpc-cors <origin>` only when a browser UI needs it.
 ## What is real and what is not
 
 | Piece | Status |
@@ -131,6 +153,8 @@ Differences from the in-process simulation:
 2. **Invites are one-time key pairs, not secret codes.** The recipient registers
    the public half and hands out the private half. The opener signs
    "opener + recipient", so a copied transaction is useless to anyone else.
+   Invites are stored per owner, so registering someone else's invite key
+   first does not block them.
 3. **Admission is enforced by the recipient's client, not by relay nodes.** Mix
    nodes cannot know who is talking to whom, so they cannot check channels.
    The recipient's client reads the chain and drops everything else.
@@ -141,6 +165,10 @@ Differences from the in-process simulation:
    with an invite instead, the price is refunded in full. The network fee is
    never refunded, so spam always costs something.
 5. **Network fees are split**: part burned, part into a pool for relay nodes.
+   **Storage is not free**: each invite, block entry and messaging key holds a
+   refundable deposit (placeholder 0.01 coin), returned when the entry is
+   used, revoked, lifted, cleared or replaced. Anyone may remove an expired
+   invite; its deposit goes back to the owner.
 6. **`max_price` on contact requests** protects the sender from a price change
    between signing and inclusion.
 7. **Closing blocks.** If you close a channel, the other address cannot pay to
@@ -149,7 +177,8 @@ Differences from the in-process simulation:
    The block is per address; a new wallet starts fresh and pays stranger costs.
 8. **Direct blocking.** You can block any address, with or without a channel.
    Its paid requests then fail before any fee is charged, its pending request
-   is refunded in full, and an open channel with it is closed. Any new channel
+   is refunded in full, your own pending request to it is cancelled (decline
+   fee burned), and an open channel with it is closed. Any new channel
    between two addresses clears blocks both ways, since it only opens with
    both sides' consent.
 9. **No mixnet address is ever published.** Wallets publish a messaging key
@@ -165,8 +194,9 @@ Differences from the in-process simulation:
 
 ## Open questions for you
 
-- **Fee levels**: current numbers (0.01 / 0.5 / default price 1.0 / decline fee 1%) are
-  placeholders. They should come out of a spam-cost simulation.
+- **Fee levels**: current numbers (0.01 / 0.5 / default price 1.0 / decline
+  fee 1% / storage deposits 0.01) are placeholders. They should come out of
+  a spam-cost simulation.
 - **Intro message cap**: 280 bytes is proposed. Right size?
 
 ## Known gaps that matter for the security claim

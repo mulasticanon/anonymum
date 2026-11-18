@@ -6,7 +6,7 @@
 
 use crate::mock::*;
 use crate::pallet::{
-    Blocks, Channels, Error, Event, ExpiryQueue, MessagingKeys, OpenedVia, RefundReason, Requests,
+    HoldReason, Blocks, Channels, Error, Event, ExpiryQueue, MessagingKeys, OpenedVia, RefundReason, Requests,
     UnblockReason,
 };
 use crate::{invite_message, SealedNote};
@@ -30,8 +30,14 @@ fn free(name: &str) -> Balance {
     Balances::free_balance(account(name))
 }
 
+/// Held in contact-request escrow (not counting storage deposits).
 fn held(name: &str) -> Balance {
-    Balances::total_balance_on_hold(&account(name))
+    Balances::balance_on_hold(&HoldReason::ContactEscrow.into(), &account(name))
+}
+
+/// Held as storage deposits (invites, blocks, messaging key).
+fn deposits(name: &str) -> Balance {
+    Balances::total_balance_on_hold(&account(name)) - held(name)
 }
 
 fn issuance() -> Balance {
@@ -100,7 +106,8 @@ fn blocked(blocker: &str, target: &str) -> bool {
 
 /// Every coin is in a wallet (free or held) or the pool, or was burned.
 fn assert_conserved(start_issuance: Balance) {
-    let wallets: Balance = ["alice", "bob", "carol", "dave"].iter().map(|n| free(n) + held(n)).sum();
+    let wallets: Balance =
+        ["alice", "bob", "carol", "dave"].iter().map(|n| free(n) + held(n) + deposits(n)).sum();
     assert_eq!(wallets + pool_balance(), issuance(), "all coins accounted for");
     assert!(issuance() <= start_issuance);
 }
@@ -734,5 +741,162 @@ fn coins_are_conserved_across_a_mixed_history() {
         // Burned: half of three cold fees and one invite fee, two decline fees.
         let burned = 3 * (COLD_FEE / 2) + INVITE_FEE / 2 + 2 * DECLINE_FEE;
         assert_eq!(start - issuance(), burned);
+    });
+}
+
+// ---- F3: refundable storage deposits ----------------------------------------
+
+#[test]
+fn an_invite_holds_a_deposit_returned_when_used() {
+    new_test_ext().execute_with(|| {
+        let secret = invite("bob", 1);
+        assert_eq!(free("bob"), 10 * COIN - DEPOSIT);
+        assert_eq!(deposits("bob"), 2 * DEPOSIT, "key + invite");
+        assert_ok!(open("alice", "bob", &secret));
+        assert_eq!(free("bob"), 10 * COIN, "invite deposit back");
+        assert_eq!(deposits("bob"), DEPOSIT);
+    });
+}
+
+#[test]
+fn revoking_an_invite_returns_its_deposit() {
+    new_test_ext().execute_with(|| {
+        let secret = invite("bob", 1);
+        assert_ok!(Anonymum::revoke_invite(signed("bob"), secret.public().0));
+        assert_eq!(free("bob"), 10 * COIN);
+    });
+}
+
+#[test]
+fn anyone_may_remove_an_expired_invite_and_the_owner_gets_the_deposit() {
+    new_test_ext().execute_with(|| {
+        let secret = ed25519::Pair::from_seed(&[9; 32]);
+        let key = secret.public().0;
+        assert_ok!(Anonymum::register_invite(signed("bob"), key, Some(5)));
+        assert_noop!(
+            Anonymum::remove_expired_invite(signed("carol"), account("bob"), key),
+            Error::<Test>::InviteNotExpired
+        );
+        System::set_block_number(6);
+        System::reset_events();
+        assert_ok!(Anonymum::remove_expired_invite(signed("carol"), account("bob"), key));
+        assert_eq!(
+            new_events(),
+            vec![Event::ExpiredInviteRemoved { owner: account("bob"), key, by: account("carol") }]
+        );
+        assert_eq!(free("bob"), 10 * COIN, "deposit to the owner");
+        assert_eq!(free("carol"), 10 * COIN, "not to the caller");
+        assert_noop!(
+            Anonymum::remove_expired_invite(signed("carol"), account("bob"), key),
+            Error::<Test>::UnknownInvite
+        );
+    });
+}
+
+#[test]
+fn an_invite_without_expiry_cannot_be_removed_by_others() {
+    new_test_ext().execute_with(|| {
+        let secret = invite("bob", 1);
+        System::set_block_number(1_000_000);
+        assert_noop!(
+            Anonymum::remove_expired_invite(signed("carol"), account("bob"), secret.public().0),
+            Error::<Test>::InviteNotExpired
+        );
+    });
+}
+
+#[test]
+fn storing_anything_without_the_deposit_fails_and_charges_nothing() {
+    new_test_ext().execute_with(|| {
+        // Erin's whole balance is one deposit, but an account must also keep
+        // the existential deposit, so she cannot hold one.
+        let erin = account("erin");
+        assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), erin.clone(), DEPOSIT));
+        let origin = || RuntimeOrigin::signed(erin.clone());
+        assert_noop!(Anonymum::register_invite(origin(), [3; 32], None), Error::<Test>::InsufficientFunds);
+        assert_noop!(Anonymum::block(origin(), account("bob")), Error::<Test>::InsufficientFunds);
+        let key = [7u8; 32];
+        let binding = MultiSignature::Ed25519(keypair("erin").sign(&crate::key_binding_message(&key)));
+        assert_noop!(Anonymum::publish_messaging_key(origin(), key, binding), Error::<Test>::InsufficientFunds);
+    });
+}
+
+#[test]
+fn a_block_holds_a_deposit_returned_on_unblock() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Anonymum::block(signed("bob"), account("carol")));
+        assert_eq!(free("bob"), 10 * COIN - DEPOSIT);
+        assert_ok!(Anonymum::unblock(signed("bob"), account("carol")));
+        assert_eq!(free("bob"), 10 * COIN);
+    });
+}
+
+#[test]
+fn closing_takes_the_block_deposit_from_the_closer() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(open("alice", "bob", &invite("bob", 1)));
+        assert_ok!(Anonymum::close_channel(signed("bob"), channel("alice", "bob").unwrap()));
+        assert_eq!(free("bob"), 10 * COIN - DEPOSIT);
+        assert_eq!(deposits("bob"), 2 * DEPOSIT, "key + block");
+    });
+}
+
+#[test]
+fn a_closer_who_cannot_pay_the_block_deposit_cannot_close() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(open("alice", "bob", &invite("bob", 1)));
+        let id = channel("alice", "bob").unwrap();
+        // Leave Bob with only the existential deposit free.
+        assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), account("bob"), 1));
+        assert_noop!(Anonymum::close_channel(signed("bob"), id), Error::<Test>::InsufficientFunds);
+        assert!(channel("alice", "bob").is_some(), "channel stays open");
+    });
+}
+
+#[test]
+fn opening_a_channel_returns_cleared_block_deposits_to_the_blockers() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Anonymum::block(signed("bob"), account("carol")));
+        assert_ok!(Anonymum::block(signed("carol"), account("bob")));
+        let fresh = invite("bob", 7);
+        assert_ok!(open("carol", "bob", &fresh));
+        assert_eq!(free("bob"), 10 * COIN, "block + invite deposits back");
+        assert_eq!(free("carol"), 10 * COIN - INVITE_FEE, "block deposit back");
+    });
+}
+
+#[test]
+fn replacing_a_messaging_key_keeps_a_single_deposit() {
+    new_test_ext().execute_with(|| {
+        let key = [9u8; 32];
+        let binding = MultiSignature::Ed25519(keypair("alice").sign(&crate::key_binding_message(&key)));
+        assert_ok!(Anonymum::publish_messaging_key(signed("alice"), key, binding));
+        assert_eq!(deposits("alice"), DEPOSIT);
+        assert_eq!(free("alice"), 10 * COIN);
+    });
+}
+
+// ---- F5: a refund that cannot complete is visible ---------------------------
+
+#[test]
+fn a_refund_whose_hold_is_gone_still_completes_and_reports_it() {
+    use frame::traits::fungible::MutateHold;
+    use frame::traits::tokens::Precision;
+    new_test_ext().execute_with(|| {
+        assert_ok!(req("carol", "bob", COIN));
+        let request = last_request();
+        // Simulate a broken invariant: the escrow hold vanishes.
+        assert_ok!(<Balances as MutateHold<_>>::release(
+            &HoldReason::ContactEscrow.into(),
+            &account("carol"),
+            COIN,
+            Precision::Exact,
+        ));
+        System::reset_events();
+        assert_ok!(Anonymum::cancel_request(signed("bob"), request));
+        let events = new_events();
+        assert!(events.iter().any(|e| matches!(e, Event::HoldNotReleased { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, Event::RequestRefunded { .. })));
+        assert!(Requests::<Test>::get(request).is_none(), "the request is still cleaned up");
     });
 }

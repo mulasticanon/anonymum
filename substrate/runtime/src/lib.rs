@@ -187,6 +187,8 @@ impl frame_system::Config for Runtime {
 // Implements the types required for the balances pallet.
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Runtime {
+	// u128, like `anonymum-core` and the pallet's mock (audit F6).
+	type Balance = u128;
 	type AccountStore = System;
 }
 
@@ -202,10 +204,28 @@ impl pallet_timestamp::Config for Runtime {}
 #[derive_impl(pallet_transaction_payment::config_preludes::TestDefaultConfig)]
 impl pallet_transaction_payment::Config for Runtime {
 	type OnChargeTransaction = pallet_transaction_payment::FungibleAdapter<Balances, ()>;
-	// Setting fee as independent of the weight of the extrinsic for demo purposes
-	type WeightToFee = NoFee<<Self as pallet_balances::Config>::Balance>;
-	// Setting fee as fixed for any length of the call data for demo purposes
-	type LengthToFee = FixedFee<1, <Self as pallet_balances::Config>::Balance>;
+	// A transaction's fee scales with its weight and its size (audit F3).
+	// Both rates are placeholders, and the pallet's weights are not yet
+	// benchmarked, so the weight part is only roughly right.
+	type WeightToFee = RefTimeToFee;
+	type LengthToFee = frame_support::weights::ConstantMultiplier<u128, ConstU128<FEE_PER_BYTE>>;
+}
+
+/// Fee per byte of an encoded transaction (placeholder): 10 units.
+pub const FEE_PER_BYTE: u128 = 10;
+
+/// Placeholder weight-to-fee rate: 1 unit per 100,000 units of reference
+/// time. Measured on the dev node (2026-11-18), weight plus size fees came
+/// to 6,921 units (about 0.007 coin) for a contact request and 3,431 units
+/// for opening with an invite, against the 0.5 coin network fee.
+pub struct RefTimeToFee;
+
+impl frame_support::weights::WeightToFee for RefTimeToFee {
+	type Balance = u128;
+
+	fn weight_to_fee(weight: &Weight) -> u128 {
+		u128::from(weight.ref_time() / 100_000)
+	}
 }
 
 parameter_types! {
@@ -213,22 +233,26 @@ parameter_types! {
 }
 
 /// One coin in smallest units (same as `anonymum-core`).
-pub const COIN: u64 = 1_000_000;
+pub const COIN: u128 = 1_000_000;
 
 impl pallet_anonymum::Config for Runtime {
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
 	type Signature = sp_runtime::MultiSignature;
 	type PalletId = AnonymumPalletId;
-	type InviteOpenFee = ConstU64<{ COIN / 100 }>;
-	type ColdNetworkFee = ConstU64<{ COIN / 2 }>;
-	type DefaultContactPrice = ConstU64<COIN>;
+	type InviteOpenFee = ConstU128<{ COIN / 100 }>;
+	type ColdNetworkFee = ConstU128<{ COIN / 2 }>;
+	type DefaultContactPrice = ConstU128<COIN>;
 	type RequestTtlMillis = ConstU64<{ 48 * 60 * 60 * 1000 }>;
 	// Run the dev node with `--dev-block-time 6000` to match.
 	type ExpectedBlockTimeMillis = ConstU64<6_000>;
 	type FeeBurnPercent = ConstU8<50>;
 	type DeclineFeeBps = ConstU16<100>;
 	type MaxRequestsPerBlock = ConstU32<256>;
+	// Refundable storage deposits (audit F3). Placeholders: 0.01 coin each.
+	type InviteDeposit = ConstU128<{ COIN / 100 }>;
+	type BlockDeposit = ConstU128<{ COIN / 100 }>;
+	type KeyDeposit = ConstU128<{ COIN / 100 }>;
 }
 
 type Block = frame::runtime::types_common::BlockOf<Runtime, TxExtension>;

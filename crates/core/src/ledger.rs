@@ -1,7 +1,8 @@
 //! Coin balances, escrow, the node reward pool and the burn counter.
 //!
-//! Invariant: every coin ever issued is in exactly one of four places —
-//! a wallet, escrow, the reward pool, or burned. `is_balanced` checks it.
+//! Invariant: every coin ever issued is in exactly one of five places —
+//! a wallet, a storage deposit, escrow, the reward pool, or burned.
+//! `is_balanced` checks it.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +17,8 @@ pub struct InsufficientFunds {
 #[derive(Default, Debug, Clone)]
 pub struct Ledger {
     balances: BTreeMap<Address, Amount>,
+    /// Refundable storage deposits held per account (audit F3).
+    reserved: BTreeMap<Address, Amount>,
     escrowed: Amount,
     reward_pool: Amount,
     burned: Amount,
@@ -31,6 +34,11 @@ impl Ledger {
 
     pub fn balance(&self, who: &Address) -> Amount {
         self.balances.get(who).copied().unwrap_or(0)
+    }
+
+    /// Storage deposits `who` currently has held.
+    pub fn reserved(&self, who: &Address) -> Amount {
+        self.reserved.get(who).copied().unwrap_or(0)
     }
 
     pub fn escrowed(&self) -> Amount {
@@ -54,6 +62,7 @@ impl Ledger {
         let total = self
             .balances
             .values()
+            .chain(self.reserved.values())
             .chain([&self.escrowed, &self.reward_pool, &self.burned])
             .try_fold(0 as Amount, |sum, x| sum.checked_add(*x));
         total == Some(self.issued)
@@ -81,6 +90,24 @@ impl Ledger {
         self.burned = bounded_add(self.burned, burn);
         self.reward_pool = bounded_add(self.reward_pool, amount - burn);
         Ok(())
+    }
+
+    /// Hold a refundable storage deposit from `who`'s wallet.
+    pub(crate) fn reserve(&mut self, who: Address, amount: Amount) -> Result<(), InsufficientFunds> {
+        self.debit(who, amount)?;
+        let held = self.reserved.entry(who).or_insert(0);
+        *held = bounded_add(*held, amount);
+        Ok(())
+    }
+
+    /// Return a storage deposit to `who`'s wallet.
+    pub(crate) fn unreserve(&mut self, who: Address, amount: Amount) {
+        let held = self.reserved.entry(who).or_insert(0);
+        *held = held.checked_sub(amount).expect("deposit underflow");
+        if *held == 0 {
+            self.reserved.remove(&who);
+        }
+        self.credit(who, amount);
     }
 
     /// Move coins from a wallet into escrow.

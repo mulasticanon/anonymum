@@ -56,7 +56,13 @@ impl pallet_anonymum::Config for Test {
     type FeeBurnPercent = ConstU8<50>;
     type DeclineFeeBps = ConstU16<100>;
     type MaxRequestsPerBlock = ConstU32<4>;
+    type InviteDeposit = ConstU128<DEPOSIT>;
+    type BlockDeposit = ConstU128<DEPOSIT>;
+    type KeyDeposit = ConstU128<DEPOSIT>;
 }
+
+/// Storage deposit per invite, block entry and messaging key (placeholder).
+pub const DEPOSIT: Balance = COIN / 100;
 
 pub fn keypair(name: &str) -> ed25519::Pair {
     ed25519::Pair::from_seed(&blake2_256(name.as_bytes()))
@@ -82,12 +88,14 @@ pub fn note() -> SealedNote {
     vec![0xAB; SEALED_NOTE_LEN as usize].try_into().unwrap()
 }
 
-/// Alice, Bob, Carol and Dave with 10 coins each (Dave publishes no key),
-/// the reward pool holding the existential deposit, block 1.
+/// Alice, Bob and Carol with published messaging keys and 10 coins free
+/// each (they get the key deposit on top, which stays held); Dave with 10
+/// coins and no key; the reward pool holding the existential deposit; block 1.
 pub fn new_test_ext() -> TestState {
     let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
     let mut balances: Vec<(AccountId32, Balance)> =
-        ["alice", "bob", "carol", "dave"].iter().map(|n| (account(n), 10 * COIN)).collect();
+        ["alice", "bob", "carol"].iter().map(|n| (account(n), 10 * COIN + DEPOSIT)).collect();
+    balances.push((account("dave"), 10 * COIN));
     balances.push((pool(), 1));
     pallet_balances::GenesisConfig::<Test> { balances, ..Default::default() }
         .assimilate_storage(&mut storage)

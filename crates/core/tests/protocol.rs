@@ -3,7 +3,8 @@ use anonymum_core::crypto::invite_message;
 use anonymum_core::ratelimit::TokenBucket;
 use anonymum_core::*;
 
-/// Alice, Bob and Carol with 10 coins each and published messaging keys.
+/// Alice, Bob and Carol with published messaging keys and 10 coins free
+/// each (they are minted the key deposit on top, which stays held).
 fn setup() -> (Chain<MockScheme>, Address, Address, Address) {
     let mut chain = Chain::new(Params::default(), MockScheme);
     let (alice, bob, carol) = (
@@ -11,8 +12,9 @@ fn setup() -> (Chain<MockScheme>, Address, Address, Address) {
         Address::from_label("bob"),
         Address::from_label("carol"),
     );
+    let key_deposit = chain.params().key_deposit;
     for who in [alice, bob, carol] {
-        chain.mint(who, 10 * COIN);
+        chain.mint(who, 10 * COIN + key_deposit);
         chain.apply(who, publish_key(who)).unwrap();
     }
     (chain, alice, bob, carol)
@@ -50,6 +52,7 @@ fn fails_charging_nothing(chain: &mut Chain<MockScheme>, sender: Address, tx: Tx
     let after = chain.ledger();
     for who in ["alice", "bob", "carol", "dave"].map(Address::from_label) {
         assert_eq!(after.balance(&who), ledger_before.balance(&who), "{who} charged");
+        assert_eq!(after.reserved(&who), ledger_before.reserved(&who), "{who}'s deposits moved");
     }
     assert_eq!(after.escrowed(), ledger_before.escrowed());
     assert_eq!(after.burned(), ledger_before.burned());
@@ -788,4 +791,143 @@ fn only_the_owner_can_revoke_an_invite() {
     fails_charging_nothing(&mut chain, alice, Tx::RevokeInvite { key: secret.public() }, Error::UnknownInvite);
     chain.apply(bob, Tx::RevokeInvite { key: secret.public() }).unwrap();
     fails_charging_nothing(&mut chain, alice, open_tx(&secret, alice, bob), Error::UnknownInvite);
+}
+
+// ---- F3: refundable storage deposits ----------------------------------------
+
+const DEPOSIT: Amount = COIN / 100;
+
+#[test]
+fn an_invite_holds_a_deposit_returned_when_used() {
+    let (mut chain, alice, bob, _) = setup();
+    let secret = bob_invite(&mut chain, bob, 1);
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN - DEPOSIT);
+    assert_eq!(chain.ledger().reserved(&bob), 2 * DEPOSIT, "key + invite");
+    chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN, "invite deposit back");
+    assert!(chain.ledger().is_balanced());
+}
+
+#[test]
+fn revoking_an_invite_returns_its_deposit() {
+    let (mut chain, _, bob, _) = setup();
+    let secret = bob_invite(&mut chain, bob, 1);
+    chain.apply(bob, Tx::RevokeInvite { key: secret.public() }).unwrap();
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN);
+}
+
+#[test]
+fn anyone_may_remove_an_expired_invite_and_the_owner_gets_the_deposit() {
+    let (mut chain, alice, bob, carol) = setup();
+    let secret = MockInviteSecret::from_seed(9);
+    chain.apply(bob, Tx::RegisterInvite { key: secret.public(), expires_at: Some(5) }).unwrap();
+    let remove = Tx::RemoveExpiredInvite { owner: bob, key: secret.public() };
+    fails_charging_nothing(&mut chain, carol, remove.clone(), Error::InviteNotExpired);
+    chain.advance_blocks(6);
+    let events = chain.apply(carol, remove.clone()).unwrap();
+    assert_eq!(events, vec![Event::ExpiredInviteRemoved { owner: bob, key: secret.public(), by: carol }]);
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN, "deposit to the owner");
+    assert_eq!(chain.ledger().balance(&carol), 10 * COIN, "not to the caller");
+    fails_charging_nothing(&mut chain, carol, remove, Error::UnknownInvite);
+    fails_charging_nothing(&mut chain, alice, open_tx(&secret, alice, bob), Error::UnknownInvite);
+}
+
+#[test]
+fn an_invite_without_expiry_cannot_be_removed_by_others() {
+    let (mut chain, _, bob, carol) = setup();
+    let secret = bob_invite(&mut chain, bob, 1);
+    chain.advance_blocks(1_000_000);
+    fails_charging_nothing(
+        &mut chain,
+        carol,
+        Tx::RemoveExpiredInvite { owner: bob, key: secret.public() },
+        Error::InviteNotExpired,
+    );
+}
+
+#[test]
+fn storing_anything_without_the_deposit_fails_and_charges_nothing() {
+    let (mut chain, _, bob, _) = setup();
+    let dave = Address::from_label("dave");
+    chain.mint(dave, DEPOSIT - 1);
+    let key = MessagingKey([7; 32]);
+    let txs = [
+        Tx::RegisterInvite { key: MockInviteSecret::from_seed(3).public(), expires_at: None },
+        Tx::Block { target: bob },
+        Tx::PublishMessagingKey { key, binding: mock_binding(&dave, &key) },
+    ];
+    for tx in txs {
+        let err = chain.apply(dave, tx.clone()).unwrap_err();
+        assert!(matches!(err, Error::InsufficientFunds { .. }), "got {err:?}");
+        fails_charging_nothing(&mut chain, dave, tx, err);
+    }
+}
+
+#[test]
+fn a_block_holds_a_deposit_returned_on_unblock() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN - DEPOSIT);
+    chain.apply(bob, Tx::Unblock { target: carol }).unwrap();
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN);
+}
+
+#[test]
+fn closing_takes_the_block_deposit_from_the_closer() {
+    let (mut chain, alice, bob, _) = setup();
+    let secret = bob_invite(&mut chain, bob, 1);
+    chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
+    let id = chain.channel_between(&alice, &bob).unwrap().id;
+    chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN - DEPOSIT);
+    assert_eq!(chain.ledger().reserved(&bob), 2 * DEPOSIT, "key + block");
+}
+
+#[test]
+fn a_closer_who_cannot_pay_the_block_deposit_cannot_close() {
+    let (mut chain, alice, bob, _) = setup();
+    // Erin has exactly enough for a key deposit and an invite deposit.
+    let erin = Address::from_label("erin");
+    chain.mint(erin, 2 * DEPOSIT);
+    let key = MessagingKey([5; 32]);
+    chain.apply(erin, Tx::PublishMessagingKey { key, binding: mock_binding(&erin, &key) }).unwrap();
+    let invite = MockInviteSecret::from_seed(6);
+    chain.apply(erin, Tx::RegisterInvite { key: invite.public(), expires_at: None }).unwrap();
+    chain.apply(bob, open_tx(&invite, bob, erin)).unwrap(); // invite deposit back to Erin
+    chain.apply(erin, Tx::Block { target: alice }).unwrap(); // and spent on a block
+    assert_eq!(chain.ledger().balance(&erin), 0);
+    let channel = chain.channel_between(&bob, &erin).unwrap().id;
+
+    fails_charging_nothing(
+        &mut chain,
+        erin,
+        Tx::CloseChannel { channel },
+        Error::InsufficientFunds { needed: DEPOSIT, available: 0 },
+    );
+    assert!(chain.channel_between(&bob, &erin).is_some(), "channel stays open");
+}
+
+#[test]
+fn opening_a_channel_returns_cleared_block_deposits_to_the_blockers() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    chain.apply(carol, Tx::Block { target: bob }).unwrap();
+    let fresh = bob_invite(&mut chain, bob, 7);
+    chain.apply(carol, open_tx(&fresh, carol, bob)).unwrap();
+    assert_eq!(chain.ledger().balance(&bob), 10 * COIN, "block + invite deposits back");
+    assert_eq!(
+        chain.ledger().balance(&carol),
+        10 * COIN - chain.params().invite_open_fee,
+        "block deposit back"
+    );
+    assert!(chain.ledger().is_balanced());
+}
+
+#[test]
+fn replacing_a_messaging_key_keeps_a_single_deposit() {
+    let (mut chain, alice, _, _) = setup();
+    let key = MessagingKey([9; 32]);
+    chain.apply(alice, Tx::PublishMessagingKey { key, binding: mock_binding(&alice, &key) }).unwrap();
+    assert_eq!(chain.ledger().reserved(&alice), DEPOSIT);
+    assert_eq!(chain.ledger().balance(&alice), 10 * COIN);
 }

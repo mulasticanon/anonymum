@@ -47,6 +47,12 @@ pub struct Params {
     /// nobody profits from turning strangers away. Not charged when the
     /// request is superseded by an invite or ended by a block.
     pub decline_fee_bps: u16,
+    /// Refundable deposit held for each registered invite, block entry and
+    /// published messaging key, so on-chain storage is not free (audit F3).
+    /// Placeholders: 0.01 coin each.
+    pub invite_deposit: Amount,
+    pub block_deposit: Amount,
+    pub key_deposit: Amount,
 }
 
 impl Default for Params {
@@ -59,6 +65,9 @@ impl Default for Params {
             block_time_ms: 6_000,
             fee_burn_percent: 50,
             decline_fee_bps: 100,
+            invite_deposit: COIN / 100,
+            block_deposit: COIN / 100,
+            key_deposit: COIN / 100,
         }
     }
 }
@@ -103,6 +112,17 @@ struct Invite {
     /// Position in the chain's history of invites and blocks. Only an
     /// invite issued after a block can lift that block.
     seq: u64,
+    /// Held from the owner; returned when the invite is used, revoked or
+    /// removed after expiry.
+    deposit: Amount,
+}
+
+#[derive(Debug, Clone)]
+struct BlockEntry {
+    /// When the block was made (see `Invite::seq`).
+    seq: u64,
+    /// Held from the blocker; returned when the block is lifted or cleared.
+    deposit: Amount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +142,8 @@ pub struct ContactRequest {
 pub struct PublishedKey {
     pub key: MessagingKey,
     pub binding: KeyBinding,
+    /// Held from the owner; carried over when the key is replaced.
+    pub deposit: Amount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +158,9 @@ pub enum Tx {
     /// Publish the public half of a one-time invite.
     RegisterInvite { key: InviteKey, expires_at: Option<BlockHeight> },
     RevokeInvite { key: InviteKey },
+    /// Anyone may remove an invite past its `expires_at`; the deposit goes
+    /// back to the owner, not the caller.
+    RemoveExpiredInvite { owner: Address, key: InviteKey },
     /// Cheap path: open a channel using an invite the recipient handed out.
     OpenWithInvite { recipient: Address, key: InviteKey, proof: InviteProof },
     /// Expensive path: pay the network and escrow the recipient's price.
@@ -183,6 +208,7 @@ pub enum Event {
     MessagingKeyPublished { who: Address, key: MessagingKey },
     InviteRegistered { owner: Address, key: InviteKey },
     InviteRevoked { owner: Address, key: InviteKey },
+    ExpiredInviteRemoved { owner: Address, key: InviteKey, by: Address },
     ContactRequested { request: RequestId, from: Address, to: Address, price: Amount, note: SealedNote },
     /// `amount` went back to the requester; `burned` was the decline fee.
     RequestRefunded {
@@ -225,6 +251,8 @@ pub enum Error {
     BadKeyBinding,
     AlreadyBlocked,
     NotBlocked,
+    /// The invite has no expiry, or it has not passed yet.
+    InviteNotExpired,
 }
 
 impl From<InsufficientFunds> for Error {
@@ -253,7 +281,7 @@ pub struct Chain<S: InviteScheme> {
     by_pair: BTreeMap<(Address, Address), ChannelId>,
     requests: BTreeMap<RequestId, ContactRequest>,
     /// (blocker, blocked) -> sequence number when the block was made.
-    blocks: BTreeMap<(Address, Address), u64>,
+    blocks: BTreeMap<(Address, Address), BlockEntry>,
     next_id: u64,
     next_seq: u64,
     events: Vec<Event>,
@@ -370,22 +398,42 @@ impl<S: InviteScheme> Chain<S> {
                 if !self.scheme.verify_key_binding(&sender, &key, &binding) {
                     return Err(Error::BadKeyBinding);
                 }
-                self.messaging_keys.insert(sender, PublishedKey { key, binding });
+                // One deposit per key; replacing a key carries it over.
+                let old = self.messaging_keys.get(&sender).map_or(0, |k| k.deposit);
+                let deposit = self.params.key_deposit;
+                if deposit > old {
+                    self.ledger.can_pay(&sender, deposit - old)?;
+                }
+                self.ledger.unreserve(sender, old);
+                self.ledger.reserve(sender, deposit).expect("funds checked above");
+                self.messaging_keys.insert(sender, PublishedKey { key, binding, deposit });
                 self.events.push(Event::MessagingKeyPublished { who: sender, key });
             }
             Tx::RegisterInvite { key, expires_at } => {
                 if self.invites.contains_key(&(sender, key)) {
                     return Err(Error::InviteAlreadyRegistered);
                 }
+                let deposit = self.params.invite_deposit;
+                self.ledger.reserve(sender, deposit)?;
                 let seq = self.take_seq();
-                self.invites.insert((sender, key), Invite { expires_at, seq });
+                self.invites.insert((sender, key), Invite { expires_at, seq, deposit });
                 self.events.push(Event::InviteRegistered { owner: sender, key });
             }
             Tx::RevokeInvite { key } => {
                 // Only the owner's own entry can be found, so only the owner
                 // can revoke it.
-                self.invites.remove(&(sender, key)).ok_or(Error::UnknownInvite)?;
+                let invite = self.invites.remove(&(sender, key)).ok_or(Error::UnknownInvite)?;
+                self.ledger.unreserve(sender, invite.deposit);
                 self.events.push(Event::InviteRevoked { owner: sender, key });
+            }
+            Tx::RemoveExpiredInvite { owner, key } => {
+                let invite = self.invites.get(&(owner, key)).ok_or(Error::UnknownInvite)?;
+                if !invite.expires_at.is_some_and(|deadline| self.height > deadline) {
+                    return Err(Error::InviteNotExpired);
+                }
+                let invite = self.invites.remove(&(owner, key)).expect("found above");
+                self.ledger.unreserve(owner, invite.deposit);
+                self.events.push(Event::ExpiredInviteRemoved { owner, key, by: sender });
             }
             Tx::OpenWithInvite { recipient, key, proof } => {
                 self.open_with_invite(sender, recipient, key, proof)?
@@ -407,6 +455,8 @@ impl<S: InviteScheme> Chain<S> {
                     return Err(Error::NotParticipant);
                 }
                 let other = if sender == ch.a { ch.b } else { ch.a };
+                // The automatic block takes a deposit like any other block.
+                self.ledger.can_pay(&sender, self.params.block_deposit)?;
                 self.close_channel(channel, sender);
                 self.add_block(sender, other);
             }
@@ -417,6 +467,7 @@ impl<S: InviteScheme> Chain<S> {
                 if self.is_blocked(&sender, &target) {
                     return Err(Error::AlreadyBlocked);
                 }
+                self.ledger.can_pay(&sender, self.params.block_deposit)?;
                 if let Some(&channel) = self.by_pair.get(&pair(sender, target)) {
                     self.close_channel(channel, sender);
                 }
@@ -441,9 +492,8 @@ impl<S: InviteScheme> Chain<S> {
                 self.add_block(sender, target);
             }
             Tx::Unblock { target } => {
-                if self.blocks.remove(&(sender, target)).is_none() {
-                    return Err(Error::NotBlocked);
-                }
+                let entry = self.blocks.remove(&(sender, target)).ok_or(Error::NotBlocked)?;
+                self.ledger.unreserve(sender, entry.deposit);
                 self.events.push(Event::Unblocked { by: sender, target, reason: UnblockReason::Lifted });
             }
         }
@@ -469,8 +519,8 @@ impl<S: InviteScheme> Chain<S> {
         }
         // A blocked opener may only use an invite issued after the block:
         // the recipient handing out a fresh invite is how they reopen.
-        if let Some(&blocked_at) = self.blocks.get(&(recipient, opener)) {
-            if invite.seq < blocked_at {
+        if let Some(block) = self.blocks.get(&(recipient, opener)) {
+            if invite.seq < block.seq {
                 return Err(Error::Blocked);
             }
         }
@@ -483,7 +533,9 @@ impl<S: InviteScheme> Chain<S> {
             self.params.invite_open_fee,
             self.params.fee_burn_percent,
         )?;
-        self.invites.remove(&(recipient, key)); // one-time use
+        // One-time use: the invite goes, and its deposit returns to the owner.
+        let invite = self.invites.remove(&(recipient, key)).expect("found above");
+        self.ledger.unreserve(recipient, invite.deposit);
         let superseded: Vec<RequestId> = self
             .requests
             .values()
@@ -590,7 +642,8 @@ impl<S: InviteScheme> Chain<S> {
         let id = ChannelId(self.take_id());
         let (a, b) = pair(a, b);
         for (blocker, target) in [(a, b), (b, a)] {
-            if self.blocks.remove(&(blocker, target)).is_some() {
+            if let Some(entry) = self.blocks.remove(&(blocker, target)) {
+                self.ledger.unreserve(blocker, entry.deposit);
                 self.events.push(Event::Unblocked {
                     by: blocker,
                     target,
@@ -610,9 +663,12 @@ impl<S: InviteScheme> Chain<S> {
         }
     }
 
+    /// Callers check `block_deposit` is affordable before changing anything.
     fn add_block(&mut self, blocker: Address, target: Address) {
+        let deposit = self.params.block_deposit;
+        self.ledger.reserve(blocker, deposit).expect("caller checked funds");
         let seq = self.take_seq();
-        self.blocks.insert((blocker, target), seq);
+        self.blocks.insert((blocker, target), BlockEntry { seq, deposit });
         self.events.push(Event::Blocked { by: blocker, target });
     }
 

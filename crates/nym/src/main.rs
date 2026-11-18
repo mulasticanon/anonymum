@@ -168,6 +168,7 @@ async fn run() -> Result<(), AnyError> {
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
     chain.mint(alice.address(), 10 * COIN);
     chain.mint(carol.address(), 10 * COIN);
+    chain.mint(bob.address(), COIN); // storage deposits for his key and invite
     chain.apply(bob.address(), bob.publish_key_tx())?;
     println!("\nOn-chain: Bob publishes his messaging key (a key, not a location).");
 
