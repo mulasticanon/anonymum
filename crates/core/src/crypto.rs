@@ -30,7 +30,7 @@ pub trait InviteScheme {
 /// against a different opener or a different recipient.
 pub fn invite_message(opener: &Address, recipient: &Address) -> Vec<u8> {
     let mut message = Vec::with_capacity(16 + 64);
-    message.extend_from_slice(b"murmur/invite/v1");
+    message.extend_from_slice(b"anonymum/invite/v1");
     message.extend_from_slice(&opener.0);
     message.extend_from_slice(&recipient.0);
     message

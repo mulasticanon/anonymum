@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Core and crypto (default members). --locked keeps the pinned Cargo.lock.
       - run: cargo test --locked
-      - run: cargo run --locked -p murmur-core --example demo
+      - run: cargo run --locked -p anonymum-core --example demo
 
   # The Nym demo needs the live mixnet, so CI only checks that it compiles.
   nym-build:
@@ -30,4 +30,4 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked -p murmur-nym
+      - run: cargo check --locked -p anonymum-nym

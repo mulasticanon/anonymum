@@ -1,4 +1,4 @@
-# Murmur (working title)
+# Anonymum
 
 A messaging coin where reaching someone costs money unless they invited you.
 
@@ -10,17 +10,17 @@ Three crates:
 
 | Crate | What it is | Verified how |
 |---|---|---|
-| `murmur-core` | The rules: invites, paid contact requests, channels, fees, escrow, client-side admission, rate limits. No dependencies. | 20 tests |
-| `murmur-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, message framing. | 15 tests |
-| `murmur-nym` | Demo: three wallets exchanging encrypted messages over the live Nym mixnet. | Ran end to end over the live mixnet on Windows, 2026-11-18 (17 s). A single manual run, not an automated test. |
+| `anonymum-core` | The rules: invites, paid contact requests, channels, fees, escrow, client-side admission, rate limits. No dependencies. | 23 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, message framing. | 15 tests |
+| `anonymum-nym` | Demo: three wallets exchanging encrypted messages over the live Nym mixnet. | Ran end to end over the live mixnet on Windows, 2026-11-18 (17 s). A single manual run, not an automated test. |
 
 Nothing here has been audited. Do not use it to protect anything real.
 
 ## Run it
 
     cargo test                 # core + crypto, fast
-    cargo run -p murmur-core --example demo
-    cargo run -p murmur-nym    # live mixnet; first build takes several minutes
+    cargo run -p anonymum-core --example demo
+    cargo run -p anonymum-nym    # live mixnet; first build takes several minutes
 
 Needs Rust 1.87 or newer. Keep `Cargo.lock`: it pins the Nym crates to the
 set the SDK was released with. A fresh resolve picks mismatched Nym versions
@@ -28,7 +28,7 @@ that do not compile.
 
 The Nym demo needs ordinary internet access (DNS, and outbound connections
 to mixnet gateways). It prefers gateways on TLS port 443; set
-`MURMUR_PLAIN_WS=1` to allow any gateway.
+`ANONYMUM_PLAIN_WS=1` to allow any gateway.
 
 First live run (Windows 11, Rust 1.100, 2026-11-18): all three clients
 connected in 1–5 s over TLS gateways. Alice's handshake took 4 s, a message
@@ -63,8 +63,11 @@ can key sessions by that tag.
 3. **Admission is enforced by the recipient's client, not by relay nodes.** Mix
    nodes cannot know who is talking to whom, so they cannot check channels.
    The recipient's client reads the chain and drops everything else.
-4. **Stranger's payment is held in escrow.** Accept: recipient gets it. Decline
-   or no answer before the deadline: sender gets it back. The network fee is
+4. **Stranger's payment is held in escrow.** Accept: recipient gets it. Decline,
+   sender cancel, or no answer before the deadline: sender gets it back minus a
+   1% decline fee, which is burned. Nobody receives the decline fee, so no one
+   profits from turning people away. Exception: if the stranger opens a channel
+   with an invite instead, the price is refunded in full. The network fee is
    never refunded, so spam always costs something.
 5. **Network fees are split**: part burned, part into a pool for relay nodes.
 6. **`max_price` on contact requests** protects the sender from a price change
@@ -72,17 +75,13 @@ can key sessions by that tag.
 
 ## Open questions for you
 
-- **Declined requests**: refund in full (current), or let the recipient keep
-  part for their attention? Full refund makes spam cheaper; keeping it lets
-  recipients profit from ignoring people.
-- **Fee levels**: current numbers (0.01 / 0.5 / default price 1.0) are
+- **Fee levels**: current numbers (0.01 / 0.5 / default price 1.0 / decline fee 1%) are
   placeholders. They should come out of a spam-cost simulation.
 - **Closing a channel**: either side can close for free today. Should the
   closed-out party need a new invite, or can they pay the stranger price?
 - **Finding someone's mixnet address**: invited contacts can receive it with
   the invite. For strangers it must be published somewhere, and publishing
   it on-chain ties a wallet to a gateway. Needs a design decision.
-- **Name**: "Murmur" is a placeholder.
 
 ## Known gaps that matter for the security claim
 

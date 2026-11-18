@@ -31,6 +31,12 @@ pub struct Params {
     pub request_ttl_blocks: BlockHeight,
     /// Share of each network fee that is destroyed; the rest pays nodes.
     pub fee_burn_percent: u8,
+    /// Share of the escrowed price that is burned when a contact request
+    /// ends without a channel (declined, cancelled or expired), in basis
+    /// points (100 = 1%). Rounded up. Burned rather than paid to anyone, so
+    /// nobody profits from turning strangers away. Not charged when the
+    /// request is superseded by an invite.
+    pub decline_fee_bps: u16,
 }
 
 impl Default for Params {
@@ -41,8 +47,20 @@ impl Default for Params {
             default_contact_price: COIN,
             request_ttl_blocks: 1_000,
             fee_burn_percent: 50,
+            decline_fee_bps: 100,
         }
     }
+}
+
+/// Basis points per whole (100%).
+pub const BPS_DENOMINATOR: u16 = 10_000;
+
+/// `bps` basis points of `amount`, rounded up, capped at `amount`.
+/// Split into quotient and remainder so it cannot overflow.
+pub fn bps_of_rounded_up(amount: Amount, bps: u16) -> Amount {
+    let bps = Amount::from(bps.min(BPS_DENOMINATOR));
+    let denom = Amount::from(BPS_DENOMINATOR);
+    amount / denom * bps + (amount % denom * bps).div_ceil(denom)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +127,14 @@ pub enum Event {
     InviteRegistered { owner: Address, key: InviteKey },
     InviteRevoked { owner: Address, key: InviteKey },
     ContactRequested { request: RequestId, from: Address, to: Address, price: Amount },
-    RequestRefunded { request: RequestId, to: Address, amount: Amount, reason: RefundReason },
+    /// `amount` went back to the requester; `burned` was the decline fee.
+    RequestRefunded {
+        request: RequestId,
+        to: Address,
+        amount: Amount,
+        burned: Amount,
+        reason: RefundReason,
+    },
     ChannelOpened { channel: ChannelId, a: Address, b: Address, via: OpenedVia },
     ChannelClosed { channel: ChannelId, by: Address },
 }
@@ -366,13 +391,24 @@ impl<S: InviteScheme> Chain<S> {
         Ok(())
     }
 
+    /// End a request without a paid channel. The decline fee is burned in
+    /// every case except `Superseded` (the pair became real contacts).
     fn refund(&mut self, id: RequestId, reason: RefundReason) {
         if let Some(req) = self.requests.remove(&id) {
-            self.ledger.release(req.from, req.price);
+            let burned = match reason {
+                RefundReason::Superseded => 0,
+                RefundReason::CancelledBy(_) | RefundReason::Expired => {
+                    bps_of_rounded_up(req.price, self.params.decline_fee_bps)
+                }
+            };
+            let amount = req.price - burned;
+            self.ledger.burn_escrowed(burned);
+            self.ledger.release(req.from, amount);
             self.events.push(Event::RequestRefunded {
                 request: id,
                 to: req.from,
-                amount: req.price,
+                amount,
+                burned,
                 reason,
             });
         }

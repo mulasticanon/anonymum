@@ -1,4 +1,4 @@
-//! Murmur over the live Nym mixnet.
+//! Anonymum over the live Nym mixnet.
 //!
 //! Three wallets in one process, each with its own Nym client:
 //!
@@ -7,17 +7,17 @@
 //! * Carol has no channel. Bob's client authenticates her, sees no channel
 //!   on the chain, and drops her.
 //!
-//! The chain here is the in-process simulation from `murmur-core`. The
+//! The chain here is the in-process simulation from `anonymum-core`. The
 //! mixnet and the cryptography are real.
 //!
-//!     cargo run -p murmur-nym
+//!     cargo run -p anonymum-nym
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use murmur_core::{Chain, Envelope, Inbox, Params, Tx, Verdict, COIN};
-use murmur_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent};
-use murmur_crypto::{Ed25519Invites, Identity, InviteSecret};
+use anonymum_core::{Chain, Envelope, Inbox, Params, Tx, Verdict, COIN};
+use anonymum_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent};
+use anonymum_crypto::{Ed25519Invites, Identity, InviteSecret};
 use nym_sdk::mixnet::{
     AnonymousSenderTag, MixnetClient, MixnetClientBuilder, MixnetMessageSender, Recipient,
 };
@@ -37,8 +37,8 @@ impl Endpoint {
     async fn connect(name: &'static str) -> Result<Self, AnyError> {
         let started = Instant::now();
         // Gateways reached over TLS on port 443 work from behind most
-        // firewalls. Set MURMUR_PLAIN_WS=1 to allow any gateway instead.
-        let tls_only = std::env::var_os("MURMUR_PLAIN_WS").is_none();
+        // firewalls. Set ANONYMUM_PLAIN_WS=1 to allow any gateway instead.
+        let tls_only = std::env::var_os("ANONYMUM_PLAIN_WS").is_none();
         let client = MixnetClientBuilder::new_ephemeral()
             .force_tls(tls_only)
             .build()?
@@ -88,7 +88,7 @@ const STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn main() -> Result<(), AnyError> {
     std::thread::Builder::new()
-        .name("murmur-main".into())
+        .name("anonymum-main".into())
         .stack_size(STACK_SIZE)
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()

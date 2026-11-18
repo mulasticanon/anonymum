@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use murmur_core::Address;
+use anonymum_core::Address;
 
 use crate::identity::Identity;
 use crate::session::{Handshake, Session, SessionError};

@@ -1,12 +1,12 @@
 [package]
-name = "murmur-nym"
+name = "anonymum-nym"
 version = "0.1.0"
 edition = "2021"
-description = "Murmur over the Nym mixnet: encrypted chat between two wallets"
+description = "Anonymum over the Nym mixnet: encrypted chat between two wallets"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-murmur-core = { path = "../core" }
-murmur-crypto = { path = "../crypto" }
+anonymum-core = { path = "../core" }
+anonymum-crypto = { path = "../crypto" }
 nym-sdk = "1.21.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

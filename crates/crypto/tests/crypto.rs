@@ -1,6 +1,6 @@
-use murmur_core::crypto::InviteProof;
-use murmur_core::{Chain, Error, Params, Tx, COIN};
-use murmur_crypto::{Ed25519Invites, Handshake, Identity, InviteSecret, Session, SessionError};
+use anonymum_core::crypto::InviteProof;
+use anonymum_core::{Chain, Error, Params, Tx, COIN};
+use anonymum_crypto::{Ed25519Invites, Handshake, Identity, InviteSecret, Session, SessionError};
 
 fn connect(initiator: &Identity, responder: &Identity) -> (Session, Session) {
     let (hs_i, m1) = Handshake::initiate(initiator, responder.address()).unwrap();
@@ -156,6 +156,6 @@ fn identity_survives_save_and_restore() {
 fn oversized_message_is_refused() {
     let (alice, bob) = (Identity::generate(), Identity::generate());
     let (mut a, _b) = connect(&alice, &bob);
-    assert!(matches!(a.seal(&vec![0u8; murmur_crypto::MAX_PLAINTEXT + 1]), Err(SessionError::TooLarge)));
-    assert!(a.seal(&vec![0u8; murmur_crypto::MAX_PLAINTEXT]).is_ok());
+    assert!(matches!(a.seal(&vec![0u8; anonymum_crypto::MAX_PLAINTEXT + 1]), Err(SessionError::TooLarge)));
+    assert!(a.seal(&vec![0u8; anonymum_crypto::MAX_PLAINTEXT]).is_ok());
 }

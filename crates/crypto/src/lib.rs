@@ -1,9 +1,9 @@
-//! Real cryptography for Murmur, built only from audited-in-the-wild crates.
+//! Real cryptography for Anonymum, built only from audited-in-the-wild crates.
 //!
 //! * [`Identity`] — a wallet: Ed25519 key for the address and signatures,
 //!   X25519 key for message encryption, with the second bound to the first.
 //! * [`InviteSecret`] / [`Ed25519Invites`] — one-time invites, replacing the
-//!   insecure mock in `murmur-core`.
+//!   insecure mock in `anonymum-core`.
 //! * [`Handshake`] / [`Session`] — end-to-end encryption between two
 //!   addresses using the Noise XX pattern. Nobody without one of the two
 //!   private keys can read the messages: no node, no developer.

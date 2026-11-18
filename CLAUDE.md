@@ -15,9 +15,9 @@ existing chain) whose purpose is extremely secure, anonymous messaging.
 - Messages never go on-chain. They travel over the Nym mixnet, end-to-end
   encrypted, so no node and no developer can read them.
 
-The project folder is called "Anonymum". The crates are still named
-`murmur-*` (an earlier placeholder). Renaming is pending; ask the owner before
-doing it.
+The currency and project are called Anonymum, and the crates are named
+`anonymum-*`. They were called `murmur-*` (a placeholder) until 2026-11-18;
+the protocol domain labels changed with them (e.g. `"anonymum/invite/v1"`).
 
 ## State as of 2026-11-18
 
@@ -26,13 +26,13 @@ this Windows machine.
 
 | Crate | Contents | Verified |
 |---|---|---|
-| `crates/core` (`murmur-core`) | Chain rules as a deterministic state machine: invites, paid contact requests, escrow, channels, fee split, client-side inbox admission, token-bucket rate limit. Zero dependencies. | 20 tests passed on Linux |
-| `crates/crypto` (`murmur-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `wire` framing (`Initiator`, `Responder<T>`). | 15 tests passed on Linux |
-| `crates/nym` (`murmur-nym`) | Binary: three wallets, three Nym clients, full scenario over the live mixnet. | Ran end to end on Windows, 17 s (one manual run) |
+| `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests, escrow, channels, fee split, client-side inbox admission, token-bucket rate limit. Zero dependencies. | 23 tests, run by CI on Linux and Windows |
+| `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `wire` framing (`Initiator`, `Responder<T>`). | 15 tests, run by CI on Linux and Windows |
+| `crates/nym` (`anonymum-nym`) | Binary: three wallets, three Nym clients, full scenario over the live mixnet. | Ran end to end on Windows, 17 s (one manual run) |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
 VS Build Tools 2026 provide the C++ toolchain. `cargo test` passes 35/35.
-The first `murmur-nym` build took ~23 min. The first run hit
+The first `anonymum-nym` build took ~23 min. The first run hit
 `STATUS_STACK_OVERFLOW` while connecting (Windows main-thread stack is
 1 MiB), so `main` now runs the tokio runtime on 16 MiB stacks. After that the
 whole scenario completed over the live mixnet. Nym's
@@ -43,12 +43,12 @@ tasks below are done; they are kept for history. Next up: roadmap step 4.
 ## First tasks (done 2026-11-18)
 
 1. Run `cargo test` and confirm 35 tests pass on Windows.
-2. Run `cargo run -p murmur-nym` and get the live demo to complete. Expect
+2. Run `cargo run -p anonymum-nym` and get the live demo to complete. Expect
    to debug this. Likely trouble spots:
    - Windows build of the Nym dependency tree (needs MSVC C++ build tools;
      some crates compile C code).
    - Gateway selection: the demo uses `.force_tls(true)`; setting the
-     environment variable `MURMUR_PLAIN_WS=1` allows any gateway.
+     environment variable `ANONYMUM_PLAIN_WS=1` allows any gateway.
    - Whether replies via `send_reply` carry a `sender_tag` back, and whether
      the tag is stable across a caller's messages. The demo keys Bob's
      sessions by the tag from the first handshake frame and falls back to it
@@ -70,8 +70,8 @@ The `.bat` helper scripts that once did steps 1 and 2 were deleted on
 - Nym's docs describe `nym-sdk` 2.0.1; crates.io had 1.21.6 as the newest at
   the time. Check before assuming the docs match.
 - `default-members` in the workspace `Cargo.toml` excludes `crates/nym`, so
-  plain `cargo test` / `cargo build` stay fast. Use `-p murmur-nym`.
-- `murmur_core::crypto::mock` is an insecure stand-in used only by the core
+  plain `cargo test` / `cargo build` stay fast. Use `-p anonymum-nym`.
+- `anonymum_core::crypto::mock` is an insecure stand-in used only by the core
   crate's own tests and example. Never use it outside tests.
 
 ## Rules for this codebase
@@ -92,12 +92,15 @@ The `.bat` helper scripts that once did steps 1 and 2 were deleted on
 
 1. Messages are off-chain; the chain holds money and channel state only.
 2. Invites are one-time key pairs. The opener signs
-   `"murmur/invite/v1" || opener || recipient`, so a proof copied from a
+   `"anonymum/invite/v1" || opener || recipient`, so a proof copied from a
    pending transaction is useless to anyone else.
 3. Relay nodes cannot enforce the fee model (a mixnet hides who talks to
    whom). The recipient's client checks the chain and drops non-contacts.
-4. A stranger's payment sits in escrow: accept pays the recipient; decline
-   or expiry refunds. The network fee is never refunded.
+4. A stranger's payment sits in escrow: accept pays the recipient. Decline,
+   sender cancel or expiry refunds it minus `decline_fee_bps` (default 1%,
+   rounded up), which is burned, never paid to anyone (decided 2026-11-18:
+   paying it to the recipient or the node pool would reward declining).
+   Superseded by an invite: full refund. The network fee is never refunded.
 5. Network fees split between burn and a node reward pool.
 6. Sessions use Noise XX. Each side sends address + binding signature inside
    the encrypted handshake payload; observers learn neither address.
@@ -111,15 +114,13 @@ The `.bat` helper scripts that once did steps 1 and 2 were deleted on
 
 ## Open questions for the owner
 
-- Declined stranger request: full refund (current) or does the recipient
-  keep part?
-- Fee levels are placeholders (0.01 / 0.5 / default price 1.0 coin); they
+- Fee levels are placeholders (0.01 / 0.5 / default price 1.0 coin / 1%
+  decline fee); they
   should come from a spam-cost simulation.
 - After a channel is closed, does the other party need a new invite, or may
   they pay the stranger price?
 - How does a stranger learn a recipient's mixnet address without the chain
   linking wallet to gateway?
-- Project and crate naming.
 
 ## Known gaps that undercut the security claim
 

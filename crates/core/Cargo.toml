@@ -1,8 +1,8 @@
 [package]
-name = "murmur-core"
+name = "anonymum-core"
 version = "0.1.0"
 edition = "2021"
-description = "Protocol core for a pay-to-reach-me private messaging coin (working title: Murmur)"
+description = "Protocol core for a pay-to-reach-me private messaging coin"
 license = "MIT OR Apache-2.0"
 
 # Deliberately zero dependencies in milestone 1: this crate is the pure

@@ -1,6 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use murmur_core::crypto::{invite_message, InviteKey, InviteProof, InviteScheme};
-use murmur_core::Address;
+use anonymum_core::crypto::{invite_message, InviteKey, InviteProof, InviteScheme};
+use anonymum_core::Address;
 use rand_core::OsRng;
 
 /// The private half of a one-time invite.

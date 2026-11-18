@@ -2,9 +2,9 @@
 //!
 //!     cargo run --example demo
 
-use murmur_core::crypto::invite_message;
-use murmur_core::crypto::mock::{MockInviteSecret, MockScheme};
-use murmur_core::*;
+use anonymum_core::crypto::invite_message;
+use anonymum_core::crypto::mock::{MockInviteSecret, MockScheme};
+use anonymum_core::*;
 
 fn coins(amount: Amount) -> String {
     format!("{}.{:06}", amount / COIN, amount % COIN)

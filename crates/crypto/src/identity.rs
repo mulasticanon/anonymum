@@ -1,9 +1,9 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use murmur_core::Address;
+use anonymum_core::Address;
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const BINDING_DOMAIN: &[u8] = b"murmur/msgkey-binding/v1";
+const BINDING_DOMAIN: &[u8] = b"anonymum/msgkey-binding/v1";
 
 /// A wallet's private keys. Never leaves the device.
 ///

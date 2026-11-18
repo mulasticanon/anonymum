@@ -131,6 +131,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "anonymum-core"
+version = "0.1.0"
+
+[[package]]
+name = "anonymum-crypto"
+version = "0.1.0"
+dependencies = [
+ "anonymum-core",
+ "ed25519-dalek",
+ "rand_core 0.6.4",
+ "snow 0.10.0",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "anonymum-nym"
+version = "0.1.0"
+dependencies = [
+ "anonymum-core",
+ "anonymum-crypto",
+ "nym-sdk",
+ "tokio",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3483,32 +3509,6 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
-]
-
-[[package]]
-name = "murmur-core"
-version = "0.1.0"
-
-[[package]]
-name = "murmur-crypto"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "murmur-core",
- "rand_core 0.6.4",
- "snow 0.10.0",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "murmur-nym"
-version = "0.1.0"
-dependencies = [
- "murmur-core",
- "murmur-crypto",
- "nym-sdk",
- "tokio",
 ]
 
 [[package]]

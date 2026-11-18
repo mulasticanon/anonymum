@@ -1,4 +1,4 @@
-//! Murmur protocol core (working title).
+//! Anonymum protocol core.
 //!
 //! This crate models the *on-chain rules* and the *client-side admission
 //! rules* of a messaging coin where:

@@ -84,6 +84,12 @@ impl Ledger {
         Ok(())
     }
 
+    /// Destroy coins held in escrow (the decline fee). Nobody receives them.
+    pub(crate) fn burn_escrowed(&mut self, amount: Amount) {
+        self.escrowed = self.escrowed.checked_sub(amount).expect("escrow underflow");
+        self.burned += amount;
+    }
+
     /// Move coins from escrow into a wallet.
     pub(crate) fn release(&mut self, to: Address, amount: Amount) {
         self.escrowed = self.escrowed.checked_sub(amount).expect("escrow underflow");

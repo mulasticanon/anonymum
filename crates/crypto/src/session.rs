@@ -18,13 +18,13 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use murmur_core::Address;
+use anonymum_core::Address;
 use snow::{Builder, HandshakeState, StatelessTransportState};
 
 use crate::identity::{verify_binding, Identity};
 
 const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
-const PROLOGUE: &[u8] = b"murmur/session/v1";
+const PROLOGUE: &[u8] = b"anonymum/session/v1";
 const CREDENTIALS_LEN: usize = 32 + 64;
 const TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 8;

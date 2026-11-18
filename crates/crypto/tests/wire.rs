@@ -1,5 +1,5 @@
-use murmur_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent, WireError};
-use murmur_crypto::Identity;
+use anonymum_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent, WireError};
+use anonymum_crypto::Identity;
 
 /// Drive a full handshake; `tag` plays the role of the transport's reply handle.
 fn establish(alice: &Identity, bob: &Identity, bob_side: &mut Responder<u32>, tag: u32) -> Initiator {
