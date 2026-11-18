@@ -147,8 +147,7 @@ pub mod pallet {
     }
 
     #[derive(Encode, Decode, MaxEncodedLen, TypeInfo, Clone, PartialEq, Eq, Debug)]
-    pub struct Invite<AccountId, BlockNumber> {
-        pub owner: AccountId,
+    pub struct Invite<BlockNumber> {
         pub expires_at: Option<BlockNumber>,
         /// Only an invite issued after a block can lift it.
         pub seq: u64,
@@ -194,8 +193,16 @@ pub mod pallet {
         StorageMap<_, Blake2_128Concat, T::AccountId, PublishedKey<T::Signature>>;
 
     #[pallet::storage]
-    pub type Invites<T: Config> =
-        StorageMap<_, Blake2_128Concat, InviteKey, Invite<T::AccountId, BlockNumberFor<T>>>;
+    /// (owner, invite key) -> invite. Keyed by owner too, so nobody can
+    /// squat an owner's key by registering it first (audit F2).
+    pub type Invites<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        T::AccountId,
+        Blake2_128Concat,
+        InviteKey,
+        Invite<BlockNumberFor<T>>,
+    >;
 
     #[pallet::storage]
     pub type Channels<T: Config> =
@@ -272,7 +279,6 @@ pub mod pallet {
         ChannelExists,
         InviteAlreadyRegistered,
         UnknownInvite,
-        NotInviteOwner,
         InviteExpired,
         BadInviteProof,
         PriceAboveMax,
@@ -367,9 +373,9 @@ pub mod pallet {
             expires_at: Option<BlockNumberFor<T>>,
         ) -> DispatchResult {
             let owner = ensure_signed(origin)?;
-            ensure!(!Invites::<T>::contains_key(key), Error::<T>::InviteAlreadyRegistered);
+            ensure!(!Invites::<T>::contains_key(&owner, key), Error::<T>::InviteAlreadyRegistered);
             let seq = Self::take_seq();
-            Invites::<T>::insert(key, Invite { owner: owner.clone(), expires_at, seq });
+            Invites::<T>::insert(&owner, key, Invite { expires_at, seq });
             Self::deposit_event(Event::InviteRegistered { owner, key });
             Ok(())
         }
@@ -378,9 +384,9 @@ pub mod pallet {
         #[pallet::weight(placeholder::<T>(1, 1))]
         pub fn revoke_invite(origin: OriginFor<T>, key: InviteKey) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let invite = Invites::<T>::get(key).ok_or(Error::<T>::UnknownInvite)?;
-            ensure!(invite.owner == who, Error::<T>::NotInviteOwner);
-            Invites::<T>::remove(key);
+            // Only the owner's own entry can be found, so only the owner can
+            // revoke it.
+            ensure!(Invites::<T>::take(&who, key).is_some(), Error::<T>::UnknownInvite);
             Self::deposit_event(Event::InviteRevoked { owner: who, key });
             Ok(())
         }
@@ -399,8 +405,7 @@ pub mod pallet {
             let opener = ensure_signed(origin)?;
             ensure!(opener != recipient, Error::<T>::SelfContact);
             ensure!(!ChannelByPair::<T>::contains_key(pair::<T>(&opener, &recipient)), Error::<T>::ChannelExists);
-            let invite = Invites::<T>::get(key).ok_or(Error::<T>::UnknownInvite)?;
-            ensure!(invite.owner == recipient, Error::<T>::UnknownInvite);
+            let invite = Invites::<T>::get(&recipient, key).ok_or(Error::<T>::UnknownInvite)?;
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(invite.expires_at.map_or(true, |deadline| now <= deadline), Error::<T>::InviteExpired);
             if let Some(blocked_at) = Blocks::<T>::get(&recipient, &opener) {
@@ -416,7 +421,7 @@ pub mod pallet {
                 Error::<T>::BadInviteProof
             );
             Self::pay_network_fee(&opener, T::InviteOpenFee::get())?;
-            Invites::<T>::remove(key);
+            Invites::<T>::remove(&recipient, key);
             if let Some(id) = RequestByPair::<T>::get(pair::<T>(&opener, &recipient)) {
                 Self::refund(id, RefundReason::Superseded);
             }
@@ -514,7 +519,8 @@ pub mod pallet {
         }
 
         /// Block an address: its paid requests fail, its pending request is
-        /// refunded in full, an open channel with it is closed.
+        /// refunded in full, the blocker's own pending request to it is
+        /// cancelled (decline fee burned), an open channel with it is closed.
         #[pallet::call_index(10)]
         #[pallet::weight(placeholder::<T>(5, 8))]
         pub fn block(origin: OriginFor<T>, target: T::AccountId) -> DispatchResult {
@@ -527,9 +533,17 @@ pub mod pallet {
                     Self::remove_channel(channel, &ch, who.clone());
                 }
             }
+            // The target's pending request is refunded in full; the
+            // blocker's own is cancelled as a sender cancel (decline fee
+            // burned; audit F4).
             if let Some(id) = RequestByPair::<T>::get(&key) {
-                if Requests::<T>::get(id).is_some_and(|r| r.from == target) {
-                    Self::refund(id, RefundReason::Blocked);
+                if let Some(req) = Requests::<T>::get(id) {
+                    let reason = if req.from == target {
+                        RefundReason::Blocked
+                    } else {
+                        RefundReason::CancelledBy(who.clone())
+                    };
+                    Self::refund(id, reason);
                 }
             }
             Self::add_block(who, target);

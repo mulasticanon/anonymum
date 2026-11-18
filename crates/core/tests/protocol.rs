@@ -480,11 +480,29 @@ fn blocking_refunds_a_pending_request_in_full() {
 }
 
 #[test]
-fn blocking_leaves_the_blockers_own_request_alone() {
+fn blocking_cancels_the_blockers_own_request_with_decline_fee() {
     let (mut chain, _, bob, carol) = setup();
-    chain.apply(bob, req(carol, COIN)).unwrap();
-    chain.apply(bob, Tx::Block { target: carol }).unwrap();
-    assert_eq!(chain.ledger().escrowed(), COIN);
+    let events = chain.apply(bob, req(carol, COIN)).unwrap();
+    let Event::ContactRequested { request, .. } = events[0] else { panic!() };
+
+    let events = chain.apply(bob, Tx::Block { target: carol }).unwrap();
+
+    assert_eq!(
+        events,
+        vec![
+            Event::RequestRefunded {
+                request,
+                to: bob,
+                amount: COIN - DECLINE_FEE,
+                burned: DECLINE_FEE,
+                reason: RefundReason::CancelledBy(bob),
+            },
+            Event::Blocked { by: bob, target: carol },
+        ]
+    );
+    assert_eq!(chain.ledger().escrowed(), 0);
+    assert!(chain.request(request).is_none(), "Carol can no longer accept it");
+    assert!(chain.ledger().is_balanced());
 }
 
 #[test]
@@ -717,4 +735,57 @@ fn coins_are_conserved_across_a_mixed_history() {
 
     assert!(chain.ledger().is_balanced());
     assert_eq!(chain.ledger().issued(), issued);
+}
+
+// ---- F1: no arithmetic overflow ---------------------------------------------
+
+#[test]
+fn a_price_near_u128_max_cannot_wrap_past_the_funds_check() {
+    let (mut chain, _, bob, carol) = setup();
+    let fee = chain.params().cold_network_fee;
+    chain.apply(bob, Tx::SetContactPrice { price: u128::MAX - fee + 1 }).unwrap();
+    let tx = Tx::RequestContact { recipient: bob, max_price: u128::MAX, note: note() };
+    let err = chain.apply(carol, tx.clone()).unwrap_err();
+    assert!(matches!(err, Error::InsufficientFunds { .. }), "got {err:?}");
+    fails_charging_nothing(&mut chain, carol, tx, err);
+}
+
+#[test]
+fn time_saturates_instead_of_wrapping() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.advance_blocks(u64::MAX - 5);
+    chain.apply(carol, req(bob, COIN)).unwrap(); // expiry would overflow u64
+    chain.advance_blocks(u64::MAX); // must not panic
+    assert_eq!(chain.height(), u64::MAX);
+    assert!(chain.ledger().is_balanced());
+}
+
+// ---- F2: invite keys cannot be squatted -------------------------------------
+
+#[test]
+fn a_squatted_invite_key_does_not_stop_the_owner_or_the_invitee() {
+    let (mut chain, alice, bob, carol) = setup();
+    let secret = MockInviteSecret::from_seed(42);
+    // Carol sees Bob's pending registration and registers the key first.
+    chain.apply(carol, Tx::RegisterInvite { key: secret.public(), expires_at: None }).unwrap();
+    // Bob's own registration still succeeds, and Alice can use it.
+    chain.apply(bob, Tx::RegisterInvite { key: secret.public(), expires_at: None }).unwrap();
+    chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
+    assert!(chain.channel_between(&alice, &bob).is_some());
+    // Carol's entry is separate: still registered, so she cannot add it twice.
+    fails_charging_nothing(
+        &mut chain,
+        carol,
+        Tx::RegisterInvite { key: secret.public(), expires_at: None },
+        Error::InviteAlreadyRegistered,
+    );
+}
+
+#[test]
+fn only_the_owner_can_revoke_an_invite() {
+    let (mut chain, alice, bob, _) = setup();
+    let secret = bob_invite(&mut chain, bob, 1);
+    fails_charging_nothing(&mut chain, alice, Tx::RevokeInvite { key: secret.public() }, Error::UnknownInvite);
+    chain.apply(bob, Tx::RevokeInvite { key: secret.public() }).unwrap();
+    fails_charging_nothing(&mut chain, alice, open_tx(&secret, alice, bob), Error::UnknownInvite);
 }

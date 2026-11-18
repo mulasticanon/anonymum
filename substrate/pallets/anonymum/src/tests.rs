@@ -162,13 +162,34 @@ fn expired_invite_is_rejected() {
 fn invites_can_be_revoked_only_by_their_owner() {
     new_test_ext().execute_with(|| {
         let secret = invite("bob", 1);
-        assert_noop!(Anonymum::revoke_invite(signed("alice"), secret.public().0), Error::<Test>::NotInviteOwner);
+        // Alice can only find (and revoke) invites registered under her own name.
+        assert_noop!(Anonymum::revoke_invite(signed("alice"), secret.public().0), Error::<Test>::UnknownInvite);
         assert_noop!(
-            Anonymum::register_invite(signed("alice"), secret.public().0, None),
+            Anonymum::register_invite(signed("bob"), secret.public().0, None),
             Error::<Test>::InviteAlreadyRegistered
         );
         assert_ok!(Anonymum::revoke_invite(signed("bob"), secret.public().0));
         assert_noop!(open("alice", "bob", &secret), Error::<Test>::UnknownInvite);
+    });
+}
+
+#[test]
+fn a_squatted_invite_key_does_not_stop_the_owner_or_the_invitee() {
+    new_test_ext().execute_with(|| {
+        // Carol sees Bob's pending registration and registers the key first.
+        let secret = ed25519::Pair::from_seed(&blake2_256(b"bob's invite"));
+        assert_ok!(Anonymum::register_invite(signed("carol"), secret.public().0, None));
+        // Bob's own registration still succeeds, and Alice can use it.
+        assert_ok!(Anonymum::register_invite(signed("bob"), secret.public().0, None));
+        assert_ok!(open("alice", "bob", &secret));
+        assert!(channel("alice", "bob").is_some());
+        // Carol's entry is separate and untouched; Bob's is used up.
+        assert!(crate::pallet::Invites::<Test>::contains_key(account("carol"), secret.public().0));
+        assert!(!crate::pallet::Invites::<Test>::contains_key(account("bob"), secret.public().0));
+        assert_noop!(
+            Anonymum::register_invite(signed("carol"), secret.public().0, None),
+            Error::<Test>::InviteAlreadyRegistered
+        );
     });
 }
 
@@ -442,11 +463,31 @@ fn blocking_refunds_a_pending_request_in_full() {
 }
 
 #[test]
-fn blocking_leaves_the_blockers_own_request_alone() {
+fn blocking_cancels_the_blockers_own_request_with_decline_fee() {
     new_test_ext().execute_with(|| {
         assert_ok!(req("bob", "carol", COIN));
+        let request = last_request();
+        let issuance_before = issuance();
+        System::reset_events();
+
         assert_ok!(Anonymum::block(signed("bob"), account("carol")));
-        assert_eq!(held("bob"), COIN);
+
+        assert_eq!(
+            new_events(),
+            vec![
+                Event::RequestRefunded {
+                    request,
+                    to: account("bob"),
+                    amount: COIN - DECLINE_FEE,
+                    burned: DECLINE_FEE,
+                    reason: RefundReason::CancelledBy(account("bob")),
+                },
+                Event::Blocked { by: account("bob"), target: account("carol") },
+            ]
+        );
+        assert_eq!(held("bob"), 0);
+        assert_eq!(issuance_before - issuance(), DECLINE_FEE);
+        assert!(Requests::<Test>::get(request).is_none(), "Carol can no longer accept it");
     });
 }
 

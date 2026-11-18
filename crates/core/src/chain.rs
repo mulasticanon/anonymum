@@ -99,7 +99,6 @@ pub struct Channel {
 
 #[derive(Debug, Clone)]
 struct Invite {
-    owner: Address,
     expires_at: Option<BlockHeight>,
     /// Position in the chain's history of invites and blocks. Only an
     /// invite issued after a block can lift that block.
@@ -152,7 +151,8 @@ pub enum Tx {
     /// closer again.
     CloseChannel { channel: ChannelId },
     /// Block an address: its paid requests fail, its pending request is
-    /// refunded in full, an open channel with it is closed.
+    /// refunded in full, the blocker's own pending request to it is
+    /// cancelled (decline fee burned), an open channel with it is closed.
     Block { target: Address },
     Unblock { target: Address },
 }
@@ -205,7 +205,6 @@ pub enum Error {
     ChannelExists,
     InviteAlreadyRegistered,
     UnknownInvite,
-    NotInviteOwner,
     InviteExpired,
     BadInviteProof,
     PriceAboveMax { price: Amount },
@@ -247,7 +246,9 @@ pub struct Chain<S: InviteScheme> {
     /// Addresses that refuse paid requests from strangers.
     invite_only: BTreeSet<Address>,
     messaging_keys: BTreeMap<Address, PublishedKey>,
-    invites: BTreeMap<InviteKey, Invite>,
+    /// (owner, invite key) -> invite. Keyed by owner too, so nobody can
+    /// squat an owner's key by registering it first (audit F2).
+    invites: BTreeMap<(Address, InviteKey), Invite>,
     channels: BTreeMap<ChannelId, Channel>,
     by_pair: BTreeMap<(Address, Address), ChannelId>,
     requests: BTreeMap<RequestId, ContactRequest>,
@@ -335,7 +336,7 @@ impl<S: InviteScheme> Chain<S> {
     /// refunded. Returns the events this produced.
     pub fn advance_blocks(&mut self, blocks: BlockHeight) -> Vec<Event> {
         let start = self.events.len();
-        self.height += blocks;
+        self.height = self.height.saturating_add(blocks);
         let expired: Vec<RequestId> = self
             .requests
             .values()
@@ -373,19 +374,17 @@ impl<S: InviteScheme> Chain<S> {
                 self.events.push(Event::MessagingKeyPublished { who: sender, key });
             }
             Tx::RegisterInvite { key, expires_at } => {
-                if self.invites.contains_key(&key) {
+                if self.invites.contains_key(&(sender, key)) {
                     return Err(Error::InviteAlreadyRegistered);
                 }
                 let seq = self.take_seq();
-                self.invites.insert(key, Invite { owner: sender, expires_at, seq });
+                self.invites.insert((sender, key), Invite { expires_at, seq });
                 self.events.push(Event::InviteRegistered { owner: sender, key });
             }
             Tx::RevokeInvite { key } => {
-                let invite = self.invites.get(&key).ok_or(Error::UnknownInvite)?;
-                if invite.owner != sender {
-                    return Err(Error::NotInviteOwner);
-                }
-                self.invites.remove(&key);
+                // Only the owner's own entry can be found, so only the owner
+                // can revoke it.
+                self.invites.remove(&(sender, key)).ok_or(Error::UnknownInvite)?;
                 self.events.push(Event::InviteRevoked { owner: sender, key });
             }
             Tx::OpenWithInvite { recipient, key, proof } => {
@@ -421,14 +420,23 @@ impl<S: InviteScheme> Chain<S> {
                 if let Some(&channel) = self.by_pair.get(&pair(sender, target)) {
                     self.close_channel(channel, sender);
                 }
-                let pending: Vec<RequestId> = self
+                // At most one request is pending per pair. The target's is
+                // refunded in full; the blocker's own is cancelled as a
+                // sender cancel, so the decline fee is burned (decided
+                // 2026-11-18, audit F4).
+                let pending: Vec<(RequestId, Address)> = self
                     .requests
                     .values()
-                    .filter(|r| r.from == target && r.to == sender)
-                    .map(|r| r.id)
+                    .filter(|r| pair(r.from, r.to) == pair(sender, target))
+                    .map(|r| (r.id, r.from))
                     .collect();
-                for id in pending {
-                    self.refund(id, RefundReason::Blocked);
+                for (id, from) in pending {
+                    let reason = if from == target {
+                        RefundReason::Blocked
+                    } else {
+                        RefundReason::CancelledBy(sender)
+                    };
+                    self.refund(id, reason);
                 }
                 self.add_block(sender, target);
             }
@@ -455,10 +463,7 @@ impl<S: InviteScheme> Chain<S> {
         if self.by_pair.contains_key(&pair(opener, recipient)) {
             return Err(Error::ChannelExists);
         }
-        let invite = self.invites.get(&key).ok_or(Error::UnknownInvite)?;
-        if invite.owner != recipient {
-            return Err(Error::UnknownInvite);
-        }
+        let invite = self.invites.get(&(recipient, key)).ok_or(Error::UnknownInvite)?;
         if invite.expires_at.is_some_and(|deadline| self.height > deadline) {
             return Err(Error::InviteExpired);
         }
@@ -478,7 +483,7 @@ impl<S: InviteScheme> Chain<S> {
             self.params.invite_open_fee,
             self.params.fee_burn_percent,
         )?;
-        self.invites.remove(&key); // one-time use
+        self.invites.remove(&(recipient, key)); // one-time use
         let superseded: Vec<RequestId> = self
             .requests
             .values()
@@ -525,11 +530,16 @@ impl<S: InviteScheme> Chain<S> {
             return Err(Error::PriceAboveMax { price });
         }
         let fee = self.params.cold_network_fee;
-        self.ledger.can_pay(&from, fee + price)?;
+        // Checked: a price near u128::MAX must not wrap past the funds check.
+        let total = fee.checked_add(price).ok_or(Error::InsufficientFunds {
+            needed: Amount::MAX,
+            available: self.ledger.balance(&from),
+        })?;
+        self.ledger.can_pay(&from, total)?;
         self.ledger.pay_network_fee(from, fee, self.params.fee_burn_percent)?;
         self.ledger.lock(from, price)?;
         let id = RequestId(self.take_id());
-        let expires_at = self.height + self.params.request_ttl_blocks();
+        let expires_at = self.height.saturating_add(self.params.request_ttl_blocks());
         self.requests.insert(
             id,
             ContactRequest { id, from, to, price, expires_at, note: note.clone() },
@@ -559,6 +569,7 @@ impl<S: InviteScheme> Chain<S> {
                     bps_of_rounded_up(req.price, self.params.decline_fee_bps)
                 }
             };
+            // `burned <= price`: `bps_of_rounded_up` is capped at 100%.
             let amount = req.price - burned;
             self.ledger.burn_escrowed(burned);
             self.ledger.release(req.from, amount);
