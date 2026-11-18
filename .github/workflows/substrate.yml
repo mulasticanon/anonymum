@@ -1,0 +1,27 @@
+name: Substrate pallet
+
+# The Polkadot SDK build is large, so this runs only when the Substrate port
+# changes. It runs the pallet's unit tests; the WebAssembly runtime and the
+# live dev node are checked manually (see README, "Local node").
+on:
+  push:
+    paths: ["substrate/**", ".github/workflows/substrate.yml"]
+  pull_request:
+    paths: ["substrate/**", ".github/workflows/substrate.yml"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pallet-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: substrate
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: substrate
+      - run: cargo test --locked -p pallet-anonymum

@@ -6,13 +6,15 @@ A messaging coin where reaching someone costs money unless they invited you.
 - **Stranger**: pays a larger network fee plus a price the recipient sets.
 - **After that**: messages are free, rate limited, and travel over the Nym mixnet.
 
-Three crates:
+Three crates, plus a Substrate port in `substrate/`:
 
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, client-side admission, rate limits. No dependencies. | 45 tests |
 | `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing. | 25 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 (see below). Not an automated test. |
+
+| `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 45 tests (43 rule tests ported from the core crate); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
 
@@ -60,6 +62,52 @@ the 48 h a request lives, so the accepting side must keep calling again until
 the request would have expired. The demo retries every 150 s; a real client
 would retry on a slower schedule.
 
+## Substrate pallet and local node (roadmap step 4)
+
+`substrate/` is its own Cargo workspace (own `Cargo.lock`) so the Polkadot SDK
+cannot disturb the pinned Nym crates.
+
+    cd substrate
+    cargo test -p pallet-anonymum                 # 45 tests, mock runtime
+    cargo build --release -p anonymum-runtime     # native + WebAssembly runtime
+
+On Windows (Rust 1.100, 8 cores, 7.7 GB RAM, `-j 4`): the first release
+runtime build took 27 min; later runtime rebuilds took about 2–3 min.
+(The first pallet build was interrupted by a restart, so its full time was
+not measured.)
+
+The local node runs in WSL2 (Polkadot SDK nodes are not supported on native
+Windows), using Parity's prebuilt `polkadot-omni-node` 1.25.2:
+
+    # inside WSL/Ubuntu
+    bash substrate/scripts/get-omni-node.sh       # download + SHA-256 check
+    bash substrate/scripts/run-node.sh            # dev chain on 127.0.0.1:9944
+
+    # on Windows, with the node running
+    cd substrate/scripts && npm install && node smoke.mjs
+
+`smoke.mjs` sends real signed transactions and checks balances and events
+after each: a messaging key (and a forged one refused), an invite channel, a
+stranger's paid request with its sealed note accepted, a declined request
+with the 1% burn, a blocked address refused, a closed channel blocking the
+other side, and total issuance falling by exactly the burns plus transaction
+fees. All checks passed on 2026-11-18 (three runs on fresh chains).
+
+Differences from the in-process simulation:
+- Escrow is a balance hold; the reward pool is the pallet's account.
+- Accounts must keep the existential deposit, so payments cannot empty them.
+- A failed transaction changes no pallet state and takes no pallet fee, but
+  the chain's own transaction fee is still charged (1 unit in this demo
+  runtime), as on any Substrate chain.
+- Expiry uses one queue per block; at most `MaxRequestsPerBlock` (256)
+  requests can expire in one block, and a request that would overflow it
+  fails without charge.
+- Weights are placeholders, not benchmarks.
+- The runtime exposes a stub Aura API (6 s slots, no authorities) only
+  because omni-node's dev mode reads it. There is no Aura consensus.
+- Dev accounts are sr25519 (Substrate's default); the binding check accepts
+  any Substrate signature type, while `anonymum-crypto` wallets are Ed25519.
+
 ## What is real and what is not
 
 | Piece | Status |
@@ -70,7 +118,7 @@ would retry on a slower schedule.
 | End-to-end encryption | Noise XX (X25519, ChaCha20-Poly1305, BLAKE2s). Addresses are proven inside the encrypted handshake, so observers learn neither party |
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |
 | Mixnet transport | Nym SDK; replies go through single-use reply blocks, so the recipient never learns the caller's network location. Ran once live; no automated test |
-| The chain itself | Simulated in-process. No real blockchain yet |
+| The chain itself | Rules run as a Substrate pallet on a local single-node dev chain (manual seal, 6 s blocks). No real network, consensus or validators yet |
 | Shielded payments | Not started. The channel table is public |
 | Node staking and rewards | Pool accumulates; payout not started |
 | Post-quantum key exchange, per-message forward secrecy | Not started |
@@ -142,7 +190,9 @@ would retry on a slower schedule.
 3. **Done** — Nym transport demo, run live over the mixnet.
    **Done** — closing blocks, direct blocking, reverse rendezvous for
    strangers, invite-only wallets, 48 h expiry.
-4. Port `chain.rs` to a Substrate pallet; run a local test chain.
+4. **Done** — `chain.rs` ported to a Substrate pallet; local dev chain runs it
+   with real transactions. Not done: benchmarked weights, a real network
+   with consensus, our own node binary.
 5. Shielded channel opening, so the chain no longer reveals the contact graph.
 6. Double ratchet and post-quantum key exchange.
 7. Node staking, reward payout, fee simulation, external audit.

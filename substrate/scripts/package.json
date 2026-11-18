@@ -1,0 +1,10 @@
+{
+  "name": "anonymum-smoke-test",
+  "private": true,
+  "type": "module",
+  "description": "Sends real transactions to a local Anonymum dev node and checks the results.",
+  "scripts": { "smoke": "node smoke.mjs" },
+  "dependencies": {
+    "@polkadot/api": "17.0.2"
+  }
+}

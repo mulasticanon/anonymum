@@ -1,0 +1,18 @@
+# Substrate (Polkadot SDK) port of anonymum-core's chain rules.
+# A separate workspace with its own Cargo.lock, so the Polkadot SDK's
+# dependency tree cannot disturb the pinned Nym crates in the main workspace.
+[workspace]
+resolver = "2"
+members = ["pallets/anonymum", "runtime"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# polkadot-stable2609-2 ships the umbrella crate at 2609.3.0.
+polkadot-sdk = { version = "=2609.3.0", default-features = false }
+codec = { version = "3.7.5", default-features = false, package = "parity-scale-codec", features = ["derive"] }
+scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.132", default-features = false, features = ["alloc"] }
+pallet-anonymum = { path = "pallets/anonymum", default-features = false }

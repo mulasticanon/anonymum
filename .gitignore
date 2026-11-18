@@ -3,3 +3,8 @@
 *.zip
 # Local run logs
 *-output.txt
+
+# Node.js (substrate/scripts)
+node_modules/
+# Substrate build output
+/substrate/target/

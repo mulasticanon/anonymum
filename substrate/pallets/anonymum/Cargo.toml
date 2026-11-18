@@ -1,0 +1,19 @@
+[package]
+name = "pallet-anonymum"
+version = "0.1.0"
+description = "Anonymum chain rules as a FRAME pallet: invites, paid contact requests with sealed notes, channels, blocks, fees."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+codec = { workspace = true }
+scale-info = { workspace = true }
+polkadot-sdk = { workspace = true, features = ["experimental", "runtime"] }
+
+[dev-dependencies]
+polkadot-sdk = { workspace = true, features = ["experimental", "runtime", "pallet-balances", "std"] }
+
+[features]
+default = ["std"]
+std = ["codec/std", "polkadot-sdk/std", "scale-info/std"]

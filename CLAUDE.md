@@ -28,6 +28,8 @@ Windows machine (see the update below).
 |---|---|---|
 | `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 48 h expiry, client-side inbox admission, token-bucket rate limit. Zero dependencies. | 45 tests, run by CI on Linux and Windows |
 | `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `note` (`seal_note` / `open_note`, Noise N), `wire` framing (`Initiator`, `Responder<T>`; a repeated first frame gets the same reply). | 25 tests, run by CI on Linux and Windows |
+| `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 45 tests (43 ported rule tests + 2 FRAME checks); CI workflow `substrate.yml` |
+| `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
 | `crates/nym` (`anonymum-nym`) | Binary: Alice (invite), Carol (stranger, reverse rendezvous with a persisted throwaway client and retrying caller), Dave (dropped). | Manual live runs on Windows, see README |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
@@ -38,8 +40,8 @@ The first `anonymum-nym` build took ~23 min. The first run hit
 whole scenario completed over the live mixnet. Nym's
 `get_or_create_sender_tag(&recipient)` gives one stable tag per
 sender/recipient pair, so keying Bob's sessions by tag is fine. The first
-tasks below are done; they are kept for history. Next up: roadmap step 4
-(waiting for the owner's go-ahead on the plan).
+tasks below are done; they are kept for history. Roadmap step 4 is done
+too (see "Substrate port" below). Next up: roadmap step 5.
 
 ## First tasks (done 2026-11-18)
 
@@ -169,6 +171,43 @@ Still visible on-chain until roadmap step 5: that wallet Y requested wallet
 X, the sealed note, messaging keys, and who blocked whom. Keep the pallet
 storage for these thin; step 5 replaces it.
 
+## Substrate port (roadmap step 4, done 2026-11-18)
+
+- Layout: `substrate/` workspace with `pallets/anonymum` (lib, `mock.rs`,
+  `tests.rs`), `runtime/` (from the SDK minimal template), `scripts/`
+  (`get-omni-node.sh`, `run-node.sh` for WSL; `smoke.mjs` for Windows).
+- Mapping: escrow = `fungible::MutateHold` with `HoldReason::ContactEscrow`;
+  network fee = `burn_from` + transfer to the pallet account (PalletId
+  `anonymum`, must be endowed at genesis); decline fee = `burn_held`;
+  expiry = `ExpiryQueue` per block, processed in `on_initialize`;
+  pending-request lookup = `RequestByPair` (no scans). Invite proofs:
+  `sp_io::crypto::ed25519_verify`. Key binding: `T::Signature: Verify`
+  (`MultiSignature` in the runtime).
+- Choices to revisit: `MaxRequestsPerBlock` caps expiries per block (256 in
+  the runtime; overflow fails with `ExpiryQueueFull`, no charge); payments
+  keep the existential deposit; weights are placeholders; the chain's own
+  transaction fee is charged even on failed calls.
+
+Things that bit, so they do not bite again:
+- Build: cargo is not on the tool PATH (prefix `%USERPROFILE%\.cargoin`);
+  use `-j 4` (7.7 GB RAM). Needs `rustup target add wasm32v1-none` and
+  `rustup component add rust-src` for the runtime.
+- FRAME in this release: the supertrait must be written
+  `polkadot_sdk::frame_system::Config<RuntimeEvent: From<Event<Self>>>`
+  (full path; a separate `type RuntimeEvent` is deprecated), and
+  `RuntimeDebug` is not exported here (use `Debug`).
+- `assert_noop!` compares the whole storage root, so do any setup (e.g.
+  registering an invite) before it, not inside it.
+- omni-node 1.25.2 only drives Aura runtimes: the runtime has a stub
+  `AuraApi` (6 s, no authorities) for dev mode, and the chain spec needs
+  placeholder `-c dev -p 1000` (relay chain / para id) or it refuses to load.
+  No relay chain is contacted.
+- With manual seal, transactions go Ready -> Finalized with no InBlock
+  status; Polkadot.js reads a raw `Uint8Array` for `Bytes` as already
+  length-prefixed (pass hex). Both are handled in `smoke.mjs`.
+- WSL2 has 3.8 GB RAM: fine to run the node, not to compile one.
+- The omni-node checksum is checked, its GPG signature is not.
+
 ## Open questions for the owner
 
 - Fee levels are placeholders (0.01 / 0.5 / default price 1.0 coin / 1%
@@ -182,7 +221,8 @@ storage for these thin; step 5 replaces it.
   whom. Needs shielded payments (Zcash-style proofs or stealth addresses).
 - Forward secrecy is per session, not per message. No double ratchet yet.
 - No post-quantum key exchange.
-- The chain is simulated in-process; there is no real blockchain.
+- The chain runs only as a single-node dev chain (manual seal). No real
+  network, consensus, validators or benchmarked weights yet.
 - No node staking or reward payout.
 - A privacy coin faces EU exchange restrictions from July 2027 (AMLR).
   The owner should take legal advice before any public sale.
@@ -193,7 +233,8 @@ storage for these thin; step 5 replaces it.
 2. Done: real invites, identities, sessions, framing.
 3. Done: live Nym run (2026-11-18, Windows).
    Done: decisions A-C in the existing crates, demo run live (2026-11-18).
-4. Port `chain.rs` to a Substrate pallet (Polkadot SDK); local test chain.
+4. Done: `chain.rs` ported to `pallet-anonymum`; local dev chain with real
+   transactions (2026-11-18).
 5. Shielded channel opening.
 6. Double ratchet and post-quantum key exchange.
 7. Node staking, reward payout, fee simulation, external audit.
