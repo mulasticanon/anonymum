@@ -189,7 +189,7 @@ storage for these thin; step 5 replaces it.
   transaction fee is charged even on failed calls.
 
 Things that bit, so they do not bite again:
-- Build: cargo is not on the tool PATH (prefix `%USERPROFILE%\.cargoin`);
+- Build: cargo is not on the tool PATH (prefix `%USERPROFILE%\.cargo\bin`);
   use `-j 4` (7.7 GB RAM). Needs `rustup target add wasm32v1-none` and
   `rustup component add rust-src` for the runtime.
 - FRAME in this release: the supertrait must be written
