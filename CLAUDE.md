@@ -31,7 +31,7 @@ this Windows machine.
 | `crates/nym` (`anonymum-nym`) | Binary: three wallets, three Nym clients, full scenario over the live mixnet. | Ran end to end on Windows, 17 s (one manual run) |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
-VS Build Tools 2026 provide the C++ toolchain. `cargo test` passes 35/35.
+VS Build Tools 2026 provide the C++ toolchain. `cargo test` passed 35/35 at the time (38 since the decline-fee tests).
 The first `anonymum-nym` build took ~23 min. The first run hit
 `STATUS_STACK_OVERFLOW` while connecting (Windows main-thread stack is
 1 MiB), so `main` now runs the tokio runtime on 16 MiB stacks. After that the
@@ -112,15 +112,71 @@ The `.bat` helper scripts that once did steps 1 and 2 were deleted on
    traffic correlation). An optional faster onion mode for calls and large
    files was discussed but is not planned yet.
 
+## Decided 2026-11-18, not yet implemented
+
+Build these into the chain work (roadmap step 4). Each needs tests,
+including failure paths that charge nothing.
+
+**A. Closing a channel blocks the closed-out address.**
+- When X closes a channel with Y, Y may no longer send X a paid contact
+  request. `RequestContact` from Y to X fails before any fee is charged.
+- Only the closer can reopen: X can register a new invite and hand it to Y.
+  Y using a valid invite from X clears the block.
+- X is not blocked from paying to request Y (unless Y separately blocks X).
+- The block is per address. A new wallet is not blocked; that is accepted.
+  It still pays the network fee and risks the decline fee each attempt.
+- A user may also block any address directly, with no prior channel
+  (decided 2026-11-18: for known spammers and harassers). Add `Block` and
+  `Unblock` transactions. A block has the same effect as closing: paid
+  requests from that address fail before any fee is charged; a pending
+  request from it is refunded in full (treat like `Superseded`, no decline
+  fee, since the requester did nothing wrong by the rules at the time);
+  an open channel with it is closed. Only the blocker can lift it, by
+  `Unblock` or by issuing an invite that the blocked address then uses.
+
+**B. No mixnet address is ever published. Strangers are reached by
+reverse rendezvous.**
+- Each wallet publishes its X25519 messaging public key on-chain, with the
+  existing binding signature so it is tied to the address. A key is not a
+  location.
+- `RequestContact` carries a sealed note encrypted to the recipient's
+  messaging key. Contents: a throwaway mixnet address created for this one
+  request, and a short intro message. The intro is greeting-length: at
+  most 280 bytes of UTF-8 (a proposed cap; the owner asked for "as long as a
+  greeting", e.g. "Hello, it's X, I really need to talk to you about Y").
+  Reject longer at the client and on-chain. Pad the whole note to one fixed
+  size so length leaks nothing. Use a vetted sealed-box / one-way
+  Noise construction (e.g. Noise N or X via `snow`); do not invent one.
+- The recipient's client decrypts the note and shows the intro. On accept,
+  the recipient calls the requester at the throwaway address (the recipient
+  is now the Noise initiator). Inside the session both sides exchange their
+  long-lived mixnet addresses.
+- A wallet can switch stranger requests off entirely (invite-only). A
+  request to such a wallet fails before any fee is charged.
+- Invited contacts still receive the mixnet address with the invite, out of
+  band, as now.
+
+**C. Contact requests expire after 48 hours.**
+- Define the TTL as a duration and derive the block count from the chain's
+  block time (at Substrate's default 6 s blocks, 48 h = 28,800 blocks).
+  `request_ttl_blocks: 1_000` in `Params` is a placeholder to replace.
+- Expiry refunds as today (price minus the burned decline fee).
+- Consequence for B: the requester's throwaway mixnet identity must be
+  persisted to disk and remain reachable for up to 48 h, and be discarded
+  after accept, decline or expiry. Check how long Nym gateways hold
+  messages for an offline client before relying on store-and-forward; if it
+  is shorter than 48 h, the accepting side needs to retry.
+
+Still visible on-chain until roadmap step 5: that wallet Y requested wallet
+X, and who blocked whom. Keep the pallet storage for A and B thin; step 5
+replaces it.
+
 ## Open questions for the owner
 
 - Fee levels are placeholders (0.01 / 0.5 / default price 1.0 coin / 1%
   decline fee); they
   should come from a spam-cost simulation.
-- After a channel is closed, does the other party need a new invite, or may
-  they pay the stranger price?
-- How does a stranger learn a recipient's mixnet address without the chain
-  linking wallet to gateway?
+- Is 280 bytes the right cap for the intro message?
 
 ## Known gaps that undercut the security claim
 

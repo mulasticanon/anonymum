@@ -77,11 +77,21 @@ can key sessions by that tag.
 
 - **Fee levels**: current numbers (0.01 / 0.5 / default price 1.0 / decline fee 1%) are
   placeholders. They should come out of a spam-cost simulation.
-- **Closing a channel**: either side can close for free today. Should the
-  closed-out party need a new invite, or can they pay the stranger price?
-- **Finding someone's mixnet address**: invited contacts can receive it with
-  the invite. For strangers it must be published somewhere, and publishing
-  it on-chain ties a wallet to a gateway. Needs a design decision.
+- **Intro message cap**: 280 bytes is proposed. Right size?
+
+## Decided, not yet built
+
+- **Closing blocks.** If you close a channel, the other address cannot pay to
+  reach you again. Only you can reopen, by giving them a new invite. The
+  block is per address; a new wallet starts fresh and pays stranger costs.
+- **Direct blocking.** You can also block any address you never had a channel
+  with, for known spammers or harassers. Only you can lift the block.
+- **No mixnet address is ever published.** A stranger's contact request
+  carries a sealed note for the recipient: a throwaway mixnet address and a
+  greeting-length intro (up to 280 bytes). If the recipient accepts, their app calls the stranger there,
+  and the two exchange real addresses inside the encrypted session. Wallets
+  can also turn stranger requests off and be invite-only.
+- **Requests expire after 48 hours.**
 
 ## Known gaps that matter for the security claim
 
