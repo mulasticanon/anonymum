@@ -8,6 +8,9 @@ on:
     paths: ["substrate/**", ".github/workflows/substrate.yml"]
   pull_request:
     paths: ["substrate/**", ".github/workflows/substrate.yml"]
+  # Manual runs (Actions tab > Substrate pallet > Run workflow). Path filters
+  # do not fire on a branch's first push, e.g. into a new repository.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

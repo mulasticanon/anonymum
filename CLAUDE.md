@@ -19,6 +19,25 @@ The currency and project are called Anonymum, and the crates are named
 `anonymum-*`. They were called `murmur-*` (a placeholder) until 2026-11-18;
 the protocol domain labels changed with them (e.g. `"anonymum/invite/v1"`).
 
+## Repository identity (done 2026-11-18)
+
+The project is pseudonymous. Every commit is by `mulasticanon
+<maximilianmula@tutamail.com>` with dates in `+0000`; the history was
+rewritten once (git filter-repo) to make it so, and the remote is the
+private repository `https://github.com/mulasticanon/anonymum`.
+
+- Commit only with the repo-local identity (`git config --local user.*`).
+  This machine's **global** git identity and the logged-in GitHub CLI are a
+  different, personal account: never use them here, and never write the
+  owner's real name, email or account into files or commit messages.
+- Pushes authenticate through Git Credential Manager, pinned to the
+  `mulasticanon` account by the remote URL and
+  `credential.https://github.com.username` (device-code sign-in). Use the
+  GitHub API with that credential, not `gh`, for this repository.
+- Git stamps new commits with the local timezone by default. Keep the
+  history in `+0000` by committing like this (Git Bash):
+  `d="$(date -u +%s) +0000"; GIT_AUTHOR_DATE="$d" GIT_COMMITTER_DATE="$d" git commit ...`
+
 ## State as of 2026-11-18
 
 Written in a cloud workspace (Linux, Rust 1.97), now developed on the owner's
