@@ -1,0 +1,14 @@
+[package]
+name = "murmur-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Real cryptography for Murmur: Ed25519 invites, identities, Noise sessions"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+murmur-core = { path = "../core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+snow = "0.10.0"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = "1.9.2"

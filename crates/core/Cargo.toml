@@ -1,0 +1,11 @@
+[package]
+name = "murmur-core"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol core for a pay-to-reach-me private messaging coin (working title: Murmur)"
+license = "MIT OR Apache-2.0"
+
+# Deliberately zero dependencies in milestone 1: this crate is the pure
+# state machine. Real cryptography and the Nym transport arrive as separate
+# crates that implement the traits defined here.
+[dependencies]

@@ -1,0 +1,5 @@
+/target/
+# Original handoff archive; the first commit holds the same code.
+*.zip
+# Local run logs
+*-output.txt
