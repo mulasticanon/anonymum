@@ -45,11 +45,11 @@ Windows machine (see the update below).
 
 | Crate | Contents | Verified |
 |---|---|---|
-| `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 48 h expiry, client-side inbox admission, token-bucket rate limit. Zero dependencies. | 45 tests, run by CI on Linux and Windows |
+| `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 48 h expiry, client-side inbox admission, token-bucket rate limit, storage deposits. Zero dependencies. | 61 tests, run by CI on Linux and Windows |
 | `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `note` (`seal_note` / `open_note`, Noise N), `wire` framing (`Initiator`, `Responder<T>`; a repeated first frame gets the same reply). | 25 tests, run by CI on Linux and Windows |
-| `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 45 tests (43 ported rule tests + 2 FRAME checks); CI workflow `substrate.yml` |
+| `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 57 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
-| `crates/nym` (`anonymum-nym`) | Binary: Alice (invite), Carol (stranger, reverse rendezvous with a persisted throwaway client and retrying caller), Dave (dropped). | Manual live runs on Windows, see README |
+| `crates/nym` (`anonymum-nym`) | Binary: Alice (invite), Carol (stranger, reverse rendezvous with a persisted throwaway client and retrying caller), Dave (dropped); subcommands `wallet`/`throwaway`/`seal`/`open`/`talk` for `substrate/scripts/e2e.mjs`. | Manual live runs on Windows, see README |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
 VS Build Tools 2026 provide the C++ toolchain. `cargo test` passed 35/35 at the time (38 since the decline-fee tests).
@@ -227,87 +227,46 @@ Things that bit, so they do not bite again:
 - WSL2 has 3.8 GB RAM: fine to run the node, not to compile one.
 - The omni-node checksum is checked, its GPG signature is not.
 
-## Audit fixes (2026-11-18 audit, decided, not yet implemented)
+## Audit fixes F1-F8 (2026-11-18 audit, done 2026-11-18)
 
-An independent read of the repository made before the history rewrite (the commit now `36c0df0`) (all 70 crate tests and
-45 pallet tests passed on a separate Linux machine) found the items below.
-Fix them in both `crates/core` and `substrate/pallets/anonymum` unless a
-line says otherwise, each with tests including the failure path.
+An independent read of the repository (before the history rewrite) found
+eight items. All are fixed in `crates/core` and `substrate/pallets/anonymum`
+(unless noted), each with tests including the failure path.
 
-**F1. Overflow in the simulation's `request_contact` (bug).**
-`crates/core/src/chain.rs`: `self.ledger.can_pay(&from, fee + price)` adds
-two `u128`s unchecked. With the recipient's price near `u128::MAX` and
-`max_price: u128::MAX`, a debug build panics and a release build wraps,
-passes the check, charges the network fee, then fails at `lock`: a failed
-transaction that charged 0.5 coin. Use checked or saturating addition and
-return `InsufficientFunds`. Add a test with `SetContactPrice { price:
-u128::MAX - fee + 1 }`. Review every other `+`, `-`, `*` on amounts and
-heights in `chain.rs` and `ledger.rs` the same way. The pallet already uses
-`saturating_add` here and passed this probe.
+- **F1** Overflow in the simulation's `request_contact`: `fee + price` is now
+  checked (`InsufficientFunds`); heights saturate; the ledger splits fees
+  without multiplying the whole amount and uses bounded adds for totals.
+  The regression test fails on the old code (verified).
+- **F2** Invite keys could be squatted: invites are stored under
+  `(owner, key)`; opening looks up `(recipient, key)`, revoking
+  `(sender, key)`. `NotInviteOwner` is gone (a non-owner gets
+  `UnknownInvite`).
+- **F3** Storage was free: refundable deposits (placeholder 0.01 coin, config
+  constants) for each invite, block entry and messaging key, returned when
+  used / revoked / lifted / cleared / replaced. `close_channel`'s block takes
+  the closer's deposit; a closer who cannot pay cannot close (my reading of
+  "like any other block"). Anyone may remove an expired invite
+  (`RemoveExpiredInvite` / `remove_expired_invite`); the deposit goes to the
+  owner. Replacing a messaging key carries one deposit over. Dev runtime fees
+  now scale with weight (ref-time / 100,000) and size (10 units/byte):
+  measured 6,921 units for a contact request. Weights are not benchmarked.
+- **F4** (decision changed) `Block` also cancels the blocker's own pending
+  request to the target as `CancelledBy(blocker)`, decline fee burned.
+- **F5** The pallet no longer discards refund/release errors: it carries on,
+  logs, and emits `HoldNotReleased`.
+- **F6** Documented in the pallet docs and README: invite proofs use
+  `verify_strict` in the crates but the more permissive `ed25519_verify`
+  host function in the pallet (not exploitable today). Fixed: the dev
+  runtime's balances are now `u128` like the simulation and mock.
+- **F7** `--rpc-cors all` removed from `run-node.sh` (a foreign origin now
+  gets no allow-origin header); README has a "DEV ONLY" list.
+- **F8** `substrate/scripts/e2e.mjs` + `anonymum-nym` subcommands (`wallet`,
+  `throwaway`, `seal`, `open`, `talk`): real key and binding, a real
+  `seal_note` output through the dev node, read back from chain state and
+  opened, then a real Nym conversation. Passed live. Clients standardise on
+  Ed25519 account keys (wallet address = chain AccountId).
 
-**F2. Invite keys can be squatted.**
-Invites are stored by invite key alone, so anyone who sees a pending
-`RegisterInvite` can register the same key first; the owner's registration
-then fails with `InviteAlreadyRegistered` and the invite they handed out is
-dead. Fix: store invites under `(owner, key)`. `OpenWithInvite` already
-names the recipient, so it looks up `(recipient, key)`; `RevokeInvite`
-looks up `(sender, key)`. Two different owners may then register the same
-key without affecting each other. Test: a third party registering the same
-key first does not stop the owner registering or the invitee opening.
-
-**F3. On-chain storage is free.**
-500 invites cost no pallet fee; blocks, prices, invite-only flags and
-messaging keys are also stored for nothing, and expired invites are never
-removed. Pallet:
-- Take a refundable deposit (a hold, new `HoldReason`s) for each stored
-  invite, block entry and messaging key; return it when the entry is used,
-  revoked, lifted, replaced or expires. Deposit sizes are config constants;
-  start with a placeholder of 0.01 coin per entry and say so in README.
-- A block created automatically by `close_channel` takes the deposit from
-  the closer like any other block.
-- Let anyone remove an invite that is past `expires_at` (the deposit goes
-  back to the owner, not the caller).
-- Give the simulation the same deposits so the two stay rule for rule.
-Dev runtime: replace `WeightToFee = NoFee` and `LengthToFee = FixedFee<1>`
-with real fee settings, so a transaction's cost scales with its size and
-weight. Benchmarked weights are still a later task; say so.
-
-**F4. Blocking cancels the blocker's own pending request (decision
-changed).** Today `Block` leaves the blocker's own request to the target
-alive, and if the target accepts it the block is cleared. The owner wants
-the opposite: `Block` also cancels the blocker's pending request to the
-target. Treat it as a sender cancel (`CancelledBy(blocker)`, decline fee
-burned). Replace the tests `blocking_leaves_the_blockers_own_request_alone`
-and any that rely on it; `an_accepted_request_from_the_blocker_clears_
-blocks_both_ways` still applies to a request made *after* the block.
-
-**F5. Refund errors are swallowed in the pallet.** `refund` discards the
-results of `burn_held` and `release` with `let _ =`. Keep going (it runs in
-`on_initialize`, which cannot fail) but report: use `defensive!` or log an
-error and emit an event, so a stuck hold is visible.
-
-**F6. Simulation and pallet differ in two quiet ways.** Document both in
-the pallet's module docs and README; fix where cheap.
-- Invite proofs: the crates use `ed25519-dalek` `verify_strict`; the pallet
-  uses `sp_io::crypto::ed25519_verify`, which is more permissive. Only the
-  invite's owner chooses the key, so this is not exploitable today.
-- Balances: `u128` in the simulation and the pallet's mock, `u64` in the
-  dev runtime.
-
-**F7. Dev-only settings that must not leave the laptop.** Sudo with the
-public `//Alice` key, `TestDefaultConfig` pallet settings, the stub Aura
-API, and `--rpc-cors all` in `run-node.sh` (any web page open in a browser
-can reach the local node while it runs). Drop `--rpc-cors all` unless a
-browser UI is in use, and add a "DEV ONLY" list to README.
-
-**F8. Join the halves (was already the suggested next step).** The smoke
-test sends placeholder bytes as the sealed note and a hash as the messaging
-key; the Nym demo still uses the in-process `Chain`. Make one run where a
-wallet publishes a real X25519 key with a real binding, a real
-`seal_note` output goes through the dev node, the recipient reads it back
-from chain state, opens it, and the two then talk over Nym. This also
-forces the sr25519 / Ed25519 question: standardise clients on Ed25519
-account keys.
+Tests after the fixes: core 61, crypto 25, pallet 57.
 
 ## Open questions for the owner
 

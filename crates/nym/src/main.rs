@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anonymum_core::{Chain, Envelope, Event, Inbox, Params, Tx, Verdict, COIN};
+use anonymum_core::{Address, Chain, Envelope, Event, Inbox, MessagingKey, Params, SealedNote, Tx, Verdict, COIN};
 use anonymum_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent};
 use anonymum_crypto::{open_note, seal_note, Ed25519Invites, Identity, InviteSecret};
 use nym_sdk::mixnet::{
@@ -140,7 +140,7 @@ fn main() -> Result<(), AnyError> {
                 .enable_all()
                 .thread_stack_size(STACK_SIZE)
                 .build()?
-                .block_on(run())
+                .block_on(dispatch())
         })?
         .join()
         .map_err(|_| "main thread panicked")?
@@ -298,66 +298,7 @@ async fn run() -> Result<(), AnyError> {
     println!("  On-chain: Bob accepts. Channel carol<->bob open: {}", chain.channel_between(&carol.address(), &bob.address()).is_some());
 
     println!("\nBob calls Carol at the throwaway address; she is offline for {}s.", offline.as_secs());
-    let started = Instant::now();
-    let bob_calls = call_with_retry(&mut bob_net, &bob, carol.address(), reply_to);
-    let carol_answers = async {
-        tokio::time::sleep(offline).await;
-        let mut throwaway = Endpoint::connect_persistent("carol (throwaway, back online)", &throwaway_dir).await?;
-        if throwaway.address() != throwaway_address {
-            return Err::<_, AnyError>("throwaway client came back with a different address".into());
-        }
-        let mut carol_side: Responder<AnonymousSenderTag> = Responder::new();
-        loop {
-            let (frame, tag) = throwaway.receive().await?;
-            let tag = tag.ok_or("call arrived without reply blocks")?;
-            match carol_side.handle(&carol, tag, &frame) {
-                Ok(ResponderEvent::Reply(frame2)) => {
-                    println!(
-                        "  Carol's throwaway receives Bob's call {:.0}s after it was sent (held by her gateway).",
-                        started.elapsed().as_secs_f32()
-                    );
-                    throwaway.reply(tag, frame2).await?;
-                }
-                Ok(ResponderEvent::Established { peer }) => {
-                    if peer != bob.address() {
-                        return Err("Carol was called by someone other than Bob".into());
-                    }
-                    return Ok((throwaway, carol_side, tag));
-                }
-                Ok(other) => println!("  Carol ignores unexpected {other:?}"),
-                Err(error) => println!("  Carol ignores a frame: {error}"),
-            }
-        }
-    };
-    let (bob_call, carol_end) = tokio::join!(bob_calls, carol_answers);
-    let (mut bob_to_carol, attempts) = bob_call?;
-    let (mut throwaway, mut carol_side, bob_tag) = carol_end?;
-    println!(
-        "  Session established after {:.0}s ({attempts} call attempt(s)). Bob is the initiator.",
-        started.elapsed().as_secs_f32()
-    );
-
-    println!("\nInside the session they swap long-lived mixnet addresses.");
-    let carol_long_lived = carol_net.address();
-    throwaway.reply(bob_tag, carol_side.seal(&bob_tag, carol_long_lived.to_string().as_bytes())?).await?;
-    let text = next_message(&mut bob_net, &mut bob_to_carol).await?;
-    let learned: Recipient = String::from_utf8(text)?.parse()?;
-    println!("  Bob learns Carol's long-lived address: matches {}", learned == carol_long_lived);
-
-    bob_net.send(reply_to, bob_to_carol.seal(bob_mix_address.to_string().as_bytes())?).await?;
-    let (frame, tag) = throwaway.receive().await?;
-    let ResponderEvent::Message { plaintext, .. } = carol_side.handle(&carol, tag.unwrap_or(bob_tag), &frame)? else {
-        return Err("expected Bob's address".into());
-    };
-    let learned: Recipient = String::from_utf8(plaintext)?.parse()?;
-    println!("  Carol learns Bob's long-lived address: matches {}", learned == bob_mix_address);
-    if learned != bob_mix_address {
-        return Err("address exchange failed".into());
-    }
-
-    throwaway.client.disconnect().await;
-    std::fs::remove_dir_all(&throwaway_dir)?;
-    println!("  Carol discards the throwaway client and deletes it from disk.");
+    rendezvous(&mut bob_net, &bob, &carol, carol_net.address(), reply_to, &throwaway_dir, offline).await?;
 
     // ---- Dave, with no channel, calls Bob directly ---------------------------
     println!("\nDave -> Bob: handshake from a wallet with no channel.");
@@ -402,6 +343,212 @@ async fn run() -> Result<(), AnyError> {
     bob_net.client.disconnect().await;
     assert!(chain.ledger().is_balanced());
     println!("Every coin accounted for. Done in {:.0}s.", clock.elapsed().as_secs_f32());
+    Ok(())
+}
+
+/// Bob calls Carol at her throwaway address (retrying), Carol's throwaway
+/// client comes back online after `offline` and answers, and inside the
+/// session the two swap long-lived mixnet addresses. Then Carol discards the
+/// throwaway client and deletes it from disk. Shared by the demo and `talk`.
+async fn rendezvous(
+    bob_net: &mut Endpoint,
+    bob: &Identity,
+    carol: &Identity,
+    carol_long_lived: Recipient,
+    reply_to: Recipient,
+    throwaway_dir: &PathBuf,
+    offline: Duration,
+) -> Result<(), AnyError> {
+    let started = Instant::now();
+    let bob_mix_address = bob_net.address();
+    let bob_calls = call_with_retry(bob_net, bob, carol.address(), reply_to);
+    let carol_answers = async {
+        tokio::time::sleep(offline).await;
+        let mut throwaway = Endpoint::connect_persistent("carol (throwaway, back online)", throwaway_dir).await?;
+        if throwaway.address() != reply_to {
+            return Err::<_, AnyError>("throwaway client came back with a different address".into());
+        }
+        let mut carol_side: Responder<AnonymousSenderTag> = Responder::new();
+        loop {
+            let (frame, tag) = throwaway.receive().await?;
+            let tag = tag.ok_or("call arrived without reply blocks")?;
+            match carol_side.handle(carol, tag, &frame) {
+                Ok(ResponderEvent::Reply(frame2)) => {
+                    println!(
+                        "  Carol's throwaway receives Bob's call {:.0}s after it was sent (held by her gateway).",
+                        started.elapsed().as_secs_f32()
+                    );
+                    throwaway.reply(tag, frame2).await?;
+                }
+                Ok(ResponderEvent::Established { peer }) => {
+                    if peer != bob.address() {
+                        return Err("Carol was called by someone other than Bob".into());
+                    }
+                    return Ok((throwaway, carol_side, tag));
+                }
+                Ok(other) => println!("  Carol ignores unexpected {other:?}"),
+                Err(error) => println!("  Carol ignores a frame: {error}"),
+            }
+        }
+    };
+    let (bob_call, carol_end) = tokio::join!(bob_calls, carol_answers);
+    let (mut bob_to_carol, attempts) = bob_call?;
+    let (mut throwaway, mut carol_side, bob_tag) = carol_end?;
+    println!(
+        "  Session established after {:.0}s ({attempts} call attempt(s)). Bob is the initiator.",
+        started.elapsed().as_secs_f32()
+    );
+
+    println!("\nInside the session they swap long-lived mixnet addresses.");
+    throwaway.reply(bob_tag, carol_side.seal(&bob_tag, carol_long_lived.to_string().as_bytes())?).await?;
+    let text = next_message(bob_net, &mut bob_to_carol).await?;
+    let learned: Recipient = String::from_utf8(text)?.parse()?;
+    println!("  Bob learns Carol's long-lived address: matches {}", learned == carol_long_lived);
+    if learned != carol_long_lived {
+        return Err("address exchange failed".into());
+    }
+
+    bob_net.send(reply_to, bob_to_carol.seal(bob_mix_address.to_string().as_bytes())?).await?;
+    let (frame, tag) = throwaway.receive().await?;
+    let ResponderEvent::Message { plaintext, .. } = carol_side.handle(carol, tag.unwrap_or(bob_tag), &frame)? else {
+        return Err("expected Bob's address".into());
+    };
+    let learned: Recipient = String::from_utf8(plaintext)?.parse()?;
+    println!("  Carol learns Bob's long-lived address: matches {}", learned == bob_mix_address);
+    if learned != bob_mix_address {
+        return Err("address exchange failed".into());
+    }
+
+    throwaway.client.disconnect().await;
+    std::fs::remove_dir_all(throwaway_dir)?;
+    println!("  Carol discards the throwaway client and deletes it from disk.");
+    Ok(())
+}
+
+// ---- subcommands for the end-to-end run against a dev node (audit F8) ------
+//
+// `substrate/scripts/e2e.mjs` drives these: it does the chain transactions
+// (Polkadot.js, signing with each wallet's Ed25519 account key) and calls
+// this binary for everything cryptographic and for the mixnet.
+//
+//   anonymum-nym wallet <file>       create (or load) a wallet; print its
+//                                    address, messaging key and binding
+//   anonymum-nym throwaway <dir>     create a persisted throwaway Nym client;
+//                                    print its address, then go offline
+//   anonymum-nym seal --key K --from A --to B --reply R --intro TEXT
+//   anonymum-nym open --wallet F --from A --note HEX
+//   anonymum-nym talk --bob F --carol F --dir D --reply R
+//
+// Wallet files hold the two private keys in hex. DEV ONLY: they are plain
+// files for this test, not encrypted storage.
+
+async fn dispatch() -> Result<(), AnyError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rest = args.get(1..).unwrap_or(&[]);
+    match args.first().map(String::as_str) {
+        None | Some("demo") => run().await,
+        Some("wallet") => cmd_wallet(rest),
+        Some("throwaway") => cmd_throwaway(rest).await,
+        Some("seal") => cmd_seal(rest),
+        Some("open") => cmd_open(rest),
+        Some("talk") => cmd_talk(rest).await,
+        Some(other) => Err(format!("unknown command {other:?}").into()),
+    }
+}
+
+fn flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, AnyError> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing {name}").into())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(text: &str) -> Result<Vec<u8>, AnyError> {
+    let text = text.trim().trim_start_matches("0x");
+    if text.len() % 2 != 0 {
+        return Err("odd-length hex".into());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| e.into()))
+        .collect()
+}
+
+fn fixed<const N: usize>(text: &str) -> Result<[u8; N], AnyError> {
+    from_hex(text)?.try_into().map_err(|_| format!("expected {N} bytes").into())
+}
+
+fn load_wallet(path: &str) -> Result<Identity, AnyError> {
+    let text = std::fs::read_to_string(path)?;
+    let field = |name: &str| -> Result<[u8; 32], AnyError> {
+        let line = text.lines().find_map(|l| l.strip_prefix(name)).ok_or(format!("{path}: no {name}"))?;
+        fixed::<32>(line)
+    };
+    Ok(Identity::from_secret_bytes(field("signing=")?, field("messaging=")?))
+}
+
+fn cmd_wallet(args: &[String]) -> Result<(), AnyError> {
+    let path = args.first().ok_or("usage: wallet <file>")?;
+    if !std::path::Path::new(path).exists() {
+        let (signing, messaging) = Identity::generate().to_secret_bytes();
+        std::fs::write(path, format!("signing={}\nmessaging={}\n", to_hex(&signing), to_hex(&messaging)))?;
+    }
+    let wallet = load_wallet(path)?;
+    let Tx::PublishMessagingKey { key, binding } = wallet.publish_key_tx() else { unreachable!() };
+    println!("address={}", to_hex(&wallet.address().0));
+    println!("msgkey={}", to_hex(&key.0));
+    println!("binding={}", to_hex(&binding.0));
+    Ok(())
+}
+
+async fn cmd_throwaway(args: &[String]) -> Result<(), AnyError> {
+    let dir = PathBuf::from(args.first().ok_or("usage: throwaway <dir>")?);
+    let throwaway = Endpoint::connect_persistent("carol (throwaway)", &dir).await?;
+    println!("address={}", to_hex(&throwaway.address().to_bytes()));
+    throwaway.client.disconnect().await;
+    Ok(())
+}
+
+fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
+    let note = seal_note(
+        &MessagingKey(fixed::<32>(flag(args, "--key")?)?),
+        &Address(fixed::<32>(flag(args, "--from")?)?),
+        &Address(fixed::<32>(flag(args, "--to")?)?),
+        &fixed::<96>(flag(args, "--reply")?)?,
+        flag(args, "--intro")?,
+    )?;
+    println!("note={}", to_hex(&note.0));
+    Ok(())
+}
+
+fn cmd_open(args: &[String]) -> Result<(), AnyError> {
+    let wallet = load_wallet(flag(args, "--wallet")?)?;
+    let from = Address(fixed::<32>(flag(args, "--from")?)?);
+    let note = SealedNote(from_hex(flag(args, "--note")?)?);
+    let opened = open_note(&wallet, &from, &note)?;
+    println!("reply={}", to_hex(&opened.reply_to));
+    println!("intro={}", opened.intro.replace('\n', " "));
+    Ok(())
+}
+
+async fn cmd_talk(args: &[String]) -> Result<(), AnyError> {
+    let bob = load_wallet(flag(args, "--bob")?)?;
+    let carol = load_wallet(flag(args, "--carol")?)?;
+    let dir = PathBuf::from(flag(args, "--dir")?);
+    let reply_to = Recipient::try_from_bytes(fixed::<96>(flag(args, "--reply")?)?)?;
+    println!("Connecting Bob's and Carol's long-lived clients...");
+    let mut bob_net = Endpoint::connect("bob").await?;
+    let carol_net = Endpoint::connect("carol (long-lived)").await?;
+    println!("\nBob calls Carol at the throwaway address from her note.");
+    rendezvous(&mut bob_net, &bob, &carol, carol_net.address(), reply_to, &dir, Duration::ZERO).await?;
+    carol_net.client.disconnect().await;
+    bob_net.client.disconnect().await;
+    println!("talk=ok");
     Ok(())
 }
 

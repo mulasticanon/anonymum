@@ -84,13 +84,25 @@ Windows), using Parity's prebuilt `polkadot-omni-node` 1.25.2:
 
     # on Windows, with the node running
     cd substrate/scripts && npm install && node smoke.mjs
+    cargo build -p anonymum-nym && node substrate/scripts/e2e.mjs   # needs internet (Nym)
 
 `smoke.mjs` sends real signed transactions and checks balances and events
 after each: a messaging key (and a forged one refused), an invite channel, a
 stranger's paid request with its sealed note accepted, a declined request
 with the 1% burn, a blocked address refused, a closed channel blocking the
 other side, and total issuance falling by exactly the burns plus transaction
-fees. All checks passed on 2026-11-18 (three runs on fresh chains).
+fees. All checks passed on 2026-11-18 (three runs on fresh chains, and
+again after the audit fixes with real fees and deposits).
+
+`e2e.mjs` joins the two halves with nothing simulated: two wallets from
+`anonymum-crypto` whose Ed25519 keys are their chain accounts; Bob publishes
+his real X25519 messaging key with its real binding; Carol creates a
+persisted throwaway Nym client, reads Bob's key from chain state, seals a
+real note to it and pays to reach him; Bob reads the note back from chain
+state, opens it and accepts; then Bob calls Carol over the live Nym mixnet
+at the address from the note and they swap long-lived addresses. Passed on
+2026-11-18 (Carol's gateway held the call for the few seconds her throwaway
+client was offline).
 
 Differences from the in-process simulation:
 - Escrow and storage deposits are balance holds; the reward pool is the
@@ -115,8 +127,11 @@ Differences from the in-process simulation:
 - Weights are placeholders, not benchmarks.
 - The runtime exposes a stub Aura API (6 s slots, no authorities) only
   because omni-node's dev mode reads it. There is no Aura consensus.
-- Dev accounts are sr25519 (Substrate's default); the binding check accepts
-  any Substrate signature type, while `anonymum-crypto` wallets are Ed25519.
+- Client accounts are Ed25519 (decided 2026-11-18, audit F8): a wallet's
+  `anonymum-crypto` address and its on-chain account are the same key, as
+  `e2e.mjs` shows. The well-known dev accounts (`//Alice`, …) are still
+  sr25519 and only fund wallets on the dev chain; the binding check accepts
+  any Substrate signature type.
 
 **DEV ONLY — must not leave the laptop:**
 - Sudo, with the public `//Alice` dev key as the sudo key.
@@ -135,7 +150,7 @@ Differences from the in-process simulation:
 | Piece | Status |
 |---|---|
 | Fee and channel rules, blocks, invite-only | Built, tested |
-| Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live in the demo. Retry logic lives in the demo, not yet in a reusable client |
+| Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live, including once end to end through the dev chain (`e2e.mjs`). Retry logic lives in the demo binary, not yet in a reusable client |
 | Invites | Real Ed25519 signatures, bound to opener and recipient |
 | End-to-end encryption | Noise XX (X25519, ChaCha20-Poly1305, BLAKE2s). Addresses are proven inside the encrypted handshake, so observers learn neither party |
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |
