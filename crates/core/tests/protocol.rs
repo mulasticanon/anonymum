@@ -1,8 +1,9 @@
-use anonymum_core::crypto::mock::{MockInviteSecret, MockScheme};
+use anonymum_core::crypto::mock::{mock_binding, MockInviteSecret, MockScheme};
 use anonymum_core::crypto::invite_message;
 use anonymum_core::ratelimit::TokenBucket;
 use anonymum_core::*;
 
+/// Alice, Bob and Carol with 10 coins each and published messaging keys.
 fn setup() -> (Chain<MockScheme>, Address, Address, Address) {
     let mut chain = Chain::new(Params::default(), MockScheme);
     let (alice, bob, carol) = (
@@ -12,8 +13,49 @@ fn setup() -> (Chain<MockScheme>, Address, Address, Address) {
     );
     for who in [alice, bob, carol] {
         chain.mint(who, 10 * COIN);
+        chain.apply(who, publish_key(who)).unwrap();
     }
     (chain, alice, bob, carol)
+}
+
+fn publish_key(who: Address) -> Tx {
+    let key = MessagingKey(who.0); // any 32 bytes do for the mock
+    Tx::PublishMessagingKey { key, binding: mock_binding(&who, &key) }
+}
+
+/// A correctly sized note. The chain cannot read notes, only measure them;
+/// sealing and opening are tested in `anonymum-crypto`.
+fn note() -> SealedNote {
+    SealedNote(vec![0xAB; SEALED_NOTE_LEN])
+}
+
+fn req(recipient: Address, max_price: Amount) -> Tx {
+    Tx::RequestContact { recipient, max_price, note: note() }
+}
+
+/// Opens a paid channel from `from` to `to` (request + accept).
+fn paid_channel(chain: &mut Chain<MockScheme>, from: Address, to: Address) -> ChannelId {
+    let events = chain.apply(from, req(to, chain.contact_price(&to))).unwrap();
+    let Event::ContactRequested { request, .. } = events[0] else { panic!("wrong event") };
+    chain.apply(to, Tx::AcceptContact { request }).unwrap();
+    chain.channel_between(&from, &to).unwrap().id
+}
+
+/// Asserts a transaction fails with `expected` and changes no balance,
+/// escrow, burn or pool.
+fn fails_charging_nothing(chain: &mut Chain<MockScheme>, sender: Address, tx: Tx, expected: Error) {
+    let ledger_before = chain.ledger().clone();
+    let events_before = chain.events().len();
+    assert_eq!(chain.apply(sender, tx).unwrap_err(), expected);
+    let after = chain.ledger();
+    for who in ["alice", "bob", "carol", "dave"].map(Address::from_label) {
+        assert_eq!(after.balance(&who), ledger_before.balance(&who), "{who} charged");
+    }
+    assert_eq!(after.escrowed(), ledger_before.escrowed());
+    assert_eq!(after.burned(), ledger_before.burned());
+    assert_eq!(after.reward_pool(), ledger_before.reward_pool());
+    assert_eq!(chain.events().len(), events_before, "a failed tx emits nothing");
+    assert!(after.is_balanced());
 }
 
 /// Bob registers an invite; returns the secret he would hand to a contact.
@@ -102,7 +144,7 @@ fn stranger_pays_network_and_recipient() {
     chain.apply(bob, Tx::SetContactPrice { price: 3 * COIN }).unwrap();
 
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: 3 * COIN })
+        .apply(carol, req(bob, 3 * COIN))
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { panic!("wrong event") };
 
@@ -132,7 +174,7 @@ const DECLINE_FEE: Amount = COIN / 100;
 fn declined_request_burns_decline_fee_and_keeps_network_fee() {
     let (mut chain, _, bob, carol) = setup();
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN })
+        .apply(carol, req(bob, COIN))
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { panic!() };
     let burned_before = chain.ledger().burned();
@@ -161,7 +203,7 @@ fn declined_request_burns_decline_fee_and_keeps_network_fee() {
 fn sender_cancelling_pays_the_same_decline_fee() {
     let (mut chain, _, bob, carol) = setup();
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN })
+        .apply(carol, req(bob, COIN))
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { panic!() };
     let pool_before = chain.ledger().reward_pool();
@@ -177,9 +219,9 @@ fn sender_cancelling_pays_the_same_decline_fee() {
 #[test]
 fn unanswered_request_expires_and_refunds_minus_decline_fee() {
     let (mut chain, _, bob, carol) = setup();
-    chain.apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN }).unwrap();
+    chain.apply(carol, req(bob, COIN)).unwrap();
 
-    let ttl = chain.params().request_ttl_blocks;
+    let ttl = chain.params().request_ttl_blocks();
     assert!(chain.advance_blocks(ttl - 1).is_empty());
     let events = chain.advance_blocks(1);
 
@@ -199,7 +241,7 @@ fn unanswered_request_expires_and_refunds_minus_decline_fee() {
 fn failed_cancel_charges_nothing() {
     let (mut chain, alice, bob, carol) = setup();
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN })
+        .apply(carol, req(bob, COIN))
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { panic!() };
     let (carol_before, burned_before) = (chain.ledger().balance(&carol), chain.ledger().burned());
@@ -228,7 +270,7 @@ fn decline_fee_scales_with_price_and_rounds_up() {
     let (mut chain, _, bob, carol) = setup();
     chain.apply(bob, Tx::SetContactPrice { price: 5 * COIN }).unwrap();
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: 5 * COIN })
+        .apply(carol, req(bob, 5 * COIN))
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { panic!() };
     let events = chain.apply(bob, Tx::CancelRequest { request }).unwrap();
@@ -241,7 +283,7 @@ fn price_rise_before_inclusion_is_rejected() {
     let (mut chain, _, bob, carol) = setup();
     chain.apply(bob, Tx::SetContactPrice { price: 5 * COIN }).unwrap();
     let err = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN })
+        .apply(carol, req(bob, COIN))
         .unwrap_err();
     assert_eq!(err, Error::PriceAboveMax { price: 5 * COIN });
     assert_eq!(chain.ledger().balance(&carol), 10 * COIN);
@@ -253,7 +295,7 @@ fn cannot_request_without_funds_and_nothing_is_charged() {
     let dave = Address::from_label("dave");
     chain.mint(dave, COIN); // enough for the fee OR the price, not both
     let err = chain
-        .apply(dave, Tx::RequestContact { recipient: bob, max_price: COIN })
+        .apply(dave, req(bob, COIN))
         .unwrap_err();
     assert!(matches!(err, Error::InsufficientFunds { .. }));
     assert_eq!(chain.ledger().balance(&dave), COIN);
@@ -264,7 +306,7 @@ fn cannot_request_without_funds_and_nothing_is_charged() {
 fn only_recipient_can_accept() {
     let (mut chain, alice, bob, carol) = setup();
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN })
+        .apply(carol, req(bob, COIN))
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { panic!() };
     assert_eq!(chain.apply(carol, Tx::AcceptContact { request }).unwrap_err(), Error::NotRecipient);
@@ -277,13 +319,13 @@ fn no_duplicate_channels_or_requests() {
     let secret = bob_invite(&mut chain, bob, 1);
     chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
     assert_eq!(
-        chain.apply(bob, Tx::RequestContact { recipient: alice, max_price: COIN }).unwrap_err(),
+        chain.apply(bob, req(alice, COIN)).unwrap_err(),
         Error::ChannelExists
     );
 
-    chain.apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN }).unwrap();
+    chain.apply(carol, req(bob, COIN)).unwrap();
     assert_eq!(
-        chain.apply(bob, Tx::RequestContact { recipient: carol, max_price: COIN }).unwrap_err(),
+        chain.apply(bob, req(carol, COIN)).unwrap_err(),
         Error::RequestPending
     );
 }
@@ -291,7 +333,7 @@ fn no_duplicate_channels_or_requests() {
 #[test]
 fn invite_supersedes_pending_request_and_refunds_it() {
     let (mut chain, _, bob, carol) = setup();
-    chain.apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN }).unwrap();
+    chain.apply(carol, req(bob, COIN)).unwrap();
     let secret = bob_invite(&mut chain, bob, 2);
 
     let events = chain.apply(carol, open_tx(&secret, carol, bob)).unwrap();
@@ -310,22 +352,312 @@ fn invite_supersedes_pending_request_and_refunds_it() {
     assert!(chain.ledger().is_balanced());
 }
 
+// ---- A: closing blocks, Block / Unblock -----------------------------------
+
 #[test]
-fn closing_a_channel_forces_reopening() {
+fn closing_a_channel_blocks_the_closed_out_address() {
     let (mut chain, alice, bob, carol) = setup();
     let secret = bob_invite(&mut chain, bob, 1);
     chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
     let id = chain.channel_between(&alice, &bob).unwrap().id;
 
-    assert_eq!(chain.apply(carol, Tx::CloseChannel { channel: id }).unwrap_err(), Error::NotParticipant);
-    chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+    fails_charging_nothing(&mut chain, carol, Tx::CloseChannel { channel: id }, Error::NotParticipant);
+    let events = chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+
+    assert_eq!(
+        events,
+        vec![
+            Event::ChannelClosed { channel: id, by: bob },
+            Event::Blocked { by: bob, target: alice },
+        ]
+    );
     assert!(chain.channel_between(&alice, &bob).is_none());
+    assert!(chain.is_blocked(&bob, &alice));
+    assert!(!chain.is_blocked(&alice, &bob), "the closer is not blocked");
+    fails_charging_nothing(&mut chain, alice, req(bob, COIN), Error::Blocked);
+}
+
+#[test]
+fn the_closer_may_still_pay_to_reach_the_other_side() {
+    let (mut chain, alice, bob, _) = setup();
+    let id = paid_channel(&mut chain, alice, bob);
+    chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+
+    chain.apply(bob, req(alice, COIN)).unwrap();
+    assert!(chain.ledger().is_balanced());
+}
+
+#[test]
+fn a_fresh_invite_from_the_closer_reopens_and_clears_the_block() {
+    let (mut chain, alice, bob, _) = setup();
+    let first = bob_invite(&mut chain, bob, 1);
+    chain.apply(alice, open_tx(&first, alice, bob)).unwrap();
+    let id = chain.channel_between(&alice, &bob).unwrap().id;
+    chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+
+    let fresh = bob_invite(&mut chain, bob, 2);
+    let events = chain.apply(alice, open_tx(&fresh, alice, bob)).unwrap();
+
+    assert!(events.contains(&Event::Unblocked {
+        by: bob,
+        target: alice,
+        reason: UnblockReason::ChannelOpened
+    }));
+    assert!(!chain.is_blocked(&bob, &alice));
+    assert!(chain.channel_between(&alice, &bob).is_some());
+    assert!(chain.ledger().is_balanced());
+}
+
+#[test]
+fn an_invite_issued_before_the_block_cannot_lift_it() {
+    let (mut chain, alice, bob, _) = setup();
+    let first = bob_invite(&mut chain, bob, 1);
+    let spare = bob_invite(&mut chain, bob, 2); // Alice kept a second one
+    chain.apply(alice, open_tx(&first, alice, bob)).unwrap();
+    let id = chain.channel_between(&alice, &bob).unwrap().id;
+    chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+
+    fails_charging_nothing(&mut chain, alice, open_tx(&spare, alice, bob), Error::Blocked);
+    assert!(chain.is_blocked(&bob, &alice));
+}
+
+#[test]
+fn an_older_invite_still_works_for_someone_not_blocked() {
+    let (mut chain, alice, bob, carol) = setup();
+    let first = bob_invite(&mut chain, bob, 1);
+    let for_carol = bob_invite(&mut chain, bob, 2);
+    chain.apply(alice, open_tx(&first, alice, bob)).unwrap();
+    let id = chain.channel_between(&alice, &bob).unwrap().id;
+    chain.apply(bob, Tx::CloseChannel { channel: id }).unwrap();
+
+    chain.apply(carol, open_tx(&for_carol, carol, bob)).unwrap();
+    assert!(chain.channel_between(&carol, &bob).is_some());
+}
+
+#[test]
+fn block_without_a_channel_stops_paid_requests() {
+    let (mut chain, _, bob, carol) = setup();
+    let events = chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    assert_eq!(events, vec![Event::Blocked { by: bob, target: carol }]);
+
+    fails_charging_nothing(&mut chain, carol, req(bob, COIN), Error::Blocked);
+}
+
+#[test]
+fn a_block_is_per_address_so_a_new_wallet_pays_stranger_costs() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    let dave = Address::from_label("dave");
+    chain.mint(dave, 10 * COIN);
+
+    chain.apply(dave, req(bob, COIN)).unwrap();
+    let fee = chain.params().cold_network_fee;
+    assert_eq!(chain.ledger().balance(&dave), 10 * COIN - fee - COIN);
+}
+
+#[test]
+fn blocking_refunds_a_pending_request_in_full() {
+    let (mut chain, _, bob, carol) = setup();
+    let events = chain.apply(carol, req(bob, COIN)).unwrap();
+    let Event::ContactRequested { request, .. } = events[0] else { panic!() };
+
+    let events = chain.apply(bob, Tx::Block { target: carol }).unwrap();
+
+    assert_eq!(
+        events[0],
+        Event::RequestRefunded {
+            request,
+            to: carol,
+            amount: COIN,
+            burned: 0,
+            reason: RefundReason::Blocked,
+        }
+    );
+    let fee = chain.params().cold_network_fee;
+    assert_eq!(chain.ledger().balance(&carol), 10 * COIN - fee, "only the network fee is lost");
+    assert_eq!(chain.ledger().escrowed(), 0);
+    assert!(chain.ledger().is_balanced());
+}
+
+#[test]
+fn blocking_leaves_the_blockers_own_request_alone() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, req(carol, COIN)).unwrap();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    assert_eq!(chain.ledger().escrowed(), COIN);
+}
+
+#[test]
+fn blocking_closes_an_open_channel() {
+    let (mut chain, alice, bob, _) = setup();
+    let id = paid_channel(&mut chain, alice, bob);
+
+    let events = chain.apply(bob, Tx::Block { target: alice }).unwrap();
+
+    assert_eq!(
+        events,
+        vec![
+            Event::ChannelClosed { channel: id, by: bob },
+            Event::Blocked { by: bob, target: alice },
+        ]
+    );
+    assert!(chain.channel_between(&alice, &bob).is_none());
+    fails_charging_nothing(&mut chain, alice, req(bob, COIN), Error::Blocked);
+}
+
+#[test]
+fn unblock_lets_paid_requests_through_again() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    let events = chain.apply(bob, Tx::Unblock { target: carol }).unwrap();
+    assert_eq!(
+        events,
+        vec![Event::Unblocked { by: bob, target: carol, reason: UnblockReason::Lifted }]
+    );
+    chain.apply(carol, req(bob, COIN)).unwrap();
+}
+
+#[test]
+fn only_the_blocker_can_lift_a_block() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    fails_charging_nothing(&mut chain, carol, Tx::Unblock { target: bob }, Error::NotBlocked);
+    assert!(chain.is_blocked(&bob, &carol));
+}
+
+#[test]
+fn block_and_unblock_failure_paths() {
+    let (mut chain, _, bob, carol) = setup();
+    fails_charging_nothing(&mut chain, bob, Tx::Block { target: bob }, Error::SelfContact);
+    fails_charging_nothing(&mut chain, bob, Tx::Unblock { target: carol }, Error::NotBlocked);
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    fails_charging_nothing(&mut chain, bob, Tx::Block { target: carol }, Error::AlreadyBlocked);
+}
+
+#[test]
+fn an_accepted_request_from_the_blocker_clears_blocks_both_ways() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    chain.apply(carol, Tx::Block { target: bob }).unwrap();
+    chain.apply(carol, Tx::Unblock { target: bob }).unwrap();
+
+    // Bob blocked Carol, but Bob may still pay to reach her.
+    let events = chain.apply(bob, req(carol, COIN)).unwrap();
+    let Event::ContactRequested { request, .. } = events[0] else { panic!() };
+    let events = chain.apply(carol, Tx::AcceptContact { request }).unwrap();
+
+    assert!(events.contains(&Event::Unblocked {
+        by: bob,
+        target: carol,
+        reason: UnblockReason::ChannelOpened
+    }));
+    assert!(!chain.is_blocked(&bob, &carol));
+    assert!(chain.channel_between(&bob, &carol).is_some());
+}
+
+#[test]
+fn a_mutual_block_is_cleared_when_an_invite_opens_a_channel() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(bob, Tx::Block { target: carol }).unwrap();
+    chain.apply(carol, Tx::Block { target: bob }).unwrap();
+
+    let fresh = bob_invite(&mut chain, bob, 7);
+    chain.apply(carol, open_tx(&fresh, carol, bob)).unwrap();
+
+    assert!(!chain.is_blocked(&bob, &carol));
+    assert!(!chain.is_blocked(&carol, &bob));
+}
+
+// ---- B: messaging keys, sealed notes, invite-only -------------------------
+
+#[test]
+fn messaging_key_needs_a_valid_binding() {
+    let (mut chain, alice, bob, _) = setup();
+    let key = MessagingKey([9; 32]);
+    let forged = Tx::PublishMessagingKey { key, binding: mock_binding(&bob, &key) };
+    fails_charging_nothing(&mut chain, alice, forged, Error::BadKeyBinding);
+    assert_ne!(chain.messaging_key(&alice).unwrap().key, key, "old key kept");
+
+    chain.apply(alice, Tx::PublishMessagingKey { key, binding: mock_binding(&alice, &key) }).unwrap();
+    assert_eq!(chain.messaging_key(&alice).unwrap().key, key, "a key can be replaced");
+}
+
+#[test]
+fn request_to_a_wallet_without_a_messaging_key_fails() {
+    let (mut chain, _, _, carol) = setup();
+    let dave = Address::from_label("dave");
+    fails_charging_nothing(&mut chain, carol, req(dave, COIN), Error::NoMessagingKey);
+}
+
+#[test]
+fn request_carries_the_sealed_note_to_the_recipient() {
+    let (mut chain, _, bob, carol) = setup();
+    let events = chain.apply(carol, req(bob, COIN)).unwrap();
+    let Event::ContactRequested { request, note: ref sent, .. } = events[0] else { panic!() };
+    assert_eq!(*sent, note());
+    assert_eq!(chain.request(request).unwrap().note, note());
+}
+
+#[test]
+fn notes_of_the_wrong_size_are_refused() {
+    let (mut chain, _, bob, carol) = setup();
+    for len in [0, SEALED_NOTE_LEN - 1, SEALED_NOTE_LEN + 1, 10_000] {
+        let tx = Tx::RequestContact { recipient: bob, max_price: COIN, note: SealedNote(vec![0; len]) };
+        fails_charging_nothing(&mut chain, carol, tx, Error::BadNoteSize { len });
+    }
+}
+
+#[test]
+fn invite_only_wallets_refuse_strangers_but_not_invites() {
+    let (mut chain, alice, bob, carol) = setup();
+    chain.apply(bob, Tx::SetAcceptStrangers { accept: false }).unwrap();
+    assert!(!chain.accepts_strangers(&bob));
+
+    fails_charging_nothing(&mut chain, carol, req(bob, COIN), Error::StrangersNotAccepted);
+
+    let secret = bob_invite(&mut chain, bob, 1);
+    chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
+    assert!(chain.channel_between(&alice, &bob).is_some());
+
+    chain.apply(bob, Tx::SetAcceptStrangers { accept: true }).unwrap();
+    chain.apply(carol, req(bob, COIN)).unwrap();
+}
+
+#[test]
+fn going_invite_only_leaves_pending_requests_answerable() {
+    let (mut chain, _, bob, carol) = setup();
+    let events = chain.apply(carol, req(bob, COIN)).unwrap();
+    let Event::ContactRequested { request, .. } = events[0] else { panic!() };
+    chain.apply(bob, Tx::SetAcceptStrangers { accept: false }).unwrap();
+    chain.apply(bob, Tx::AcceptContact { request }).unwrap();
+    assert!(chain.channel_between(&bob, &carol).is_some());
+}
+
+// ---- C: 48-hour expiry ----------------------------------------------------
+
+#[test]
+fn request_ttl_is_48_hours_of_blocks() {
+    let p = Params::default();
+    assert_eq!(p.request_ttl_secs, 48 * 3600);
+    assert_eq!(p.request_ttl_blocks(), 28_800, "48 h at 6 s blocks");
+    let slow = Params { block_time_ms: 7_000, ..Params::default() };
+    assert_eq!(slow.request_ttl_blocks(), 24_686, "rounded up: never shorter than 48 h");
+    assert!(slow.request_ttl_blocks() * 7 >= 48 * 3600);
+}
+
+#[test]
+fn request_expires_exactly_at_48_hours() {
+    let (mut chain, _, bob, carol) = setup();
+    chain.apply(carol, req(bob, COIN)).unwrap();
+    assert!(chain.advance_blocks(28_799).is_empty(), "still pending one block before");
+    let events = chain.advance_blocks(1);
+    assert!(matches!(events[0], Event::RequestRefunded { reason: RefundReason::Expired, .. }));
 }
 
 #[test]
 fn network_fees_split_between_burn_and_node_rewards() {
     let (mut chain, _, bob, carol) = setup();
-    chain.apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN }).unwrap();
+    chain.apply(carol, req(bob, COIN)).unwrap();
     let fee = chain.params().cold_network_fee;
     assert_eq!(chain.ledger().burned(), fee / 2);
     assert_eq!(chain.ledger().reward_pool(), fee - fee / 2);
@@ -378,10 +710,10 @@ fn coins_are_conserved_across_a_mixed_history() {
     let issued = chain.ledger().issued();
     let s1 = bob_invite(&mut chain, bob, 1);
     chain.apply(alice, open_tx(&s1, alice, bob)).unwrap();
-    chain.apply(carol, Tx::RequestContact { recipient: bob, max_price: COIN }).unwrap();
-    chain.apply(carol, Tx::RequestContact { recipient: alice, max_price: COIN }).unwrap();
-    chain.advance_blocks(chain.params().request_ttl_blocks);
-    chain.apply(alice, Tx::RequestContact { recipient: carol, max_price: COIN }).unwrap();
+    chain.apply(carol, req(bob, COIN)).unwrap();
+    chain.apply(carol, req(alice, COIN)).unwrap();
+    chain.advance_blocks(chain.params().request_ttl_blocks());
+    chain.apply(alice, req(carol, COIN)).unwrap();
 
     assert!(chain.ledger().is_balanced());
     assert_eq!(chain.ledger().issued(), issued);

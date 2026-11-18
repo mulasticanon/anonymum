@@ -7,15 +7,19 @@
 //! * [`Handshake`] / [`Session`] — end-to-end encryption between two
 //!   addresses using the Noise XX pattern. Nobody without one of the two
 //!   private keys can read the messages: no node, no developer.
+//! * [`seal_note`] / [`open_note`] — the fixed-size note a stranger's
+//!   contact request carries (Noise N), holding a throwaway reply address.
 //!
 //! This crate composes existing primitives; it invents none. It has not been
 //! externally audited.
 
 mod identity;
 mod invite;
+pub mod note;
 mod session;
 pub mod wire;
 
 pub use identity::Identity;
 pub use invite::{Ed25519Invites, InviteSecret};
+pub use note::{open_note, seal_note, ContactNote, NoteError};
 pub use session::{Handshake, Session, SessionError, MAX_PLAINTEXT};

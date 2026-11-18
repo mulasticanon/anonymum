@@ -19,7 +19,11 @@ pub mod ratelimit;
 pub mod transport;
 pub mod types;
 
-pub use chain::{Chain, Channel, Error, Event, OpenedVia, Params, RefundReason, Tx};
+pub use chain::{
+    Chain, Channel, ContactRequest, Error, Event, OpenedVia, Params, PublishedKey, RefundReason,
+    Tx, UnblockReason,
+};
+pub use crypto::{KeyBinding, MessagingKey, SealedNote, SEALED_NOTE_LEN};
 pub use client::{Inbox, Verdict};
 pub use transport::{Envelope, InMemoryTransport, Transport};
 pub use types::{Address, Amount, BlockHeight, ChannelId, RequestId, COIN};

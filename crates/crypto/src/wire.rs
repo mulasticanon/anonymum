@@ -108,8 +108,18 @@ impl Initiator {
 
 /// The answering side, serving many callers at once.
 pub struct Responder<T> {
-    pending: HashMap<T, Handshake>,
+    pending: HashMap<T, Pending>,
     sessions: HashMap<T, Session>,
+}
+
+/// A half-finished handshake, with the frame that started it and our reply.
+/// A caller who is not answered (e.g. we were offline) sends the same first
+/// frame again; when both copies arrive, we answer the repeat with the same
+/// reply, so there is still exactly one handshake to finish.
+struct Pending {
+    first: Vec<u8>,
+    reply: Vec<u8>,
+    handshake: Handshake,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -141,16 +151,22 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     ) -> Result<ResponderEvent, WireError> {
         match split(incoming)? {
             (HANDSHAKE_1, body) => {
+                if let Some(pending) = self.pending.get(&from) {
+                    if pending.first == body {
+                        return Ok(ResponderEvent::Reply(pending.reply.clone()));
+                    }
+                }
                 if self.pending.len() >= MAX_PENDING && !self.pending.contains_key(&from) {
                     return Err(WireError::Busy);
                 }
                 let (handshake, message2) = Handshake::respond(me, body)?;
-                self.pending.insert(from, handshake);
-                Ok(ResponderEvent::Reply(frame(HANDSHAKE_2, &message2)))
+                let reply = frame(HANDSHAKE_2, &message2);
+                self.pending.insert(from, Pending { first: body.to_vec(), reply: reply.clone(), handshake });
+                Ok(ResponderEvent::Reply(reply))
             }
             (HANDSHAKE_3, body) => {
-                let handshake = self.pending.remove(&from).ok_or(WireError::UnexpectedFrame)?;
-                let session = handshake.responder_finish(body)?;
+                let pending = self.pending.remove(&from).ok_or(WireError::UnexpectedFrame)?;
+                let session = pending.handshake.responder_finish(body)?;
                 let peer = session.peer();
                 self.sessions.insert(from, session);
                 Ok(ResponderEvent::Established { peer })

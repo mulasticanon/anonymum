@@ -49,6 +49,9 @@ fn main() {
     let everyone = [alice, bob, carol];
     for who in everyone {
         chain.mint(who, 10 * COIN);
+        let key = MessagingKey(who.0);
+        let binding = anonymum_core::crypto::mock::mock_binding(&who, &key);
+        chain.apply(who, Tx::PublishMessagingKey { key, binding }).unwrap();
     }
     let mut bob_inbox = Inbox::new(bob, 5, 1);
 
@@ -79,8 +82,11 @@ fn main() {
     deliver(&chain, &mut net, &mut bob_inbox, &bob, 0);
 
     println!("\n4. Carol pays to request contact: network fee now, Bob's 2 coins held in escrow.");
+    // The note would be sealed to Bob's messaging key (see anonymum-crypto);
+    // the chain only checks its size.
+    let note = SealedNote(vec![0; SEALED_NOTE_LEN]);
     let events = chain
-        .apply(carol, Tx::RequestContact { recipient: bob, max_price: 2 * COIN })
+        .apply(carol, Tx::RequestContact { recipient: bob, max_price: 2 * COIN, note })
         .unwrap();
     let Event::ContactRequested { request, .. } = events[0] else { unreachable!() };
     balances(&chain, &everyone);

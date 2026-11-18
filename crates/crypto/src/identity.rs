@@ -1,9 +1,8 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use anonymum_core::Address;
+use anonymum_core::crypto::{key_binding_message, KeyBinding, MessagingKey};
+use anonymum_core::{Address, Tx};
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
-
-const BINDING_DOMAIN: &[u8] = b"anonymum/msgkey-binding/v1";
 
 /// A wallet's private keys. Never leaves the device.
 ///
@@ -53,12 +52,19 @@ impl Identity {
     pub(crate) fn binding(&self) -> [u8; 64] {
         self.signing.sign(&binding_message(&self.messaging_public())).to_bytes()
     }
+
+    /// The transaction that publishes this wallet's messaging key on-chain,
+    /// so strangers can seal contact notes to it.
+    pub fn publish_key_tx(&self) -> Tx {
+        Tx::PublishMessagingKey {
+            key: MessagingKey(self.messaging_public()),
+            binding: KeyBinding(self.binding()),
+        }
+    }
 }
 
 fn binding_message(messaging_public: &[u8; 32]) -> Vec<u8> {
-    let mut message = BINDING_DOMAIN.to_vec();
-    message.extend_from_slice(messaging_public);
-    message
+    key_binding_message(&MessagingKey(*messaging_public))
 }
 
 /// Does `address` vouch for `messaging_public`?

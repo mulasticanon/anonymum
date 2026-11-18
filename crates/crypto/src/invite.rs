@@ -1,5 +1,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use anonymum_core::crypto::{invite_message, InviteKey, InviteProof, InviteScheme};
+use anonymum_core::crypto::{
+    invite_message, InviteKey, InviteProof, InviteScheme, KeyBinding, MessagingKey,
+};
 use anonymum_core::Address;
 use rand_core::OsRng;
 
@@ -51,5 +53,9 @@ impl InviteScheme for Ed25519Invites {
             return false;
         };
         key.verify_strict(message, &signature).is_ok()
+    }
+
+    fn verify_key_binding(&self, address: &Address, key: &MessagingKey, binding: &KeyBinding) -> bool {
+        crate::identity::verify_binding(address, &key.0, &binding.0)
     }
 }
