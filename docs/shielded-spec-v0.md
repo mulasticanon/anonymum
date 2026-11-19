@@ -1,4 +1,4 @@
-# Shielded money: specification v0.5 (draft for review)
+# Shielded money: specification v0.6 (draft for review)
 
 Status: draft, 2026-11-19. Written to be reviewed by a cryptographer and to
 drive a plain-Rust reference model. It is not a security design until it
@@ -11,6 +11,12 @@ Background and evidence: `Shielded_Payments_Technical_Research_2026-11-19.md`
 v0.5 resolves the twelve issues the reference model raised
 (`shielded-spec-v0-issues.md`, I1 to I12). Each change is marked with its
 issue number.
+
+v0.6 takes in the findings of `design-review-2026-11-19.md` (an AI-written
+review, not the human specialist review still required): a separate
+contact identity (section 2a), key locators in the sender's recovery copy,
+a stricter rule for finding refunds, and a fixed base fee for the
+prototype.
 
 A second, more detailed proposal exists in
 `Shielded_Payments_Protocol_v0.1.md` (the "alternative protocol"). It shares
@@ -29,7 +35,7 @@ differences.
 | O3 | Accounting: one identical public base fee on every transaction, visibly credited (burn share and node-pool share). Everything tied to a user's price is confidential: the price, the difference between invited and stranger contact, and the decline penalty. Period totals may be published later, once volume is high enough. | 2026-11-19 |
 | O4 | Contact requests expire after 24 hours. | 2026-11-18 |
 | O5 | The stranger surcharge is burned, not paid to node operators (P1). | 2026-11-19 |
-| O6 | Blocked or ignored strangers get no answer and are refunded after 24 hours minus the penalty (P3). | 2026-11-19 |
+| O6 | Blocked or ignored strangers get no answer. The sender can take the refund, minus the penalty, at any time; after 24 hours the recipient can no longer claim, so an ignored request is then always refundable (P3; wording corrected for I14). | 2026-11-19 |
 | O7 | Opening a request locks the price plus one base fee, so settlement is prepaid (P4). | 2026-11-19 |
 | O8 | Claims stop at 24 hours; after that only a refund is possible (P5). | 2026-11-19 |
 
@@ -69,14 +75,21 @@ does not know anyone's price. A wallet publishes a signed contact card
 (contact key, price, validity period) off-chain. An offer below the price
 is ignored by the recipient's app and times out.
 
-**P3. Blocking is local.** A blocked or ignored stranger gets no answer;
-their escrow comes back after 24 hours minus the penalty. The chain cannot
+**P3. Blocking is local.** A blocked or ignored stranger gets no answer.
+They can take their refund, minus the penalty, at any time; once 24 hours
+pass the recipient can no longer claim. Nothing comes back on its own
+(P6). The chain cannot
 refuse them in advance.
 
 **P4. Resolution fees are prepaid.** Opening an escrow locks the price plus
 one base fee. Whoever resolves the escrow pays the base fee from that
 reserve, so a claim pays the recipient the full price and a refund never
-strands a sender who has no other coins.
+strands a sender who has no other coins. For the prototype `F` is fixed
+(review H1; issue I8): a change in either direction would leave open
+escrows unable to settle. The review's candidate for a later version is to
+lock a maximum fee `C` in each escrow and privately return `C - F` to the
+sender on every outcome, including a claim. That would amend O7 and needs
+the owner's decision.
 
 **P5. Claims stop at the deadline.** The recipient can claim only before
 24 hours have passed. After that only a refund is possible.
@@ -112,6 +125,45 @@ carry a quantum-resistant key exchange (ML-KEM-768 alone needs 1,088
 bytes). The model treats payloads as opaque fixed-size slots; the size and
 the encryption suite are for the cryptographer to fix.
 
+## 2a. Contact identity (new in v0.6; review findings H3, H4)
+
+Today's prototype uses the wallet's own address as the identity in the
+messaging handshake and in the stranger's note. In the shielded design
+that would give callers and infrastructure a reusable wallet identifier,
+whatever the payment proofs hide. Rules:
+
+1. **Two separate identities.** A wallet's money keys (spending, viewing,
+   nullifier secrets) and its contact identity (a signing key and an
+   encryption key) are generated independently. Nothing in a contact
+   identity can spend, view balances or compute a nullifier. A user may
+   hold several contact identities.
+2. **Contact card.** What a user hands out or lists publicly: contact
+   signing key, contact encryption key, price, validity period, signed by
+   the contact signing key. It carries no wallet key.
+3. **Handshake.** Sessions authenticate contact identities, never wallet
+   keys. The answering side must not reveal its contact identity to a
+   caller it has not authenticated. In every flow the caller already holds
+   the answerer's contact key (from an invitation, a contact card, or a
+   stranger's note), so the handshake should use a pattern in which the
+   caller proves it knows that key before the answerer reveals anything.
+   The current pattern (Noise XX, answerer reveals first) does not do
+   this. Which pattern replaces it is question 11.
+4. **Stranger's note.** The recipient opens it with their contact
+   encryption key alone. The sender's contact identity and the throwaway
+   reply address are inside the ciphertext, not needed to open it. The note
+   is bound to the admission record of the same transaction. Nobody
+   holding only the recipient's public contact card can tell that a note is
+   addressed to them (question 12).
+5. **Invitations** are issued by a contact identity to a holder key, and
+   name the network, an expiry and the purpose. The recipient's app checks
+   them and records which ones it has honoured.
+6. **The session is tied to the request.** Both sides mix the accepted
+   request's identifier into the session, so a session cannot be passed
+   off as belonging to a different paid request.
+
+Changing the handshake and the note format in `crates/crypto` waits for
+the cryptographer's answer to questions 11 and 12.
+
 ## 3. Objects
 
 All amounts are unsigned 64-bit integers in base units; sums are checked
@@ -126,6 +178,10 @@ a fresh secret `blinding`, so its public commitment reveals nothing and
 cannot be guessed from a known amount. (v0.2 omitted this: a retired note
 of the known surcharge `S` could have been recognised on-chain. Found in
 the owner's ChatGPT review of 2026-11-19.)
+
+The one exception is a refund note (section 4): its blinding is derived
+from the escrow's seed and position, so both escrow parties can recompute
+its commitment. It stays hidden from everyone else (I13; question 8).
 
 - **Ordinary note**: `(value, owner, blinding)`.
 - **Escrow note**: `(price, fee_reserve, recipient, refund_to,
@@ -254,9 +310,20 @@ to a key derived from the sender's own backed-up wallet keys. A wallet
 restored from backup with no local history scans the chain, decrypts that
 copy, and so recovers everything needed to take the sender refund or find a
 refund. Writing this copy correctly is in the sender's own interest, so it
-is not proven. The copy sits in a payload slot together with a fresh random
+is not proven. The copy also records how to derive the refund identity and
+the cancel authority (which key purpose and index), so a restored wallet
+derives both directly and never has to search for them (review H2). The
+copy sits in a payload slot together with a fresh random
 nonce, so a restored wallet makes one decryption attempt per payload, the
 same work as finding any other note (I11).
+
+**Finding a refund.** A wallet does not look for the expected refund
+commitment anywhere in history. It first finds the finalised transaction
+that consumed the escrow's nullifier, then matches the derived refund
+among that transaction's outputs, and tracks separately whether that note
+is still unspent (review M1). A stranger-tier receipt can only come from
+an Open: a refund whose penalty happens to equal `S` must never count as
+one.
 
 **An admitted request is always claimable.** Before showing a request as
 actionable, the recipient's app must recover the full escrow data and
@@ -381,6 +448,14 @@ and reward payout; network-layer privacy of submission and queries.
     ones resolve under a rule that hides the difference; or the reserve is
     over-funded and the excess retired. Until this is settled, `F` cannot
     be changed on a network with open escrows.
+11. Which handshake pattern should replace Noise XX so that the answering
+    side reveals its contact identity only to a caller who already knows
+    its contact key (for example XK or IK), and what does each cost in
+    identity hiding and forward secrecy?
+12. What envelope should carry a stranger's note so that it opens with the
+    recipient's contact key alone, carries the sender's identity inside,
+    and cannot be recognised by anyone holding only the recipient's public
+    contact card?
 
 ## 8. How this differs from the alternative protocol
 
