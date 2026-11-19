@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/crypto", "crates/nym"]
+members = ["crates/core", "crates/crypto", "crates/nym", "crates/shielded-model"]
 # The Substrate port is its own workspace (own Cargo.lock).
 exclude = ["substrate"]
 # The Nym crate pulls in several hundred dependencies; keep everyday builds fast.
-default-members = ["crates/core", "crates/crypto"]
+default-members = ["crates/core", "crates/crypto", "crates/shielded-model"]

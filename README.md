@@ -6,13 +6,14 @@ A messaging coin where reaching someone costs money unless they invited you.
 - **Stranger**: pays a larger network fee plus a price the recipient sets.
 - **After that**: messages are free, rate limited, and travel over the Nym mixnet.
 
-Three crates, plus a Substrate port in `substrate/`:
+Four crates, plus a Substrate port in `substrate/`:
 
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
 | `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing. | 25 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 (see below). Not an automated test. |
+| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 42 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
@@ -145,6 +146,33 @@ Differences from the in-process simulation:
 - The RPC endpoint: `run-node.sh` keeps the default CORS policy, so web
   pages cannot reach the node; `--rpc-cors all` was removed. Add a specific
   `--rpc-cors <origin>` only when a browser UI needs it.
+## Shielded money: specification and reference model
+
+The next privacy stage (roadmap step 5) is specified in
+`docs/shielded-spec-v0.md` (v0.4, the current source; the owner's
+decisions O1–O8 are recorded there and in CLAUDE.md).
+`docs/Shielded_Payments_Technical_Research_2026-11-19.md` is the background
+research and `docs/Shielded_Payments_Protocol_v0.1.md` an alternative design
+kept for reference.
+
+`crates/shielded-model` is **a model of the rules for review, not a private
+or secure implementation.** It has no zero-knowledge proofs, no circuits
+and no note encryption, and its chain function sees every hidden value. It
+lets a reviewer read the spec as code and shows, by test, which transactions
+the rules accept and reject: every property in spec section 5 with
+adversarial cases (wrong authority on each branch, double resolution,
+altered refunds, redirected penalties, forged stranger receipts, dummy-slot
+tricks, integer limits, deadlines, replay), a randomised test that checks
+conservation after every transaction of long mixed histories, and the
+section 5b acceptance test (a restored wallet recovers and spends exactly
+99 of a 101 escrow after a garbage decline). Each rule was also disabled in
+turn to confirm a test catches it.
+
+    cargo test -p anonymum-shielded-model
+
+Problems found in the spec while building it are listed in
+`docs/shielded-spec-v0-issues.md`.
+
 ## What is real and what is not
 
 | Piece | Status |
@@ -156,7 +184,7 @@ Differences from the in-process simulation:
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |
 | Mixnet transport | Nym SDK; replies go through single-use reply blocks, so the recipient never learns the caller's network location. Ran once live; no automated test |
 | The chain itself | Rules run as a Substrate pallet on a local single-node dev chain (manual seal, 6 s blocks). No real network, consensus or validators yet |
-| Shielded payments | Not started. The channel table is public |
+| Shielded payments | Specified (`docs/shielded-spec-v0.md`, draft for review) and modelled in plain Rust (`crates/shielded-model`, rules only, not private). No circuit or pallet yet; the channel table is still public |
 | Node staking and rewards | Pool accumulates; payout not started |
 | Post-quantum key exchange, per-message forward secrecy | Not started |
 
