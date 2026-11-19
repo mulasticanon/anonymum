@@ -145,7 +145,8 @@ tests for every rule and failure path (failed transactions change nothing;
 - `Tx::Block { target }`: target's paid requests fail with `Error::Blocked`
   before any fee; target's pending request is refunded in full
   (`RefundReason::Blocked`, no decline fee); an open channel is closed.
-  The blocker's own pending request to the target is left alone.
+  The blocker's own pending request to the target was left alone; audit
+  F4 changed this (it is now cancelled, decline fee burned).
 - `Tx::Unblock { target }`: only the blocker can send it (`NotBlocked`
   otherwise). Errors: `SelfContact`, `AlreadyBlocked`.
 - The owner's answers (2026-11-18): only an invite registered *after* the
@@ -267,6 +268,89 @@ eight items. All are fixed in `crates/core` and `substrate/pallets/anonymum`
   Ed25519 account keys (wallet address = chain AccountId).
 
 Tests after the fixes: core 61, crypto 25, pallet 57.
+
+## Decided 2026-11-18 (late), not yet implemented
+
+**D1. A block created by closing a channel takes no deposit.** Today
+`close_channel` fails if the closer cannot pay the block deposit, so someone
+with an empty wallet cannot leave a channel. Change: the automatic block on
+close is deposit-free and `close_channel` never fails for lack of funds.
+This does not reopen free storage: each such block needs a channel that was
+already paid for. A block made directly with `Block` keeps its deposit.
+Record which kind a block is, so `Unblock` and a reopening channel return a
+deposit only where one was taken. Core and pallet, with tests.
+
+**D2. Contact requests expire after 24 hours, not 48.** This matches how
+long Nym gateways hold messages for an offline client. Change
+`request_ttl_secs` / `RequestTtlMillis` and every test and document that
+says 48 h (24 h at 6 s blocks = 14,400 blocks). Client side: after
+replacing a messaging key, keep the old private key for 24 hours, because a
+pending request's note was sealed to it.
+
+## Roadmap step 5: read `docs/step-5-anonymity.md` first
+
+That file compares the ways to stop the chain publishing who talks to whom
+and recommends two stages (5a: move channels, invites and blocks off the
+chain with committed fee tickets, no new cryptography; 5b: shielded money).
+**Do not implement any of it yet.** The owner has five decisions to make,
+listed at the end of that file. D1 and D2 above can be done now; note that
+stage 5a would later remove the block and invite tables they touch.
+
+## Stage 5b research received 2026-11-19 (no implementation yet)
+
+`docs/Shielded_Payments_Technical_Research_2026-11-19.md` is a 25,000-word
+study commissioned by the owner from another research tool. Two of its
+load-bearing claims were checked against primary sources and hold: the
+2026 Orchard soundness flaw (ZIP 257) and the Polkadot SDK elliptic-curve
+host functions (RFC-0163: BLS12-381, Bandersnatch, Pallas/Vesta; no
+subgroup checks on decode; arkworks unaudited). The rest is unchecked.
+
+Its recommendation: one shielded note pool, Sapling-lineage Groth16 on
+BLS12-381, a new conditional-spend (escrow) circuit, verification through
+the SDK host functions, no account-signed payment transactions, contacts
+and channels entirely client-side. It sets seven feasibility gates
+(section 15.1) and says plainly that this is new, security-critical
+protocol work needing a specialist and audits.
+
+**Nothing from it is to be built yet.** Gate 1 is a set of product
+decisions for the owner, because several existing rules conflict with
+hiding amounts and activity:
+- a per-refund public 1% burn reveals the escrowed amount to within 100
+  units;
+- publicly different fees for invited and stranger contacts reveal which
+  kind each transaction is;
+- a public node reward pool balance reveals variable contributions;
+- "refund after 24 hours" cannot be automatic: a wallet or a delegate must
+  submit it;
+- either side cancelling at any time becomes "first finalised wins";
+- blocking cannot be enforced by the chain once contact state is private;
+- the 427-byte note does not fit a post-quantum key exchange;
+- invites checked inside a proof probably need a circuit-friendly
+  signature; Ed25519, used today, is costly inside a circuit.
+
+## Shielded design: current source and owner decisions (2026-11-19)
+
+The current source for the shielded design is
+**`docs/shielded-spec-v0.md` (version 0.4)**. Where
+`docs/Shielded_Payments_Protocol_v0.1.md` (the alternative protocol, kept
+for reference) differs from it, the spec wins. The research report gives
+background; section 15.1 gate 1 is what the spec's decisions answer.
+
+Owner decisions recorded in the spec (section 1):
+
+| # | Decision | Date |
+|---|---|---|
+| O1 | Go for shielded money (stage 5b), with contact state moved off-chain. | 2026-11-19 |
+| O2 | A cryptographer and external audits will be funded before any real value is at stake. | 2026-11-19 |
+| O3 | One identical public base fee on every transaction, visibly credited (burn share and node-pool share). Everything tied to a user's price is confidential: the price, the invited/stranger difference, and the decline penalty. Period totals may be published later, once volume is high enough. | 2026-11-19 |
+| O4 | Contact requests expire after 24 hours. | 2026-11-18 |
+| O5 | The stranger surcharge is burned, not paid to node operators (P1). | 2026-11-19 |
+| O6 | Blocked or ignored strangers get no answer and are refunded after 24 hours minus the penalty (P3). | 2026-11-19 |
+| O7 | Opening a request locks the price plus one base fee, so settlement is prepaid (P4). | 2026-11-19 |
+| O8 | Claims stop at 24 hours; after that only a refund is possible (P5). | 2026-11-19 |
+
+Still: no circuits, ceremony or pallet changes for the shielded design
+until the cryptographer has reviewed the spec.
 
 ## Open questions for the owner
 
