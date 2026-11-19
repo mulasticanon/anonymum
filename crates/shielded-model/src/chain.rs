@@ -18,8 +18,10 @@ pub const N_IN: usize = 2;
 pub const N_OUT: usize = 3;
 /// Encrypted payload slots per transaction.
 pub const N_PAY: usize = 3;
-/// Bytes per payload slot. A placeholder: the size is open (P10).
-pub const PAYLOAD_LEN: usize = 192;
+/// Bytes per payload slot. A placeholder: the size is open (P10). Sized to
+/// hold the sender's recovery copy: a 12-byte nonce, the 176-byte escrow
+/// and a 16-byte authentication tag.
+pub const PAYLOAD_LEN: usize = 204;
 /// Request lifetime: claims stop and timeouts start here (O4, O8).
 pub const TTL: Time = 24 * 60 * 60;
 
@@ -77,7 +79,8 @@ pub struct PublicTx {
     /// Commitment to the admission record (empty for non-requests).
     pub admission: Commitment,
     pub payloads: [Vec<u8>; N_PAY],
-    /// Validity window, half-open `[not_before, not_after)` (issue I1).
+    /// Validity window: one cell of the window grid, half-open
+    /// `[not_before, not_after)` (spec v0.5, I1).
     pub not_before: Time,
     pub not_after: Time,
     pub base_fee: Value,
@@ -113,8 +116,10 @@ pub enum Branch {
     Open,
     Claim,
     Decline,
-    Cancel,
-    Timeout,
+    /// The sender takes the refund (price minus penalty), at any time:
+    /// before the deadline an early cancellation, after it a timeout refund
+    /// (spec v0.5 merged v0.4's Cancel and Timeout, I2).
+    SenderRefund,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,7 +139,7 @@ pub enum InputWitness {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutputWitness {
     /// An unused slot: a zero-value retired note with a fresh blinding
-    /// (issue I7: the spec does not fix the dummy output's form).
+    /// (spec v0.5, I7).
     Dummy { blinding: Hash },
     Real(Note),
 }
@@ -194,7 +199,6 @@ pub enum Reject {
     RefundNotDerived,
     PenaltyWrong,
     ClaimTooLate,
-    TimeoutTooEarly,
 }
 
 /// A note's place in the tree, as anyone can see it.
@@ -371,7 +375,7 @@ impl Chain {
         }
         // 1-3. Inputs: membership, nullifier, authority, type.
         let mut input_total: u128 = 0;
-        let mut real_inputs: Vec<(&Note, Time, &Secret)> = Vec::new();
+        let mut real_inputs: Vec<(&Note, Time, u64, &Secret)> = Vec::new();
         for (slot, nf) in witness.inputs.iter().zip(&public.nullifiers) {
             match slot {
                 InputWitness::Dummy { secret } => {
@@ -404,7 +408,7 @@ impl Chain {
                         return Err(Reject::BadNullifier);
                     }
                     input_total += u128::from(note.value().ok_or(Reject::Overflow)?);
-                    real_inputs.push((note, *created_at, authority));
+                    real_inputs.push((note, *created_at, *position, authority));
                 }
             }
         }
@@ -441,7 +445,7 @@ impl Chain {
                 if tier != want || witness.admission.escrow.is_some() {
                     return Err(Reject::TierMismatch);
                 }
-                if real_inputs.iter().any(|(n, _, _)| !matches!(n, Note::Ordinary { .. })) {
+                if real_inputs.iter().any(|(n, _, _, _)| !matches!(n, Note::Ordinary { .. })) {
                     return Err(Reject::WrongInputType);
                 }
                 if real_outputs.iter().any(|n| !matches!(n, Note::Ordinary { .. })) {
@@ -449,7 +453,7 @@ impl Chain {
                 }
             }
             Branch::Open => {
-                if real_inputs.iter().any(|(n, _, _)| !matches!(n, Note::Ordinary { .. })) {
+                if real_inputs.iter().any(|(n, _, _, _)| !matches!(n, Note::Ordinary { .. })) {
                     return Err(Reject::WrongInputType);
                 }
                 let escrows: Vec<&EscrowNote> =
@@ -475,11 +479,11 @@ impl Chain {
                     return Err(Reject::ReceiptEscrowMismatch);
                 }
             }
-            Branch::Claim | Branch::Decline | Branch::Cancel | Branch::Timeout => {
+            Branch::Claim | Branch::Decline | Branch::SenderRefund => {
                 if tier != Tier::None || witness.admission.escrow.is_some() {
                     return Err(Reject::TierMismatch);
                 }
-                let [(Note::Escrow(escrow), created_at, authority)] = real_inputs.as_slice() else {
+                let [(Note::Escrow(escrow), created_at, escrow_position, authority)] = real_inputs.as_slice() else {
                     return Err(Reject::WrongInputType);
                 };
                 let required = match witness.branch {
@@ -506,10 +510,8 @@ impl Chain {
                         }
                     }
                     _ => {
-                        if witness.branch == Branch::Timeout && public.not_before < deadline {
-                            return Err(Reject::TimeoutTooEarly);
-                        }
-                        let refund = derived_refund(escrow);
+                        // Decline or sender refund: no time condition.
+                        let refund = derived_refund(escrow, *escrow_position);
                         let refunds = real_outputs.iter().filter(|n| matches!(n, Note::Ordinary { .. })).count();
                         let retired: Vec<Value> = real_outputs
                             .iter()
@@ -521,6 +523,8 @@ impl Chain {
                         if !real_outputs.contains(&refund) {
                             return Err(Reject::RefundNotDerived);
                         }
+                        // Implied by the derived refund and conservation,
+                        // but kept explicitly (spec v0.5, I12).
                         if retired[0] != penalty(escrow.price) {
                             return Err(Reject::PenaltyWrong);
                         }

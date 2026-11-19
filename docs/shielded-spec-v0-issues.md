@@ -1,103 +1,101 @@
-# Issues found while modelling shielded spec v0.4
+# Issues found while modelling the shielded spec
 
-Found while building `crates/shielded-model` (2026-11-19). Each item is a
-place where `docs/shielded-spec-v0.md` (v0.4) is ambiguous, contradicts
-itself, or cannot be implemented as written. The model did not guess
-silently: where it had to choose so the rest could be built, the choice is
-stated here and in the code, and is easy to change.
+Raised while building `crates/shielded-model` against
+`docs/shielded-spec-v0.md`. I1–I12 were found in v0.4 (2026-11-19); v0.5
+resolves all but I8. I13–I14 are new in v0.5. Each entry says how it stands
+and what the model does.
 
-Numbers I1–I12 are referenced from the code.
+| # | Issue | Status |
+|---|---|---|
+| I1 | Validity window closed vs half-open; claim rule | Resolved in v0.5 |
+| I2 | Timeout added nothing over Cancel | Resolved in v0.5 |
+| I3 | Ordinary-note nullifier unspecified | Resolved in v0.5 |
+| I4 | Value range unspecified | Resolved in v0.5 |
+| I5 | Where the admission record lives | Resolved in v0.5 |
+| I6 | `created_at`: block time or window start | Resolved in v0.5 |
+| I7 | Form of a dummy output | Resolved in v0.5 |
+| I8 | Changing `F` strands open escrows | **Open** (v0.5 question 10) |
+| I9 | Refunds of twin escrows were identical | Resolved in v0.5 |
+| I10 | Minimum price and parameter values | Resolved in v0.5 (parameter values still placeholders) |
+| I11 | Recovery copy needed a nonce search | Resolved in v0.5 |
+| I12 | Penalty constraint implied by two others | Resolved in v0.5 (check kept) |
+| I13 | "Every note has a fresh secret blinding" vs the derived refund | **New in v0.5, open** |
+| I14 | "Refunded after 24 hours" vs a refund valid at any time | **New in v0.5, open** |
 
-## Contradictions and ambiguities that change behaviour
+## Resolved in v0.5
 
-**I1. Validity windows: closed in section 4, half-open in P11.**
-Section 4 writes the window as `[not_before, not_after]` and the claim
-condition as `not_after < created_at + 24h`; P11 says the half-open
-convention `[start, end)` is used everywhere. Read half-open, the claim
-condition as written forbids a claim in the last window before the
-deadline, even though every inclusion time in that window is before the
-deadline. Read closed, `not_after` is the last allowed second and the
-condition is right but contradicts P11.
-*Model:* windows are half-open grid cells `[not_before, not_after)`; a claim
-needs `not_after <= deadline`, a timeout `not_before >= deadline`. A claim
-in the window `[deadline - W, deadline)` is accepted; one in
-`[deadline, deadline + W)` is not.
-Also open: section 4 says windows are "drawn from a small shared set", P11
-defines one grid. *Model:* exactly one width, the grid width.
+**I1. Validity windows.** v0.4 wrote the window closed in section 4 and
+half-open in P11, and its claim rule `not_after < created_at + 24h` would
+have forbidden a claim in the last window before the deadline.
+*v0.5:* one half-open grid cell `[not_before, not_after)`; claims need
+`not_after <= created_at + 24h`. *Model:* as v0.5 (unchanged).
 
-**I2. Timeout adds nothing over Cancel.**
-Cancel and Timeout have the same authority (`canceller`), the same outputs,
-and Cancel has no time condition, so anything a Timeout can do a Cancel can
-do earlier. Either Cancel should be limited (for example to before the
-deadline, or to the sender and recipient together), or Timeout should have a
-different authority, such as a delegate who may only submit the fixed refund
-(P6 mentions such a delegate later). *Model:* implements both as written.
+**I2. Timeout added nothing over Cancel.** Same authority, same outputs,
+and Cancel had no time limit. *v0.5:* merged into one **Sender refund**,
+valid at any time. *Model:* `Branch::SenderRefund` replaces `Cancel` and
+`Timeout`; `Reject::TimeoutTooEarly` is gone.
 
-**I3. How an ordinary note's nullifier is derived is not specified.**
-Section 3 specifies only the escrow nullifier (`seed`, commitment,
-position). *Model:* `H(owner secret, commitment, position)`, so only the
-owner can compute it and two insertions of one commitment differ.
+**I3. Ordinary-note nullifier.** *v0.5:* from a secret only the owner
+holds, the commitment and the position. *Model:* `H(owner secret,
+commitment, position)` (unchanged).
 
-**I4. The value range is not specified.**
-"All values fit their range" (common part, item 4) without a range or a
-maximum supply. *Model:* each note value is a `u64`; sums are computed
-exactly in 128 bits; an escrow's `price + fee_reserve` must fit a `u64`
-(else `Overflow`).
+**I4. Value range.** *v0.5:* unsigned 64-bit values, checked sums, and an
+escrow's `price + fee_reserve` must fit 64 bits. *Model:* as v0.5
+(unchanged).
 
-**I5. Where the admission record lives is not specified.**
-Section 3 says every transaction carries one; section 4's list of public
-fields does not include it, and it is not a note, so it is unclear whether
-it is a tree commitment, a public field or a payload, and how the
-recipient's app is meant to find it. *Model:* a separate public commitment
-field, not inserted in the tree.
+**I5. Admission record.** *v0.5:* its commitment is a separate public field,
+not a tree leaf. *Model:* as v0.5 (unchanged).
 
-**I6. `created_at`: block time or window start?**
-Section 3 and P11 stamp `created_at` as the start of the window containing
-the including block; section 4 says the chain "inserts new commitments with
-the block time". *Model:* the window start (the including transaction's
-`not_before`).
+**I6. `created_at`.** *v0.5:* the chain stamps the start of the current
+window. *Model:* as v0.5 (unchanged).
 
-**I7. The form of a dummy output is not specified.**
-"Dummy slots carry no value", but not what a dummy output commits to.
-*Model:* a zero-value retired note with a fresh blinding, inserted like any
-other output, so it cannot be spent and its commitment looks like any note.
+**I7. Dummy outputs.** *v0.5:* a zero-value retired note with fresh
+blinding, inserted like any other. *Model:* as v0.5 (unchanged).
 
-**I8. Changing `F` strands open escrows.**
-At opening `fee_reserve = F`; at resolution conservation reads
-`price + fee_reserve = outputs + F`. If governance changes `F` while an
-escrow is open, the escrow can no longer resolve as specified. *Model:*
-`F` is constant, and a resolution requires `fee_reserve = F`.
+**I9. Twin escrows.** v0.4 derived the refund blinding from `seed` alone,
+so two escrows sharing a seed got identical refunds. *v0.5:* from `seed`
+and the escrow's position. *Model:* `refund_blinding(seed,
+escrow_position)`; the test `two_escrows_with_the_same_seed_give_different_refunds`
+covers escrows that share only a seed and exact twins.
 
-## Gaps and cases the spec does not address
+**I10. Minimum price.** *v0.5:* none; a price of 1–99 carries a penalty of
+1 (price 0 carries none). *Model:* as v0.5 (unchanged). `F`, `S` and the
+window width are still placeholder values (`F = 10`, `S = 50`, 1 hour).
 
-**I9. Refunds of twin escrows are identical.**
-The refund's blinding is derived from `seed` alone. Two escrows with the
-same `seed` (or one commitment inserted twice, which the position-bound
-nullifier explicitly allows) produce identical refund commitments. Both stay
-spendable, because ordinary nullifiers include the position, but the
-recipient can tell them apart only by position. Deriving the refund blinding
-from `seed` and the escrow's position would keep them distinct. Related to
-the cryptographer's question 8.
+**I11. Recovery copy.** v0.4 left the nonce implicit, so the model's
+restored wallet tried every payload against every commitment. *v0.5:* the
+copy carries a fresh random nonce, one decryption per payload. *Model:* a
+payload slot holds `nonce || ciphertext` (12 + 176 + 16 = 204 bytes, so
+`PAYLOAD_LEN` grew from 192 to 204); `open_recovery` makes one attempt and
+needs no chain context. The model takes the nonce from its caller, because
+it has no randomness source of its own.
 
-**I10. Minimum price and parameter values are not specified.**
-Nothing forbids `price = 0` (penalty 0; the surcharge is still retired),
-and `F`, `S` and the window width have no values. *Model:* allows price 0;
-uses `F = 10`, `S = 50`, a 1-hour window in tests (placeholders).
+**I12. Implied penalty constraint.** *v0.5:* the explicit check is kept
+anyway. *Model:* kept; disabling it still fails no test, as expected.
 
-**I11. The recovery copy needs a way to find its nonce.**
-"Encrypted to a key derived from the sender's backed-up wallet keys" leaves
-key and nonce derivation open (question 9). *Model:* ChaCha20-Poly1305 keyed
-from the master secret, nonce derived from the escrow commitment. A restored
-wallet then has to try every payload against every commitment, which does
-not scale; a real design needs a per-copy nonce or key that the wallet can
-compute or find without that search.
+## Still open
 
-## Observation (no change required)
+**I8. Changing `F` strands open escrows.** An escrow's reserve equals the
+`F` of its opening and its resolution must pay exactly `F`, so a change of
+`F` leaves old escrows unable to resolve, or marks them by a different fee.
+v0.5 lists options as question 10 for the cryptographer. *Model:* `F` is
+constant; a resolution needs `fee_reserve = F`.
 
-**I12. The penalty constraint is implied by two others.**
-Given the derived refund (`price - penalty` to `refund_to`) and the
-conservation equation with `fee_reserve = F`, the single retired output must
-equal the penalty. In the model, disabling the explicit penalty check made
-no test fail, because nothing can reach it. A circuit could rely on the two
-other constraints, or keep the explicit one as defence in depth; the
-cryptographer should choose deliberately.
+## New in v0.5
+
+**I13. The refund's blinding is not fresh.** Section 3 says every note of
+every type carries "a fresh secret `blinding`". The refund note's blinding
+is derived from `seed` and the escrow's position, so it is neither fresh nor
+secret from the recipient, who knows the seed and can see the position.
+It is still hidden from everyone else, and the recipient's knowledge of the
+refund commitment is already question 8. Suggest section 3 names the refund
+as the one exception and says who can recompute it.
+
+**I14. "Refunded after 24 hours" no longer describes the rule.** O6 and P3
+say a blocked or ignored stranger's escrow "comes back after 24 hours minus
+the penalty". Since v0.5 the sender refund is valid at any time, so the
+sender can take it back earlier, and nothing comes back on its own (P6).
+Suggest wording such as: "the sender can take the refund, minus the
+penalty, at any time; once 24 hours pass the recipient can no longer
+claim, so an ignored request is then always refundable." This is wording
+only; the model already implements the rule as v0.5 states it.

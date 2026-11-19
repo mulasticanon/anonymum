@@ -1,4 +1,4 @@
-# Shielded money: specification v0.4 (draft for review)
+# Shielded money: specification v0.5 (draft for review)
 
 Status: draft, 2026-11-19. Written to be reviewed by a cryptographer and to
 drive a plain-Rust reference model. It is not a security design until it
@@ -7,6 +7,10 @@ document alone.
 
 Background and evidence: `Shielded_Payments_Technical_Research_2026-11-19.md`
 (the "research report"), especially sections 4, 5, 14 and 15.
+
+v0.5 resolves the twelve issues the reference model raised
+(`shielded-spec-v0-issues.md`, I1 to I12). Each change is marked with its
+issue number.
 
 A second, more detailed proposal exists in
 `Shielded_Payments_Protocol_v0.1.md` (the "alternative protocol"). It shares
@@ -57,7 +61,7 @@ kept cheaply.)
   without a shielded treasury: the retired slot already exists for the
   penalty. Paying `S` to node operators instead would need shielded
   treasury notes, a merge action and a treasury viewing key whose holder
-  could tell stranger requests apart. Owner to choose.
+  could tell stranger requests apart. Decided by the owner: burned (O5).
 - Invitations and price quotes are never verified inside the proof.
 
 **P2. The recipient's price is enforced by the recipient's app.** The chain
@@ -110,7 +114,10 @@ the encryption suite are for the cryptographer to fix.
 
 ## 3. Objects
 
-All amounts are unsigned integers in base units. `H` is a domain-separated
+All amounts are unsigned 64-bit integers in base units; sums are checked
+and an escrow's `price + fee_reserve` must itself fit in 64 bits (I4).
+There is no minimum price. With the penalty rounded up, a price of 1 to 99
+units carries a penalty of 1 unit (I10). `H` is a domain-separated
 hash. Authorities are public identifiers whose matching secret authorises
 an action.
 
@@ -126,13 +133,14 @@ the owner's ChatGPT review of 2026-11-19.)
   - `recipient`: authority that may claim or decline.
   - `refund_to`: owner of the refund note (the sender, or a fresh identity
     of theirs).
-  - `canceller`: authority that may cancel early or refund after the
-    deadline (the sender).
+  - `canceller`: authority that may take the refund at any time (the
+    sender).
   - `seed`: secret shared by both parties, from which the escrow's single
     nullifier is derived.
 - **Retired note**: `(value, blinding)`. Can never be spent.
 - **Admission record**: `(recipient contact key, request digest, tier,
-  escrow commitment or none, blinding)`. Ties a fee tier to one request,
+  escrow commitment or none, blinding)`. Its commitment is a separate
+  public field of the transaction, not a leaf of the note tree (I5). Ties a fee tier to one request,
   one recipient and, for strangers, one escrow. Every transaction carries
   one; transactions that are not contact requests carry an empty one that
   looks the same.
@@ -141,7 +149,10 @@ the owner's ChatGPT review of 2026-11-19.)
   chain as the start of the validity window that contains the including
   block, so it always lies on the window grid (see P11). Every note of
   every type gets the same leaf shape.
-- **Nullifier**: public, one per spent note. For an escrow note it is
+- **Nullifier**: public, one per spent note. For an ordinary note it is
+  derived from a secret only the owner holds, the commitment and the
+  note's position, so nobody else can compute it or tell when the note is
+  spent (I3). For an escrow note it is
   derived from `seed`, the commitment and the note's position in the tree,
   and is identical whichever outcome is used. Including the position stops
   two insertions of the same commitment sharing one identity. *(from the
@@ -160,8 +171,9 @@ unused slots:
 - accepted tree root, chain and version identifiers;
 - a fixed number of nullifiers and of new commitments;
 - a fixed number of encrypted payload slots;
-- a validity window `[not_before, not_after]` drawn from a small shared set
-  of windows;
+- a validity window `[not_before, not_after)`: one cell of the single
+  window grid in P11, half-open (I1);
+- the admission record's commitment;
 - the public base fee `F`;
 - a proof that the hidden statement below holds.
 
@@ -186,26 +198,42 @@ Branches:
 | Transfer | ordinary notes | ordinary notes; empty admission record | owners | none |
 | Invited request | ordinary notes | change; admission record with tier "invited" and no escrow | owners | none |
 | Open (stranger request) | ordinary notes | one escrow note with `fee_reserve = F`; a retired note of `S`; change; admission record with tier "stranger" naming that escrow | owners | none |
-| Claim | one escrow note | ordinary note of `price` owned by `recipient` | `recipient` | `not_after < created_at + 24h` |
+| Claim | one escrow note | ordinary note of `price` owned by `recipient` | `recipient` | `not_after <= created_at + 24h` |
 | Decline | one escrow note | ordinary note of `price - penalty` owned by `refund_to`; retired note of `penalty` | `recipient` | none |
-| Cancel | one escrow note | same as Decline | `canceller` | none |
-| Timeout | one escrow note | same as Decline | `canceller` | `not_before >= created_at + 24h` |
+| Sender refund | one escrow note | same as Decline | `canceller` | none |
 
-`penalty = ceil(price / 100)`, constrained as integers.
+`penalty = ceil(price / 100)`, constrained as integers. The explicit
+penalty check is kept even though the derived refund and the conservation
+equation already imply it (I12).
+
+A claim in the last window before the deadline is valid; one in the window
+starting at the deadline is not (I1).
+
+**One sender-refund action, valid at any time.** v0.4 had separate Cancel
+and Timeout actions with the same authority and the same effect, so
+Timeout added nothing (I2). They are merged. Before the deadline it is an
+early cancellation, after it a timeout refund; the effect is identical. A
+delegate who may submit only the fixed refund for an offline sender (P6)
+would be a new, separately authorised action in a later version.
+
+**Unused output slots** hold a zero-value retired note with fresh blinding,
+inserted like any other output (I7).
 
 **Refunds must be recoverable by the sender.** *(problem identified by the
 alternative protocol)* In Decline the recipient builds the refund note. A
 malicious recipient could build one the sender can never find or spend,
 destroying the sender's money at no cost. Proposed rule: the refund note is
 fully determined by the escrow. Its owner is `refund_to`, its value is
-`price - penalty`, and its blinding is derived from `seed`. The sender
+`price - penalty`, and its blinding is derived from `seed` and the
+escrow's position in the tree, so two escrows that happen to share a seed
+still produce different refunds (I9). The sender
 already holds all three, so their app can compute the exact commitment to
 look for and spend it without receiving anything from the recipient. The
 alternative protocol instead proves inside the transaction that the
 encrypted copy sent to the sender is correct, which is far more expensive.
 Which is sound is question 8 for the cryptographer.
 
-In Claim, Decline, Cancel and Timeout the transaction's base fee `F` is
+In Claim, Decline and Sender refund the transaction's base fee `F` is
 paid from the escrow's `fee_reserve`, so the conservation equation reads
 `price + fee_reserve = outputs + F` with `fee_reserve = F`.
 
@@ -224,9 +252,11 @@ public counter.
 transaction carries a copy of the escrow data, including `seed`, encrypted
 to a key derived from the sender's own backed-up wallet keys. A wallet
 restored from backup with no local history scans the chain, decrypts that
-copy, and so recovers everything needed to cancel, time out, or find a
+copy, and so recovers everything needed to take the sender refund or find a
 refund. Writing this copy correctly is in the sender's own interest, so it
-is not proven.
+is not proven. The copy sits in a payload slot together with a fresh random
+nonce, so a restored wallet makes one decryption attempt per payload, the
+same work as finding any other note (I11).
 
 **An admitted request is always claimable.** Before showing a request as
 actionable, the recipient's app must recover the full escrow data and
@@ -245,7 +275,8 @@ The chain, outside the proof:
   twice in it;
 - checks the root is one it accepted, and that the including block's time
   lies inside the validity window;
-- inserts new commitments with the block time;
+- inserts new commitments stamped with the start of the current window
+  (I6);
 - credits `F` to the public burn and node-pool split.
 
 ## 5. Properties the model and tests must demonstrate
@@ -255,7 +286,7 @@ The chain, outside the proof:
 - **One outcome per escrow.** No sequence resolves the same escrow twice,
   through the same or different branches.
 - **Right party, right destination.** Only `recipient` can claim or
-  decline; only `canceller` can cancel or time out; a refund can only go to
+  decline; only `canceller` can take the sender refund; a refund can only go to
   `refund_to`; a claim can only go to `recipient`.
 - **Receipt binding.** A stranger-tier receipt cannot be opened as valid
   for any other request, recipient or escrow.
@@ -274,8 +305,7 @@ The chain, outside the proof:
 - **Penalty cannot be avoided or redirected.** Every non-claim outcome
   retires exactly `ceil(price/100)`.
 - **Retired value stays retired.**
-- **Time.** No claim is included at or after the deadline; no timeout
-  before it; a sender cannot create an already-expired escrow.
+- **Time.** No claim is included at or after the deadline; a sender cannot create an already-expired escrow.
 - **No value from padding.** Dummy inputs and outputs cannot mint or hide
   value.
 - **Replay.** A transaction valid on one chain or version is invalid on
@@ -343,6 +373,14 @@ and reward payout; network-layer privacy of submission and queries.
 9. How exactly should a restored wallet derive the key for its own
    recovery copy, and should `seed` be random or derived from the sender's
    keys?
+10. Changing the base fee `F` (I8). An open escrow holds a reserve equal
+    to the `F` of its day and its resolution must pay exactly `F`. If `F`
+    changes, old escrows either cannot resolve or resolve at a visibly
+    different fee, which marks them. Options: `F` is fixed for the life of
+    a rules version; a change takes effect only for new escrows while old
+    ones resolve under a rule that hides the difference; or the reserve is
+    over-funded and the excess retired. Until this is settled, `F` cannot
+    be changed on a network with open escrows.
 
 ## 8. How this differs from the alternative protocol
 

@@ -1,6 +1,6 @@
 //! # A reference model of the shielded-money rules — for review, not use
 //!
-//! **This is a model of the rules in `docs/shielded-spec-v0.md` (v0.4), not
+//! **This is a model of the rules in `docs/shielded-spec-v0.md` (v0.5), not
 //! a private or secure implementation.** There are no zero-knowledge
 //! proofs, no circuits and no encryption of notes. The chain function sees
 //! every hidden value: it checks the witness directly where the real system

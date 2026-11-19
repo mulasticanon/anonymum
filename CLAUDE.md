@@ -49,7 +49,7 @@ Windows machine (see the update below).
 | `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `note` (`seal_note` / `open_note`, Noise N), `wire` framing (`Initiator`, `Responder<T>`; a repeated first frame gets the same reply). | 25 tests, run by CI on Linux and Windows |
 | `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 57 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
-| `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch, `Chain::submit`, a recovering wallet. Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 42 tests (section 5 properties, randomised conservation, 5b acceptance); every rule mutation-checked |
+| `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 45 tests (section 5 properties, randomised conservation, 5b acceptance); every rule mutation-checked |
 | `crates/nym` (`anonymum-nym`) | Binary: Alice (invite), Carol (stranger, reverse rendezvous with a persisted throwaway client and retrying caller), Dave (dropped); subcommands `wallet`/`throwaway`/`seal`/`open`/`talk` for `substrate/scripts/e2e.mjs`. | Manual live runs on Windows, see README |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
@@ -332,13 +332,14 @@ hiding amounts and activity:
 ## Shielded design: current source and owner decisions (2026-11-19)
 
 The current source for the shielded design is
-**`docs/shielded-spec-v0.md` (version 0.4)**. Where
+**`docs/shielded-spec-v0.md` (version 0.5)**. Where
 `docs/Shielded_Payments_Protocol_v0.1.md` (the alternative protocol, kept
 for reference) differs from it, the spec wins. The research report gives
 background; section 15.1 gate 1 is what the spec's decisions answer.
 `crates/shielded-model` is a plain-Rust reference model of the spec's rules
-(no proofs, not private or secure; 42 tests). Spec problems found while
-building it are in `docs/shielded-spec-v0-issues.md` (I1-I12), for the
+(no proofs, not private or secure; 45 tests). Spec problems found while
+building it are in `docs/shielded-spec-v0-issues.md`: I1-I12 from v0.4,
+all resolved in v0.5 except I8 (open); I13-I14 new in v0.5, for the
 owner and the cryptographer.
 
 Owner decisions recorded in the spec (section 1):

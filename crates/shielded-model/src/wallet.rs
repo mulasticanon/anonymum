@@ -4,8 +4,12 @@
 //! escrow"). Enough to run the section 5b acceptance test in the model.
 //!
 //! The copy is sealed with ChaCha20-Poly1305 (the `chacha20poly1305`
-//! crate). Key and nonce derivation here are model choices, not a reviewed
-//! design: how a restored wallet derives this key is open (spec question 9).
+//! crate) and stored together with its fresh random nonce, so a restored
+//! wallet makes exactly one decryption attempt per payload slot (spec v0.5,
+//! I11). How the key is derived is a model choice, not a reviewed design
+//! (spec question 9).
+
+use std::collections::HashSet;
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -14,8 +18,13 @@ use crate::chain::{Chain, PAYLOAD_LEN};
 use crate::hash::{h, Hash};
 use crate::objects::*;
 
+const NONCE_BYTES: usize = 12;
 const ESCROW_BYTES: usize = 8 + 8 + 32 * 5;
-const _: () = assert!(ESCROW_BYTES + 16 == PAYLOAD_LEN, "a sealed escrow copy fills one payload slot");
+const TAG_BYTES: usize = 16;
+const _: () = assert!(
+    NONCE_BYTES + ESCROW_BYTES + TAG_BYTES == PAYLOAD_LEN,
+    "a recovery copy (nonce + sealed escrow) fills one payload slot"
+);
 
 /// How far a restore searches for refund identities.
 pub const REFUND_SEARCH: u64 = 1_000;
@@ -47,51 +56,43 @@ impl Wallet {
         ChaCha20Poly1305::new(Key::from_slice(&key))
     }
 
-    fn nonce(escrow_commitment: &Commitment) -> [u8; 12] {
-        let full = h("wallet/recovery-nonce", &[&escrow_commitment.0]);
-        full[..12].try_into().expect("12 bytes")
-    }
-
-    /// The recovery copy to put in one payload slot of the opening.
-    pub fn seal_recovery(&self, escrow: &EscrowNote) -> Vec<u8> {
+    /// The recovery copy to put in one payload slot of the opening:
+    /// `nonce || ciphertext`. The nonce must be fresh and random; the model
+    /// has no randomness of its own, so the caller supplies it.
+    pub fn seal_recovery(&self, escrow: &EscrowNote, nonce: [u8; NONCE_BYTES]) -> Vec<u8> {
         let mut plain = Vec::with_capacity(ESCROW_BYTES);
         plain.extend_from_slice(&escrow.price.to_le_bytes());
         plain.extend_from_slice(&escrow.fee_reserve.to_le_bytes());
         for part in [&escrow.recipient.0, &escrow.refund_to.0, &escrow.canceller.0, &escrow.seed, &escrow.blinding] {
             plain.extend_from_slice(part);
         }
-        let commitment = Note::Escrow(*escrow).commitment();
-        // The nonce is derived from the escrow commitment, so it is the same
-        // for the same escrow and can be recomputed after decryption.
-        self.recovery_cipher()
-            .encrypt(Nonce::from_slice(&Self::nonce(&commitment)), plain.as_slice())
-            .expect("encryption of a fixed-size buffer")
+        let sealed = self
+            .recovery_cipher()
+            .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
+            .expect("encryption of a fixed-size buffer");
+        [nonce.as_slice(), &sealed].concat()
     }
 
-    /// Try to open one payload slot as one of this wallet's recovery copies.
-    /// The nonce depends on the escrow it encrypts, so try it against the
-    /// commitments the chain holds.
-    pub fn open_recovery(&self, slot: &[u8], chain: &Chain) -> Option<EscrowNote> {
+    /// One decryption attempt: is this payload slot one of this wallet's
+    /// recovery copies?
+    pub fn open_recovery(&self, slot: &[u8]) -> Option<EscrowNote> {
         if slot.len() != PAYLOAD_LEN {
             return None;
         }
-        let cipher = self.recovery_cipher();
-        chain.leaves().iter().find_map(|leaf| {
-            let plain = cipher.decrypt(Nonce::from_slice(&Self::nonce(&leaf.commitment)), slot).ok()?;
-            let escrow = decode_escrow(&plain)?;
-            (Note::Escrow(escrow).commitment() == leaf.commitment).then_some(escrow)
-        })
+        let (nonce, sealed) = slot.split_at(NONCE_BYTES);
+        let plain = self.recovery_cipher().decrypt(Nonce::from_slice(nonce), sealed).ok()?;
+        decode_escrow(&plain)
     }
 
-    /// Every escrow this wallet opened, recovered from the chain alone.
+    /// Every escrow this wallet opened that the chain holds, recovered from
+    /// the chain alone: one decryption attempt per payload slot.
     pub fn recover_escrows(&self, chain: &Chain) -> Vec<EscrowNote> {
+        let on_chain: HashSet<Commitment> = chain.leaves().iter().map(|l| l.commitment).collect();
         let mut found = Vec::new();
-        for tx in chain.log() {
-            for slot in &tx.payloads {
-                if let Some(escrow) = self.open_recovery(slot, chain) {
-                    if !found.contains(&escrow) {
-                        found.push(escrow);
-                    }
+        for slot in chain.log().iter().flat_map(|tx| tx.payloads.iter()) {
+            if let Some(escrow) = self.open_recovery(slot) {
+                if on_chain.contains(&Note::Escrow(escrow).commitment()) && !found.contains(&escrow) {
+                    found.push(escrow);
                 }
             }
         }
@@ -102,6 +103,18 @@ impl Wallet {
     pub fn refund_secret_for(&self, authority: &Authority) -> Option<Secret> {
         (0..REFUND_SEARCH).map(|i| self.refund_secret(i)).find(|s| s.authority() == *authority)
     }
+}
+
+/// The refunds that exist on chain for `escrow`, one per position the
+/// escrow was inserted at: `(refund note, refund position, created_at)`.
+pub fn find_refunds(chain: &Chain, escrow: &EscrowNote) -> Vec<(Note, u64, Time)> {
+    find_note(chain, &Note::Escrow(*escrow))
+        .into_iter()
+        .flat_map(|(escrow_position, _)| {
+            let refund = derived_refund(escrow, escrow_position);
+            find_note(chain, &refund).into_iter().map(move |(pos, at)| (refund, pos, at))
+        })
+        .collect()
 }
 
 fn decode_escrow(plain: &[u8]) -> Option<EscrowNote> {

@@ -3,8 +3,8 @@
 
 use crate::hash::{h, Hash};
 
-/// Amounts are unsigned integers in base units. The spec does not fix a
-/// range (issue I4); the model uses `u64` per note and checks every sum.
+/// Amounts are unsigned 64-bit integers in base units; sums are checked
+/// (spec v0.5, I4).
 pub type Value = u64;
 
 /// Seconds since the chain's epoch.
@@ -44,10 +44,10 @@ pub struct EscrowNote {
     pub recipient: Authority,
     /// Owner of the refund note.
     pub refund_to: Authority,
-    /// May cancel early or time out.
+    /// May take the sender refund, at any time.
     pub canceller: Authority,
-    /// Shared by both parties; the escrow's one nullifier and the refund
-    /// note's blinding are derived from it.
+    /// Shared by both parties; the escrow's one nullifier and (with its
+    /// position) the refund note's blinding are derived from it.
     pub seed: Hash,
     pub blinding: Hash,
 }
@@ -109,9 +109,8 @@ pub fn escrow_nullifier(seed: &Hash, commitment: &Commitment, position: u64) -> 
     Nullifier(h("nullifier/escrow", &[seed, &commitment.0, &position.to_le_bytes()]))
 }
 
-/// An ordinary note's nullifier. The spec does not say how it is derived
-/// (issue I3); the model uses the owner's secret, so only the owner can
-/// compute it, plus the commitment and position.
+/// An ordinary note's nullifier: from a secret only the owner holds (here,
+/// the owner's secret), the commitment and the position (spec v0.5, I3).
 pub fn ordinary_nullifier(owner: &Secret, commitment: &Commitment, position: u64) -> Nullifier {
     Nullifier(h("nullifier/ordinary", &[&owner.0, &commitment.0, &position.to_le_bytes()]))
 }
@@ -128,19 +127,22 @@ pub fn penalty(price: Value) -> Value {
     price / 100 + u64::from(price % 100 != 0)
 }
 
-/// The refund blinding, derived from the escrow seed.
-pub fn refund_blinding(seed: &Hash) -> Hash {
-    h("refund-blinding", &[seed])
+/// The refund blinding, derived from the escrow seed and the escrow's tree
+/// position, so two escrows that share a seed still get different refunds
+/// (spec v0.5, I9).
+pub fn refund_blinding(seed: &Hash, escrow_position: u64) -> Hash {
+    h("refund-blinding", &[seed, &escrow_position.to_le_bytes()])
 }
 
-/// The one refund note a Decline, Cancel or Timeout may create. Fully
-/// determined by the escrow, so the sender can find it without receiving
-/// anything from whoever resolved the escrow.
-pub fn derived_refund(escrow: &EscrowNote) -> Note {
+/// The one refund note a Decline or Sender refund may create for the escrow
+/// at `escrow_position`. Fully determined by the escrow and its position,
+/// so the sender can find it without receiving anything from whoever
+/// resolved the escrow.
+pub fn derived_refund(escrow: &EscrowNote, escrow_position: u64) -> Note {
     Note::Ordinary {
         value: escrow.price - penalty(escrow.price),
         owner: escrow.refund_to,
-        blinding: refund_blinding(&escrow.seed),
+        blinding: refund_blinding(&escrow.seed, escrow_position),
     }
 }
 

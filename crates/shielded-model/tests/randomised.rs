@@ -8,6 +8,7 @@ mod common;
 use std::collections::HashMap;
 
 use anonymum_shielded_model::build::{rebind, reseal, TxBuilder};
+use anonymum_shielded_model::chain::PAYLOAD_LEN;
 use anonymum_shielded_model::*;
 use common::*;
 
@@ -166,18 +167,18 @@ impl Sim {
                 let i = self.rng.below(self.pending.len() as u64) as usize;
                 let Pending { escrow, pos } = self.pending[i];
                 // Pick a branch the rules allow at this time: claims only in a
-                // window that ends by the deadline, timeouts only in one that
-                // starts at or after it.
+                // window that ends by the deadline; refunds at any time.
                 let deadline = self.w.created_at(pos) + DAY;
                 let window_start = self.w.time - self.w.time % HOUR;
                 let expired = window_start >= deadline;
-                let branch = match self.rng.below(4) {
-                    _ if expired && self.rng.below(2) == 0 => Branch::Timeout,
+                let branch = match self.rng.below(3) {
+                    // Expired escrows are rare (most resolve early), so favour
+                    // the sender refund once one has expired.
+                    0 if expired => Branch::Decline,
+                    _ if expired => Branch::SenderRefund,
                     0 if window_start + HOUR <= deadline => Branch::Claim,
                     0 | 1 => Branch::Decline,
-                    2 => Branch::Cancel,
-                    _ if expired => Branch::Timeout,
-                    _ => Branch::Cancel,
+                    _ => Branch::SenderRefund,
                 };
                 let recipient = self.keys[&escrow.recipient.0];
                 let canceller = self.keys[&escrow.canceller.0];
@@ -189,8 +190,8 @@ impl Sim {
                 let name = match branch {
                     Branch::Claim => "claim",
                     Branch::Decline => "decline",
-                    Branch::Cancel => "cancel",
-                    _ => "timeout",
+                    _ if expired => "sender refund after deadline",
+                    _ => "sender refund before deadline",
                 };
                 Some((name, p, w, Some(i)))
             }
@@ -201,7 +202,7 @@ impl Sim {
     fn corrupt(&mut self, public: &PublicTx, witness: &Witness) -> (PublicTx, Witness) {
         let (mut p, mut w) = (public.clone(), *witness);
         match self.rng.below(6) {
-            0 => p.payloads[self.rng.below(3) as usize][self.rng.below(192) as usize] ^= 0x40, // relay tampering
+            0 => p.payloads[self.rng.below(3) as usize][self.rng.below(PAYLOAD_LEN as u64) as usize] ^= 0x40, // relay tampering
             1 => {
                 p.nullifiers[self.rng.below(2) as usize] = Nullifier(blinding(&format!("junk{}", self.counter)));
                 rebind(&p, &mut w);
@@ -275,7 +276,7 @@ fn long_random_histories_conserve_value_after_every_transaction() {
         rejected += sim.rejected_as_predicted;
     }
     // Every branch must actually have been exercised.
-    for branch in ["transfer", "invited", "open", "claim", "decline", "cancel", "timeout"] {
+    for branch in ["transfer", "invited", "open", "claim", "decline", "sender refund before deadline", "sender refund after deadline"] {
         assert!(totals.get(branch).copied().unwrap_or(0) > 20, "too few {branch}: {totals:?}");
     }
     assert!(rejected > 100, "too few corrupted transactions tried: {rejected}");

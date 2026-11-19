@@ -6,7 +6,7 @@
 mod common;
 
 use anonymum_shielded_model::build::{rebind, reseal, TxBuilder};
-use anonymum_shielded_model::wallet::find_note;
+use anonymum_shielded_model::wallet::find_refunds;
 use anonymum_shielded_model::*;
 use common::*;
 
@@ -34,16 +34,14 @@ fn every_branch_conserves_value() {
 }
 
 #[test]
-fn decline_cancel_and_timeout_each_conserve_value() {
+fn decline_and_sender_refund_each_conserve_value() {
     let p = parties();
-    for branch in [Branch::Decline, Branch::Cancel, Branch::Timeout] {
+    for (branch, wait) in [(Branch::Decline, 0), (Branch::SenderRefund, 0), (Branch::SenderRefund, DAY)] {
         let (mut w, escrow, pos) = world_with_escrow(101);
-        if branch == Branch::Timeout {
-            w.advance(DAY);
-        }
+        w.advance(wait);
         let who = if branch == Branch::Decline { p.recipient } else { p.canceller };
         let (public, witness) = refund_tx(&w, branch, &escrow, pos, who, "r");
-        w.submit(&public, &witness).unwrap_or_else(|e| panic!("{branch:?}: {e:?}"));
+        w.submit(&public, &witness).unwrap_or_else(|e| panic!("{branch:?} after {wait}s: {e:?}"));
         assert!(w.conserved());
     }
 }
@@ -73,11 +71,13 @@ fn an_invited_request_pays_only_the_base_fee_and_opens_as_invited() {
 #[test]
 fn an_escrow_resolves_once_whichever_branches_are_tried() {
     let p = parties();
-    let attempts: [(Branch, Branch); 5] = [
+    let attempts: [(Branch, Branch); 7] = [
         (Branch::Claim, Branch::Decline),
         (Branch::Decline, Branch::Claim),
-        (Branch::Cancel, Branch::Claim),
-        (Branch::Decline, Branch::Cancel),
+        (Branch::SenderRefund, Branch::Claim),
+        (Branch::Claim, Branch::SenderRefund),
+        (Branch::Decline, Branch::SenderRefund),
+        (Branch::SenderRefund, Branch::Decline),
         (Branch::Claim, Branch::Claim),
     ];
     for (first, second) in attempts {
@@ -95,13 +95,13 @@ fn an_escrow_resolves_once_whichever_branches_are_tried() {
 }
 
 #[test]
-fn a_timeout_after_a_cancel_is_rejected() {
+fn an_early_sender_refund_cannot_be_repeated_after_the_deadline() {
     let p = parties();
     let (mut w, escrow, pos) = world_with_escrow(101);
-    let (public, witness) = refund_tx(&w, Branch::Cancel, &escrow, pos, p.canceller, "c");
+    let (public, witness) = refund_tx(&w, Branch::SenderRefund, &escrow, pos, p.canceller, "early");
     w.submit(&public, &witness).unwrap();
     w.advance(DAY);
-    let (public, witness) = refund_tx(&w, Branch::Timeout, &escrow, pos, p.canceller, "t");
+    let (public, witness) = refund_tx(&w, Branch::SenderRefund, &escrow, pos, p.canceller, "late");
     assert_eq!(w.submit(&public, &witness), Err(Reject::NullifierUsed));
 }
 
@@ -111,9 +111,9 @@ fn the_escrow_nullifier_is_the_same_on_every_branch() {
     let (w, escrow, pos) = world_with_escrow(101);
     let claim = claim_tx(&w, &escrow, pos, p.recipient, "a").0.nullifiers[0];
     let decline = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "b").0.nullifiers[0];
-    let cancel = refund_tx(&w, Branch::Cancel, &escrow, pos, p.canceller, "c").0.nullifiers[0];
+    let refund = refund_tx(&w, Branch::SenderRefund, &escrow, pos, p.canceller, "c").0.nullifiers[0];
     assert_eq!(claim, decline);
-    assert_eq!(claim, cancel);
+    assert_eq!(claim, refund);
 }
 
 #[test]
@@ -141,6 +141,51 @@ fn two_identical_commitments_at_different_positions_resolve_separately() {
     assert!(w.conserved());
 }
 
+#[test]
+fn two_escrows_with_the_same_seed_give_different_refunds() {
+    // v0.5, I9: the refund blinding comes from the seed and the escrow's
+    // position, so sharing a seed no longer makes two refunds identical.
+    let p = parties();
+    for twins in [false, true] {
+        let mut w = World::new(&[ordinary(10_000, &p.sender, "f1"), ordinary(10_000, &p.sender, "f2")]);
+        let first = escrow_note(101, &p, "shared");
+        // Same seed; either an exact twin, or a different escrow (blinding).
+        let second = if twins { first } else { EscrowNote { blinding: blinding("other"), ..first } };
+        assert_eq!(first.seed, second.seed);
+        let (public, witness) = open_tx(&w, 0, &first, "o1");
+        w.submit(&public, &witness).unwrap();
+        let pos1 = w.chain.leaves().iter().position(|l| l.commitment == Note::Escrow(first).commitment()).unwrap() as u64;
+        let (public, witness) = open_tx(&w, 1, &second, "o2");
+        w.submit(&public, &witness).unwrap();
+        let pos2 = w.position_of(&Note::Escrow(second));
+        assert_ne!(pos1, pos2);
+
+        let (public, witness) = refund_tx(&w, Branch::Decline, &first, pos1, p.recipient, "d1");
+        w.submit(&public, &witness).unwrap();
+        let (public, witness) = refund_tx(&w, Branch::Decline, &second, pos2, p.recipient, "d2");
+        w.submit(&public, &witness).unwrap();
+        let (r1, r2) = (derived_refund(&first, pos1), derived_refund(&second, pos2));
+        assert_ne!(r1.commitment(), r2.commitment(), "twins={twins}: refunds must differ");
+
+        // The sender finds each refund exactly once and can spend both.
+        for (escrow, tag) in [(first, "s1"), (second, "s2")] {
+            let refunds = find_refunds(&w.chain, &escrow);
+            let expected = if twins { 2 } else { 1 }; // a twin's commitment sits at both positions
+            assert_eq!(refunds.len(), expected, "twins={twins}");
+            if !twins || tag == "s1" {
+                for (i, (refund, rpos, at)) in refunds.into_iter().enumerate() {
+                    let (public, witness) = TxBuilder::new(Branch::Transfer, format!("{tag}{i}").as_bytes())
+                        .spend(refund, at, rpos, p.refund)
+                        .output(ordinary(99 - F, &p.sender, &format!("{tag}{i}/home")))
+                        .build(&w.chain, w.time);
+                    w.submit(&public, &witness).unwrap();
+                }
+            }
+        }
+        assert!(w.conserved());
+    }
+}
+
 // ---- right party, right destination -----------------------------------------
 
 #[test]
@@ -151,15 +196,12 @@ fn every_branch_rejects_the_wrong_authority() {
         (Branch::Claim, p.canceller),
         (Branch::Claim, stranger),
         (Branch::Decline, p.canceller),
-        (Branch::Cancel, p.recipient),
-        (Branch::Timeout, p.recipient),
-        (Branch::Timeout, stranger),
+        (Branch::Decline, stranger),
+        (Branch::SenderRefund, p.recipient),
+        (Branch::SenderRefund, stranger),
     ];
     for (branch, who) in cases {
         let (mut w, escrow, pos) = world_with_escrow(101);
-        if branch == Branch::Timeout {
-            w.advance(DAY);
-        }
         let (public, witness) = match branch {
             Branch::Claim => claim_tx(&w, &escrow, pos, who, "x"),
             _ => refund_tx(&w, branch, &escrow, pos, who, "x"),
@@ -204,11 +246,14 @@ fn a_claim_can_only_pay_the_recipient_the_price() {
 fn a_refund_that_differs_from_the_derived_one_is_rejected() {
     let p = parties();
     let thief = secret("thief");
-    let derived = derived_refund(&escrow_note(101, &p, "escrow"));
+    let (_, escrow, escrow_pos) = world_with_escrow(101);
+    let derived = derived_refund(&escrow, escrow_pos);
     let Note::Ordinary { value, owner, blinding: b } = derived else { unreachable!() };
     let altered = [
         ("owner", Note::Ordinary { value, owner: thief.authority(), blinding: b }),
         ("blinding", Note::Ordinary { value, owner, blinding: blinding("unfindable") }),
+        // v0.4's derivation (seed only) and another position's: both wrong now.
+        ("blinding from another position", Note::Ordinary { value, owner, blinding: refund_blinding(&escrow.seed, escrow_pos + 1) }),
     ];
     for (what, bad) in altered {
         let (mut w, escrow, pos) = world_with_escrow(101);
@@ -243,7 +288,7 @@ fn penalty_is_one_percent_rounded_up_without_overflow() {
 fn a_penalty_that_is_too_small_is_rejected() {
     let p = parties();
     let (mut w, escrow, pos) = world_with_escrow(101);
-    let (mut public, mut witness) = refund_tx(&w, Branch::Cancel, &escrow, pos, p.canceller, "c");
+    let (mut public, mut witness) = refund_tx(&w, Branch::SenderRefund, &escrow, pos, p.canceller, "c");
     // Retire 1 instead of 2 and keep the extra unit as a third output.
     witness.outputs[1] = OutputWitness::Real(Note::Retired { value: 1, blinding: blinding("p") });
     witness.outputs[2] = OutputWitness::Real(Note::Retired { value: 1, blinding: blinding("q") });
@@ -272,7 +317,7 @@ fn the_right_penalty_with_the_wrong_value_is_rejected() {
     let (mut public, mut witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
     // Refund 98 instead of 99 is caught as not derived, before the penalty.
     witness.outputs[1] = OutputWitness::Real(Note::Retired { value: 3, blinding: blinding("p") });
-    witness.outputs[0] = OutputWitness::Real(Note::Ordinary { value: 98, owner: escrow.refund_to, blinding: refund_blinding(&escrow.seed) });
+    witness.outputs[0] = OutputWitness::Real(Note::Ordinary { value: 98, owner: escrow.refund_to, blinding: refund_blinding(&escrow.seed, pos) });
     reseal(&mut public, &mut witness);
     assert_eq!(w.submit(&public, &witness), Err(Reject::RefundNotDerived));
 }
@@ -385,7 +430,7 @@ fn knowing_the_seed_gives_the_recipient_no_authority_over_the_refund() {
     let (mut w, escrow, pos) = world_with_escrow(101);
     let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
     w.submit(&public, &witness).unwrap();
-    let refund = derived_refund(&escrow);
+    let refund = derived_refund(&escrow, pos);
     let rpos = w.position_of(&refund);
     // The recipient can compute the refund commitment (they know the seed)...
     assert_eq!(w.chain.leaves()[rpos as usize].commitment, refund.commitment());
@@ -419,10 +464,10 @@ fn after_a_decline_the_sender_finds_and_spends_the_refund_from_what_they_held_at
     let held_at_opening = escrow; // the sender's own copy
     let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
     w.submit(&public, &witness).unwrap();
-    let refund = derived_refund(&held_at_opening);
-    let places = find_note(&w.chain, &refund);
-    assert_eq!(places.len(), 1);
-    let (rpos, created_at) = places[0];
+    // The sender locates their escrow on chain, then its derived refund.
+    let refunds = find_refunds(&w.chain, &held_at_opening);
+    assert_eq!(refunds.len(), 1);
+    let (refund, rpos, created_at) = refunds[0];
     let (public, witness) = TxBuilder::new(Branch::Transfer, b"spend")
         .spend(refund, created_at, rpos, p.refund)
         .output(ordinary(250 - penalty(250) - F, &p.sender, "home"))
@@ -443,9 +488,10 @@ fn commitments_depend_on_a_secret_blinding_even_for_retired_and_zero_value_notes
     // Guessing with every public value but no blinding does not work.
     let zeros = Note::Retired { value: S, blinding: [0; 32] };
     assert_ne!(zeros.commitment(), a.commitment());
-    // The derived refund's blinding comes from the secret seed, not a public value.
+    // The derived refund's blinding comes from the secret seed (with the
+    // escrow's public position), not from public values alone.
     let escrow = escrow_note(101, &parties(), "e");
-    assert_ne!(refund_blinding(&escrow.seed), refund_blinding(&[0; 32]));
+    assert_ne!(refund_blinding(&escrow.seed, 2), refund_blinding(&[0; 32], 2));
 }
 
 #[test]
@@ -594,33 +640,42 @@ fn no_claim_at_or_after_the_deadline() {
 }
 
 #[test]
-fn no_timeout_before_the_deadline_and_one_at_it() {
+fn the_sender_refund_is_valid_at_any_time() {
+    // v0.5 merged Cancel and Timeout (I2): one sender refund with no time
+    // condition, before the deadline, at it, and long after.
+    let p = parties();
+    for offset in [0, DAY - 1, DAY, 7 * DAY] {
+        let (mut w, escrow, pos) = world_with_escrow(101);
+        w.time = w.created_at(pos) + offset;
+        let (public, witness) = refund_tx(&w, Branch::SenderRefund, &escrow, pos, p.canceller, "r");
+        w.submit(&public, &witness).unwrap_or_else(|e| panic!("created_at + {offset}s: {e:?}"));
+    }
+}
+
+#[test]
+fn after_the_deadline_only_a_refund_is_possible() {
     let p = parties();
     let (mut w, escrow, pos) = world_with_escrow(101);
-    let deadline = w.created_at(pos) + DAY;
-    for t in [w.time, deadline - HOUR, deadline - 1] {
-        w.time = t;
-        let (public, witness) = refund_tx(&w, Branch::Timeout, &escrow, pos, p.canceller, "t");
-        assert_eq!(w.submit(&public, &witness), Err(Reject::TimeoutTooEarly), "at {t}");
-    }
-    w.time = deadline;
-    let (public, witness) = refund_tx(&w, Branch::Timeout, &escrow, pos, p.canceller, "t");
+    w.time = w.created_at(pos) + DAY;
+    let (public, witness) = claim_tx(&w, &escrow, pos, p.recipient, "c");
+    assert_eq!(w.submit(&public, &witness), Err(Reject::ClaimTooLate));
+    let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
     w.submit(&public, &witness).unwrap();
 }
 
 #[test]
-fn a_creation_time_off_the_grid_or_earlier_than_stamped_is_rejected() {
+fn a_creation_time_off_the_grid_or_other_than_stamped_is_rejected() {
     let p = parties();
     let (mut w, escrow, pos) = world_with_escrow(101);
     let stamped = w.created_at(pos);
     assert_eq!(stamped % HOUR, 0, "the chain stamps created_at on the grid");
-    for claimed in [stamped - HOUR, stamped + 6, stamped - 1] {
-        // Claiming an earlier or off-grid creation time to move the deadline.
+    for claimed in [stamped + HOUR, stamped + 6, stamped - 1] {
+        // Claiming a later or off-grid creation time to push the claim
+        // deadline back, after the real one has passed.
         w.time = stamped + DAY + 10;
-        let (public, witness) = TxBuilder::new(Branch::Timeout, b"t")
-            .spend(Note::Escrow(escrow), claimed, pos, p.canceller)
-            .output(derived_refund(&escrow))
-            .output(Note::Retired { value: penalty(101), blinding: blinding("p") })
+        let (public, witness) = TxBuilder::new(Branch::Claim, b"c")
+            .spend(Note::Escrow(escrow), claimed, pos, p.recipient)
+            .output(Note::Ordinary { value: 101, owner: escrow.recipient, blinding: blinding("pay") })
             .build(&w.chain, w.time);
         assert_eq!(w.submit(&public, &witness), Err(Reject::NotInTree), "claimed created_at {claimed}");
     }
@@ -670,7 +725,7 @@ fn a_relay_that_alters_payload_bytes_invalidates_the_transaction() {
     let (mut public, witness) = TxBuilder::new(Branch::Transfer, b"t")
         .spend(w.notes[0], 0, 0, p.sender)
         .output(ordinary(100 - F, &p.sender, "c"))
-        .payload(0, vec![7; 192])
+        .payload(0, vec![7; anonymum_shielded_model::chain::PAYLOAD_LEN])
         .build(&w.chain, w.time);
     public.payloads[0][5] ^= 1;
     assert_eq!(w.submit(&public, &witness), Err(Reject::BindingMismatch));

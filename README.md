@@ -13,7 +13,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
 | `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing. | 25 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 (see below). Not an automated test. |
-| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 42 tests, including adversarial cases and a randomised conservation test |
+| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 45 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
@@ -149,7 +149,7 @@ Differences from the in-process simulation:
 ## Shielded money: specification and reference model
 
 The next privacy stage (roadmap step 5) is specified in
-`docs/shielded-spec-v0.md` (v0.4, the current source; the owner's
+`docs/shielded-spec-v0.md` (v0.5, the current source; the owner's
 decisions O1–O8 are recorded there and in CLAUDE.md).
 `docs/Shielded_Payments_Technical_Research_2026-11-19.md` is the background
 research and `docs/Shielded_Payments_Protocol_v0.1.md` an alternative design
@@ -171,7 +171,9 @@ turn to confirm a test catches it.
     cargo test -p anonymum-shielded-model
 
 Problems found in the spec while building it are listed in
-`docs/shielded-spec-v0-issues.md`.
+`docs/shielded-spec-v0-issues.md`: v0.5 resolved I1–I12 except I8 (changing
+the base fee while escrows are open), and raised two wording issues (I13,
+I14).
 
 ## What is real and what is not
 
