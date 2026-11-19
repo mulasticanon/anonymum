@@ -19,9 +19,9 @@ pub const N_OUT: usize = 3;
 /// Encrypted payload slots per transaction.
 pub const N_PAY: usize = 3;
 /// Bytes per payload slot. A placeholder: the size is open (P10). Sized to
-/// hold the sender's recovery copy: a 12-byte nonce, the 176-byte escrow
-/// and a 16-byte authentication tag.
-pub const PAYLOAD_LEN: usize = 204;
+/// hold the sender's recovery copy: a 12-byte nonce, the 176-byte escrow,
+/// two 24-byte key paths and a 16-byte authentication tag.
+pub const PAYLOAD_LEN: usize = 252;
 /// Request lifetime: claims stop and timeouts start here (O4, O8).
 pub const TTL: Time = 24 * 60 * 60;
 
@@ -226,6 +226,8 @@ pub struct Chain {
     nullifiers: HashSet<Nullifier>,
     /// Every accepted public transaction, in order (what a scanner sees).
     log: Vec<PublicTx>,
+    /// Tree position of each logged transaction's first output.
+    first_output: Vec<u64>,
     issued: u128,
     fees_collected: u128,
     fees_burned: u128,
@@ -245,6 +247,7 @@ impl Chain {
             current_root: empty_root,
             nullifiers: HashSet::new(),
             log: Vec::new(),
+            first_output: Vec::new(),
             issued: 0,
             fees_collected: 0,
             fees_burned: 0,
@@ -268,6 +271,15 @@ impl Chain {
     }
     pub fn log(&self) -> &[PublicTx] {
         &self.log
+    }
+    /// Tree positions of the outputs of the logged transaction `index`.
+    pub fn output_positions(&self, index: usize) -> std::ops::Range<u64> {
+        let first = self.first_output[index];
+        first..first + N_OUT as u64
+    }
+    /// The finalised transaction that published `nullifier`, if any.
+    pub fn transaction_spending(&self, nullifier: &Nullifier) -> Option<usize> {
+        self.log.iter().position(|tx| tx.nullifiers.contains(nullifier))
     }
     pub fn is_spent(&self, nullifier: &Nullifier) -> bool {
         self.nullifiers.contains(nullifier)
@@ -332,6 +344,7 @@ impl Chain {
         self.fees_burned += burned;
         self.node_pool += fee - burned;
         self.log.push(public.clone());
+        self.first_output.push(first_position);
         Ok(Receipt { first_position, created_at })
     }
 

@@ -11,7 +11,7 @@ use std::hash::Hash;
 use anonymum_core::Address;
 
 use crate::identity::Identity;
-use crate::session::{Handshake, Session, SessionError};
+use crate::session::{Handshake, Session, SessionError, MAX_NOISE_MESSAGE};
 
 const HANDSHAKE_1: u8 = 1;
 const HANDSHAKE_2: u8 = 2;
@@ -32,7 +32,12 @@ pub enum WireError {
     /// Data arrived (or was to be sent) without an established session.
     NoSession,
     Busy,
+    /// Longer than any valid frame; refused before anything is allocated.
+    Oversized,
 }
+
+/// The longest valid frame: one type byte and one Noise message.
+pub const MAX_FRAME: usize = 1 + MAX_NOISE_MESSAGE;
 
 impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,6 +61,9 @@ fn frame(kind: u8, body: &[u8]) -> Vec<u8> {
 }
 
 fn split(frame: &[u8]) -> Result<(u8, &[u8]), WireError> {
+    if frame.len() > MAX_FRAME {
+        return Err(WireError::Oversized);
+    }
     frame.split_first().map(|(kind, body)| (*kind, body)).ok_or(WireError::UnknownFrame)
 }
 
@@ -84,10 +92,22 @@ impl Initiator {
     pub fn handle(&mut self, incoming: &[u8]) -> Result<InitiatorEvent, WireError> {
         match split(incoming)? {
             (HANDSHAKE_2, body) => {
-                let handshake = self.pending.take().ok_or(WireError::UnexpectedFrame)?;
-                let (session, message3) = handshake.initiator_finish(body)?;
-                self.session = Some(session);
-                Ok(InitiatorEvent::Established { reply: frame(HANDSHAKE_3, &message3) })
+                let handshake = self.pending.as_mut().ok_or(WireError::UnexpectedFrame)?;
+                match handshake.initiator_finish(body) {
+                    Ok((session, message3)) => {
+                        self.pending = None;
+                        self.session = Some(session);
+                        Ok(InitiatorEvent::Established { reply: frame(HANDSHAKE_3, &message3) })
+                    }
+                    Err(error) => {
+                        // A frame Noise rejected leaves the handshake waiting
+                        // for the real message 2.
+                        if !handshake.is_live() {
+                            self.pending = None;
+                        }
+                        Err(error.into())
+                    }
+                }
             }
             (DATA, body) => {
                 let session = self.session.as_mut().ok_or(WireError::NoSession)?;
@@ -165,8 +185,19 @@ impl<T: Hash + Eq + Clone> Responder<T> {
                 Ok(ResponderEvent::Reply(reply))
             }
             (HANDSHAKE_3, body) => {
-                let pending = self.pending.remove(&from).ok_or(WireError::UnexpectedFrame)?;
-                let session = pending.handshake.responder_finish(body)?;
+                let pending = self.pending.get_mut(&from).ok_or(WireError::UnexpectedFrame)?;
+                let session = match pending.handshake.responder_finish(body) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        // A frame Noise rejected leaves the handshake waiting
+                        // for the real message 3.
+                        if !pending.handshake.is_live() {
+                            self.pending.remove(&from);
+                        }
+                        return Err(error.into());
+                    }
+                };
+                self.pending.remove(&from);
                 let peer = session.peer();
                 self.sessions.insert(from, session);
                 Ok(ResponderEvent::Established { peer })

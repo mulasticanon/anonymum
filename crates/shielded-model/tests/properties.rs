@@ -6,7 +6,7 @@
 mod common;
 
 use anonymum_shielded_model::build::{rebind, reseal, TxBuilder};
-use anonymum_shielded_model::wallet::find_refunds;
+use anonymum_shielded_model::wallet::{escrow_status, EscrowStatus};
 use anonymum_shielded_model::*;
 use common::*;
 
@@ -167,20 +167,17 @@ fn two_escrows_with_the_same_seed_give_different_refunds() {
         let (r1, r2) = (derived_refund(&first, pos1), derived_refund(&second, pos2));
         assert_ne!(r1.commitment(), r2.commitment(), "twins={twins}: refunds must differ");
 
-        // The sender finds each refund exactly once and can spend both.
-        for (escrow, tag) in [(first, "s1"), (second, "s2")] {
-            let refunds = find_refunds(&w.chain, &escrow);
-            let expected = if twins { 2 } else { 1 }; // a twin's commitment sits at both positions
-            assert_eq!(refunds.len(), expected, "twins={twins}");
-            if !twins || tag == "s1" {
-                for (i, (refund, rpos, at)) in refunds.into_iter().enumerate() {
-                    let (public, witness) = TxBuilder::new(Branch::Transfer, format!("{tag}{i}").as_bytes())
-                        .spend(refund, at, rpos, p.refund)
-                        .output(ordinary(99 - F, &p.sender, &format!("{tag}{i}/home")))
-                        .build(&w.chain, w.time);
-                    w.submit(&public, &witness).unwrap();
-                }
-            }
+        // The sender finds each refund through the transaction that consumed
+        // its escrow, and can spend both.
+        for (escrow, escrow_pos, tag) in [(first, pos1, "s1"), (second, pos2, "s2")] {
+            let EscrowStatus::Refunded { refund, position, created_at, .. } = escrow_status(&w.chain, &escrow, escrow_pos) else {
+                panic!("twins={twins}: escrow at {escrow_pos} should be refunded")
+            };
+            let (public, witness) = TxBuilder::new(Branch::Transfer, tag.as_bytes())
+                .spend(refund, created_at, position, p.refund)
+                .output(ordinary(99 - F, &p.sender, &format!("{tag}/home")))
+                .build(&w.chain, w.time);
+            w.submit(&public, &witness).unwrap();
         }
         assert!(w.conserved());
     }
@@ -464,10 +461,11 @@ fn after_a_decline_the_sender_finds_and_spends_the_refund_from_what_they_held_at
     let held_at_opening = escrow; // the sender's own copy
     let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
     w.submit(&public, &witness).unwrap();
-    // The sender locates their escrow on chain, then its derived refund.
-    let refunds = find_refunds(&w.chain, &held_at_opening);
-    assert_eq!(refunds.len(), 1);
-    let (refund, rpos, created_at) = refunds[0];
+    // The sender finds the transaction that consumed their escrow, and the
+    // derived refund among its outputs.
+    let EscrowStatus::Refunded { refund, position: rpos, created_at, .. } = escrow_status(&w.chain, &held_at_opening, pos) else {
+        panic!("expected a refund")
+    };
     let (public, witness) = TxBuilder::new(Branch::Transfer, b"spend")
         .spend(refund, created_at, rpos, p.refund)
         .output(ordinary(250 - penalty(250) - F, &p.sender, "home"))
@@ -803,4 +801,88 @@ fn a_public_commitment_that_does_not_match_the_witness_is_rejected() {
     public.admission = AdmissionRecord::empty(blinding("other")).commitment();
     rebind(&public, &mut witness);
     assert_eq!(w.submit(&public, &witness), Err(Reject::AdmissionMismatch));
+}
+
+// ---- review fixtures: boundary prices and a penalty equal to S --------------
+
+/// An escrow at `price`, funded with enough (two maximal notes for the
+/// largest price), ready to resolve.
+fn escrow_at_price(price: Value) -> (World, EscrowNote, u64) {
+    let p = parties();
+    let big = price > 1_000_000;
+    let mut genesis = if big {
+        vec![ordinary(u64::MAX, &p.sender, "a"), ordinary(u64::MAX, &p.sender, "b")]
+    } else {
+        vec![ordinary(1_000_000, &p.sender, "a")]
+    };
+    genesis.push(ordinary(500, &p.recipient, "r"));
+    let mut w = World::new(&genesis);
+    let escrow = escrow_note(price, &p, &format!("p{price}"));
+    let mut b = TxBuilder::new(Branch::Open, format!("open{price}").as_bytes()).spend(w.notes[0], 0, 0, p.sender);
+    let inputs: u128 = if big { 2 * u128::from(u64::MAX) } else { 1_000_000 };
+    if big {
+        b = b.spend(w.notes[1], 0, 1, p.sender);
+    }
+    let change = inputs - u128::from(price) - 2 * u128::from(F) - u128::from(S);
+    let (public, witness) = b
+        .output(Note::Escrow(escrow))
+        .output(Note::Retired { value: S, blinding: blinding("s") })
+        .output(ordinary(u64::try_from(change).expect("change fits"), &p.sender, "c"))
+        .admission(stranger_record(&escrow, "o"))
+        .build(&w.chain, w.time);
+    w.submit(&public, &witness).unwrap_or_else(|e| panic!("open at {price}: {e:?}"));
+    let pos = w.position_of(&Note::Escrow(escrow));
+    (w, escrow, pos)
+}
+
+#[test]
+fn boundary_prices_resolve_exactly_by_claim_and_by_decline() {
+    let p = parties();
+    let largest = u64::MAX - F; // price + fee_reserve must fit 64 bits
+    let cases = [
+        (0, 0, 0),
+        (1, 0, 1),
+        (99, 98, 1),
+        (100, 99, 1),
+        (largest, largest - (largest / 100 + 1), largest / 100 + 1),
+    ];
+    for (price, refund_value, penalty_value) in cases {
+        assert_eq!(penalty(price), penalty_value, "penalty at {price}");
+        // Decline: exact refund and penalty.
+        let (mut w, escrow, pos) = escrow_at_price(price);
+        let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
+        w.submit(&public, &witness).unwrap_or_else(|e| panic!("decline at {price}: {e:?}"));
+        assert_eq!(derived_refund(&escrow, pos).value(), Some(refund_value), "refund at {price}");
+        assert!(w.conserved());
+        // Claim: the recipient gets the full price.
+        let (mut w, escrow, pos) = escrow_at_price(price);
+        let (public, witness) = claim_tx(&w, &escrow, pos, p.recipient, "c");
+        w.submit(&public, &witness).unwrap_or_else(|e| panic!("claim at {price}: {e:?}"));
+        assert!(w.conserved());
+    }
+}
+
+#[test]
+fn a_decline_retiring_exactly_s_never_yields_a_stranger_receipt() {
+    // At price 5,000 the penalty is 50 = S: the decline retires the same
+    // amount an opening retires as the stranger surcharge.
+    let p = parties();
+    let price = 5_000;
+    assert_eq!(penalty(price), S);
+    let (mut w, escrow, pos) = escrow_at_price(price);
+    let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
+    // Forcing a stranger receipt onto the decline is rejected,
+    for record in [stranger_record(&escrow, "forced"), AdmissionRecord { escrow: None, ..stranger_record(&escrow, "forced2") }] {
+        let (mut bad_public, mut bad_witness) = (public.clone(), witness);
+        bad_witness.admission = record;
+        reseal(&mut bad_public, &mut bad_witness);
+        assert_eq!(w.submit(&bad_public, &bad_witness), Err(Reject::TierMismatch));
+    }
+    // and the honest decline's receipt opens as no request at all.
+    w.submit(&public, &witness).unwrap();
+    let mine = Note::Escrow(escrow).commitment();
+    assert_eq!(
+        open_receipt(&public.admission, &witness.admission, &CONTACT_KEY, &REQUEST, Some(&mine)),
+        Err(ReceiptError::NotARequest)
+    );
 }

@@ -2,7 +2,9 @@
 
 Raised while building `crates/shielded-model` against
 `docs/shielded-spec-v0.md`. I1–I12 were found in v0.4 (2026-11-19); v0.5
-resolves all but I8. I13–I14 are new in v0.5. Each entry says how it stands
+resolves all but I8. I13–I14 were raised by v0.5; v0.6 fixes their wording.
+The design review of 2026-11-19 (`design-review-2026-11-19.md`) adds
+findings H1–H7 and M1–M4, tracked at the end. Each entry says how it stands
 and what the model does.
 
 | # | Issue | Status |
@@ -19,8 +21,8 @@ and what the model does.
 | I10 | Minimum price and parameter values | Resolved in v0.5 (parameter values still placeholders) |
 | I11 | Recovery copy needed a nonce search | Resolved in v0.5 |
 | I12 | Penalty constraint implied by two others | Resolved in v0.5 (check kept) |
-| I13 | "Every note has a fresh secret blinding" vs the derived refund | **New in v0.5, open** |
-| I14 | "Refunded after 24 hours" vs a refund valid at any time | **New in v0.5, open** |
+| I13 | "Every note has a fresh secret blinding" vs the derived refund | Wording fixed in v0.6; **cryptographic question open** (question 8, review H5) |
+| I14 | "Refunded after 24 hours" vs a refund valid at any time | Closed: wording fixed in v0.6 |
 
 ## Resolved in v0.5
 
@@ -78,24 +80,57 @@ anyway. *Model:* kept; disabling it still fails no test, as expected.
 **I8. Changing `F` strands open escrows.** An escrow's reserve equals the
 `F` of its opening and its resolution must pay exactly `F`, so a change of
 `F` leaves old escrows unable to resolve, or marks them by a different fee.
-v0.5 lists options as question 10 for the cryptographer. *Model:* `F` is
-constant; a resolution needs `fee_reserve = F`.
+v0.6 fixes `F` for the prototype (P4) and names the review's candidate (a
+maximum fee `C` locked in each escrow, `C - F` returned privately on every
+outcome), which would amend O7 and needs the owner's decision. Same finding
+as review H1. *Model:* `F` is constant; a resolution needs `fee_reserve = F`.
 
-## New in v0.5
+## Raised by v0.5
 
-**I13. The refund's blinding is not fresh.** Section 3 says every note of
-every type carries "a fresh secret `blinding`". The refund note's blinding
-is derived from `seed` and the escrow's position, so it is neither fresh nor
-secret from the recipient, who knows the seed and can see the position.
-It is still hidden from everyone else, and the recipient's knowledge of the
-refund commitment is already question 8. Suggest section 3 names the refund
-as the one exception and says who can recompute it.
+**I13. The refund's blinding is not fresh.** Section 3 said every note
+carries "a fresh secret `blinding`", but the refund's is derived from `seed`
+and the escrow's position, so both escrow parties can recompute its
+commitment. *Wording fixed in v0.6:* section 3 names the refund as the one
+exception. *Still open:* the cryptographic question of what the recipient
+can learn from it (question 8; review H5 asks for owner-only serials and an
+in-circuit constraint on destination, amount and blinding).
 
-**I14. "Refunded after 24 hours" no longer describes the rule.** O6 and P3
-say a blocked or ignored stranger's escrow "comes back after 24 hours minus
-the penalty". Since v0.5 the sender refund is valid at any time, so the
-sender can take it back earlier, and nothing comes back on its own (P6).
-Suggest wording such as: "the sender can take the refund, minus the
-penalty, at any time; once 24 hours pass the recipient can no longer
-claim, so an ignored request is then always refundable." This is wording
-only; the model already implements the rule as v0.5 states it.
+**I14. "Refunded after 24 hours".** O6 and P3 said an ignored stranger's
+escrow "comes back after 24 hours", although the sender refund is valid at
+any time and nothing comes back on its own. *Closed:* v0.6 rewords O6 and
+P3 ("the sender can take the refund, minus the penalty, at any time; after
+24 hours the recipient can no longer claim, so an ignored request is then
+always refundable").
+
+## Design review findings (2026-11-19)
+
+| # | Finding (short) | Status |
+|---|---|---|
+| H1 | A changed base fee strands old escrows (= I8) | **Open.** `F` fixed for the prototype (v0.6 P4); the max-fee alternative needs the owner's decision |
+| H2 | Restore did not cover the key indices the wallet can use | **Fixed in the model** (and v0.6): the recovery copy records purpose and index for the refund identity and the cancel authority; no search. Tested at `u64::MAX`, sparse indices and 40 escrows |
+| H3 | Noise XX gives a reusable wallet credential to any initiating peer | **Open, needs a design decision** (spec section 2a, question 11). Handshake identity handling deliberately unchanged |
+| H4 | The sealed note's prologue needs the stranger's address before decrypting | **Open, needs a design decision** (spec section 2a, question 12). Sealed-note format deliberately unchanged |
+| H5 | A resolver knows the deterministic refund; spend privacy and recovery need in-circuit guarantees | **Open cryptographic gate.** The model enforces the exact refund fields; it cannot show proof properties |
+| H6 | Wallet-specific fetches, immediate callbacks and a small population can reveal correspondents | **Open deployment gate** |
+| H7 | Circuit completeness, verifier validation, key privacy, setup and mobile proving are unproven | **Open release gate** |
+| M1 | Wallet matched the expected refund commitment anywhere in history | **Fixed in the model** (and v0.6): the wallet finds the finalised transaction that consumed the escrow's nullifier, matches the refund among its outputs only, and reports separately whether it is unspent. Tested with an identical decoy commitment made earlier |
+| M2 | All-zero padding payloads; receipts and invites replayable across devices | **Open.** The model still pads with zeros; receipt and invitation idempotency is not modelled |
+| M3 | Invalid handshake traffic could consume pending state | **Fixed in `anonymum-crypto`** for malformed, tampered, truncated and oversized frames and for a validly encrypted message 2 from an impostor, on both sides (see the note below). Reordered and delayed frames are covered only by the existing repeated-frame tests; the Nym demo's retry loop is unchanged |
+| M4 | A cumulative fee sink double-counts once operator funds are live; deadlines narrow candidates | **Open.** Applies before operator payouts or migrations |
+
+## Found while fixing the review findings
+
+**`snow` restores only part of its state after a failed read.** `snow`
+0.10 checkpoints its hash and chaining key before reading a handshake
+message and restores them on failure, but not its cipher state. A message 3
+that passes its first decryption, re-keys the cipher and then fails on its
+payload leaves the responder unable to read the genuine message 3. (Message
+2 escapes this by accident: its first key step overwrites the cipher key.)
+*Workaround in `anonymum-crypto`:* a handshake keeps a recipe (static key,
+a per-handshake ephemeral key from `snow`'s own generator, the transcript)
+and rebuilds a fresh `snow` state for every read attempt, so a failed
+attempt changes nothing. This uses `snow`'s `#[doc(hidden)]`
+`fixed_ephemeral_key_for_testing_only`, whose warning is against reusing an
+ephemeral key across sessions; here each key serves one handshake only.
+*For the cryptographer:* accept this, or prefer a `snow` change that also
+checkpoints the cipher state (worth reporting upstream either way).

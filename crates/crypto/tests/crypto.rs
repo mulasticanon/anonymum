@@ -3,8 +3,8 @@ use anonymum_core::{Chain, Error, Params, Tx, COIN};
 use anonymum_crypto::{Ed25519Invites, Handshake, Identity, InviteSecret, Session, SessionError};
 
 fn connect(initiator: &Identity, responder: &Identity) -> (Session, Session) {
-    let (hs_i, m1) = Handshake::initiate(initiator, responder.address()).unwrap();
-    let (hs_r, m2) = Handshake::respond(responder, &m1).unwrap();
+    let (mut hs_i, m1) = Handshake::initiate(initiator, responder.address()).unwrap();
+    let (mut hs_r, m2) = Handshake::respond(responder, &m1).unwrap();
     let (session_i, m3) = hs_i.initiator_finish(&m2).unwrap();
     let session_r = hs_r.responder_finish(&m3).unwrap();
     (session_i, session_r)
@@ -91,8 +91,8 @@ fn ciphertext_reveals_nothing_recognisable_and_outsiders_cannot_open_it() {
 #[test]
 fn handshake_does_not_expose_addresses() {
     let (alice, bob) = (Identity::generate(), Identity::generate());
-    let (hs_i, m1) = Handshake::initiate(&alice, bob.address()).unwrap();
-    let (hs_r, m2) = Handshake::respond(&bob, &m1).unwrap();
+    let (mut hs_i, m1) = Handshake::initiate(&alice, bob.address()).unwrap();
+    let (mut hs_r, m2) = Handshake::respond(&bob, &m1).unwrap();
     let (_s, m3) = hs_i.initiator_finish(&m2).unwrap();
     let _ = hs_r.responder_finish(&m3).unwrap();
     for wire in [&m1, &m2, &m3] {
@@ -134,7 +134,7 @@ fn tampered_message_is_rejected_and_does_not_block_the_real_one() {
 fn initiator_refuses_an_impostor_responder() {
     let (alice, bob, mallory) = (Identity::generate(), Identity::generate(), Identity::generate());
     // Alice wants Bob, but Mallory intercepts and answers.
-    let (hs_i, m1) = Handshake::initiate(&alice, bob.address()).unwrap();
+    let (mut hs_i, m1) = Handshake::initiate(&alice, bob.address()).unwrap();
     let (_hs_m, m2) = Handshake::respond(&mallory, &m1).unwrap();
     match hs_i.initiator_finish(&m2) {
         Err(SessionError::UnexpectedPeer { got }) => assert_eq!(got, mallory.address()),

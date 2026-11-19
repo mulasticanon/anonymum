@@ -110,3 +110,112 @@ fn a_fresh_call_from_the_same_caller_replaces_the_old_one() {
     let frame = new_call.seal(b"still fine").unwrap();
     assert!(matches!(carol_side.handle(&carol, 5, &frame), Ok(ResponderEvent::Message { .. })));
 }
+
+// ---- review finding M3: bad frames must not destroy a pending handshake -----
+
+/// Frames that fail validation: garbage, a flipped byte, truncated, empty
+/// body, wrong type byte.
+fn bad_versions(good: &[u8]) -> Vec<Vec<u8>> {
+    let mut flipped = good.to_vec();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0x01;
+    let mut mid = good.to_vec();
+    mid[good.len() / 2] ^= 0x80;
+    vec![
+        vec![good[0]; good.len()],
+        flipped,
+        mid,
+        good[..good.len() - 1].to_vec(),
+        good[..1].to_vec(),
+        [&[good[0]], &[0u8; 40][..]].concat(),
+    ]
+}
+
+#[test]
+fn a_malformed_message_2_does_not_destroy_the_initiators_handshake() {
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let mut bob_side: Responder<u32> = Responder::new();
+    let (mut caller, f1) = Initiator::start(&alice, bob.address()).unwrap();
+    let ResponderEvent::Reply(f2) = bob_side.handle(&bob, 1, &f1).unwrap() else { panic!() };
+    for bad in bad_versions(&f2) {
+        assert!(caller.handle(&bad).is_err(), "a bad message 2 must be rejected");
+    }
+    // The genuine message 2 still completes the handshake.
+    let InitiatorEvent::Established { reply: f3 } = caller.handle(&f2).unwrap() else { panic!() };
+    assert_eq!(bob_side.handle(&bob, 1, &f3).unwrap(), ResponderEvent::Established { peer: alice.address() });
+    let msg = caller.seal(b"still here").unwrap();
+    assert!(matches!(bob_side.handle(&bob, 1, &msg), Ok(ResponderEvent::Message { .. })));
+}
+
+#[test]
+fn a_malformed_message_3_does_not_destroy_the_responders_handshake() {
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let mut bob_side: Responder<u32> = Responder::new();
+    let (mut caller, f1) = Initiator::start(&alice, bob.address()).unwrap();
+    let ResponderEvent::Reply(f2) = bob_side.handle(&bob, 1, &f1).unwrap() else { panic!() };
+    let InitiatorEvent::Established { reply: f3 } = caller.handle(&f2).unwrap() else { panic!() };
+    for bad in bad_versions(&f3) {
+        assert!(bob_side.handle(&bob, 1, &bad).is_err(), "a bad message 3 must be rejected");
+    }
+    assert_eq!(bob_side.handle(&bob, 1, &f3).unwrap(), ResponderEvent::Established { peer: alice.address() });
+}
+
+#[test]
+fn a_malformed_first_frame_does_not_replace_a_pending_handshake() {
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let mut bob_side: Responder<u32> = Responder::new();
+    let (mut caller, f1) = Initiator::start(&alice, bob.address()).unwrap();
+    let ResponderEvent::Reply(f2) = bob_side.handle(&bob, 1, &f1).unwrap() else { panic!() };
+    // Garbage claiming to be a new first frame from the same caller.
+    assert!(bob_side.handle(&bob, 1, &[f1[0], 1, 2, 3]).is_err());
+    let InitiatorEvent::Established { reply: f3 } = caller.handle(&f2).unwrap() else { panic!() };
+    assert_eq!(bob_side.handle(&bob, 1, &f3).unwrap(), ResponderEvent::Established { peer: alice.address() });
+}
+
+#[test]
+fn a_validly_encrypted_message_2_from_an_impostor_does_not_end_the_handshake() {
+    // Mallory answers Alice's first frame with a message 2 that Noise
+    // accepts but that proves Mallory, not Bob. It is rejected, and Bob's
+    // genuine message 2 still completes the handshake.
+    let (alice, bob, mallory) = (Identity::generate(), Identity::generate(), Identity::generate());
+    let (mut caller, f1) = Initiator::start(&alice, bob.address()).unwrap();
+    let mut mallory_side: Responder<u32> = Responder::new();
+    let ResponderEvent::Reply(forged) = mallory_side.handle(&mallory, 1, &f1).unwrap() else { panic!() };
+    assert!(caller.handle(&forged).is_err(), "Mallory is not Bob");
+    let mut bob_side: Responder<u32> = Responder::new();
+    let ResponderEvent::Reply(f2) = bob_side.handle(&bob, 1, &f1).unwrap() else { panic!() };
+    let InitiatorEvent::Established { reply: f3 } = caller.handle(&f2).unwrap() else { panic!() };
+    assert_eq!(bob_side.handle(&bob, 1, &f3).unwrap(), ResponderEvent::Established { peer: alice.address() });
+}
+
+#[test]
+fn a_finished_handshake_takes_no_more_handshake_frames() {
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let mut bob_side: Responder<u32> = Responder::new();
+    let (mut caller, f1) = Initiator::start(&alice, bob.address()).unwrap();
+    let ResponderEvent::Reply(f2) = bob_side.handle(&bob, 1, &f1).unwrap() else { panic!() };
+    caller.handle(&f2).unwrap();
+    assert!(matches!(caller.handle(&f2), Err(WireError::UnexpectedFrame)), "message 2 replayed after finishing");
+}
+
+// ---- oversized frames are refused before anything is allocated --------------
+
+#[test]
+fn oversized_frames_are_refused_on_both_sides_and_in_a_session() {
+    use anonymum_crypto::wire::MAX_FRAME;
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let huge = vec![1u8; MAX_FRAME + 1];
+    let mut bob_side: Responder<u32> = Responder::new();
+    assert!(matches!(bob_side.handle(&bob, 1, &huge), Err(WireError::Oversized)));
+    let (mut caller, f1) = Initiator::start(&alice, bob.address()).unwrap();
+    assert!(matches!(caller.handle(&[&[2u8], &huge[1..]].concat()), Err(WireError::Oversized)));
+    // The pending handshakes survive and complete.
+    let ResponderEvent::Reply(f2) = bob_side.handle(&bob, 1, &f1).unwrap() else { panic!() };
+    let InitiatorEvent::Established { reply: f3 } = caller.handle(&f2).unwrap() else { panic!() };
+    bob_side.handle(&bob, 1, &f3).unwrap();
+    // Established sessions refuse oversized data frames too.
+    assert!(matches!(bob_side.handle(&bob, 1, &[&[4u8], &huge[1..]].concat()), Err(WireError::Oversized)));
+    // The largest valid frame size is not refused as oversized.
+    let at_limit = [&[4u8], &vec![0u8; MAX_FRAME - 1][..]].concat();
+    assert!(!matches!(bob_side.handle(&bob, 1, &at_limit), Err(WireError::Oversized)));
+}
