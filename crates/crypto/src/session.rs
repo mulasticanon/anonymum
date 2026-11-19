@@ -28,7 +28,15 @@ const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const PROLOGUE: &[u8] = b"anonymum/session/v1";
 const CREDENTIALS_LEN: usize = 32 + 64;
 const TAG_LEN: usize = 16;
-const NONCE_LEN: usize = 8;
+pub(crate) const NONCE_LEN: usize = 8;
+const KEY_LEN: usize = 32;
+/// Exact lengths of the three XX messages with our payloads: `e`;
+/// `e, ee, s, es` + credentials; `s, se` + credentials.
+pub(crate) const MESSAGE1_LEN: usize = KEY_LEN;
+pub(crate) const MESSAGE2_LEN: usize = KEY_LEN + (KEY_LEN + TAG_LEN) + (CREDENTIALS_LEN + TAG_LEN);
+pub(crate) const MESSAGE3_LEN: usize = (KEY_LEN + TAG_LEN) + (CREDENTIALS_LEN + TAG_LEN);
+/// Smallest sealed transport message: nonce and tag around nothing.
+pub(crate) const MIN_SEALED: usize = NONCE_LEN + TAG_LEN;
 /// Largest Noise message (Noise's own limit). Larger input is refused before
 /// any buffer is allocated for it.
 pub(crate) const MAX_NOISE_MESSAGE: usize = 65_535;
@@ -50,8 +58,6 @@ pub enum SessionError {
     Malformed,
     /// This message was already received, or is too old to check.
     Replay,
-    /// The handshake already finished; start a fresh one.
-    HandshakeOver,
 }
 
 impl fmt::Display for SessionError {
@@ -70,154 +76,80 @@ impl From<snow::Error> for SessionError {
 
 /// A handshake in progress.
 ///
-/// **A frame that fails validation never destroys the pending handshake**
-/// (design review M3). `snow`'s own rollback after a failed read restores
-/// its hash state but not its cipher state, so a message 3 that passes its
-/// first decryption and then fails leaves `snow` unable to read the genuine
-/// one. Instead of relying on that rollback, this type keeps a *recipe* for
-/// the handshake (our static key, a per-handshake ephemeral key and the
-/// transcript so far) and rebuilds a fresh `snow` state for every attempt to
-/// read the peer's next message. A failed attempt is simply dropped.
-///
-/// Stated plainly: rebuilding needs `snow`'s `#[doc(hidden)]`
-/// `fixed_ephemeral_key_for_testing_only`. Its warning is against reusing
-/// one ephemeral key across sessions. Here each handshake draws a fresh
-/// ephemeral key from `snow`'s own random generator and uses it only to
-/// rebuild that same handshake, which is what a complete checkpoint would
-/// do. The alternative is a `snow` change that also checkpoints the cipher
-/// state. Either way this needs cryptographic review.
+/// Uses `snow`'s public API only. Following the Noise rule, a handshake
+/// message that fails to decrypt or authenticate ends the handshake: the
+/// finishing steps consume `self`, and the caller starts again with a fresh
+/// handshake (a fresh ephemeral key). [`crate::wire`] adds the retry rules.
 pub struct Handshake {
-    secret: Zeroizing<[u8; 32]>,
-    ephemeral: Zeroizing<Vec<u8>>,
+    state: HandshakeState,
     credentials: [u8; CREDENTIALS_LEN],
-    role: Role,
-    finished: bool,
-}
-
-enum Role {
-    Initiator { expected_peer: Address },
-    /// The first message we read and the second we sent: replayed to rebuild.
-    Responder { message1: Vec<u8>, message2: Vec<u8> },
+    expected_peer: Option<Address>,
 }
 
 impl Handshake {
     /// Step 1 (initiator). Returns the first message to send to `peer`.
     pub fn initiate(me: &Identity, peer: Address) -> Result<(Handshake, Vec<u8>), SessionError> {
         let secret = Zeroizing::new(me.messaging_secret());
-        let ephemeral = fresh_ephemeral(&secret)?;
-        let mut state = builder(&secret)?.fixed_ephemeral_key_for_testing_only(&ephemeral).build_initiator()?;
+        let mut state = builder(&secret)?.build_initiator()?;
         let mut message1 = vec![0u8; MAX_NOISE_MESSAGE];
         let n = state.write_message(&[], &mut message1)?;
         message1.truncate(n);
-        let role = Role::Initiator { expected_peer: peer };
-        Ok((Handshake { secret, ephemeral, credentials: credentials(me), role, finished: false }, message1))
+        let handshake = Handshake { state, credentials: credentials(me), expected_peer: Some(peer) };
+        Ok((handshake, message1))
     }
 
     /// Step 2 (responder). Takes message 1, returns message 2.
     pub fn respond(me: &Identity, message1: &[u8]) -> Result<(Handshake, Vec<u8>), SessionError> {
         if message1.len() > MAX_NOISE_MESSAGE {
-            return Err(SessionError::TooLarge);
+            return Err(SessionError::TooLarge); // before allocating anything
         }
         let secret = Zeroizing::new(me.messaging_secret());
-        let ephemeral = fresh_ephemeral(&secret)?;
-        let creds = credentials(me);
-        let mut state = builder(&secret)?.fixed_ephemeral_key_for_testing_only(&ephemeral).build_responder()?;
+        let mut state = builder(&secret)?.build_responder()?;
         let mut scratch = vec![0u8; message1.len()];
         state.read_message(message1, &mut scratch)?;
+        let creds = credentials(me);
         let mut message2 = vec![0u8; MAX_NOISE_MESSAGE];
         let n = state.write_message(&creds, &mut message2)?;
         message2.truncate(n);
-        let role = Role::Responder { message1: message1.to_vec(), message2: message2.clone() };
-        Ok((Handshake { secret, ephemeral, credentials: creds, role, finished: false }, message2))
+        Ok((Handshake { state, credentials: creds, expected_peer: None }, message2))
     }
 
-    /// Whether this handshake can still take the peer's next message.
-    pub fn is_live(&self) -> bool {
-        !self.finished
-    }
-
-    /// A fresh `snow` state, replayed to the point where the peer's next
-    /// message is due.
-    fn rebuild(&self) -> Result<HandshakeState, SessionError> {
-        let b = builder(&self.secret)?.fixed_ephemeral_key_for_testing_only(&self.ephemeral);
-        match &self.role {
-            Role::Initiator { .. } => {
-                let mut state = b.build_initiator()?;
-                let mut scratch = vec![0u8; MAX_NOISE_MESSAGE];
-                state.write_message(&[], &mut scratch)?;
-                Ok(state)
-            }
-            Role::Responder { message1, message2 } => {
-                let mut state = b.build_responder()?;
-                let mut scratch = vec![0u8; message1.len()];
-                state.read_message(message1, &mut scratch)?;
-                let mut replayed = vec![0u8; MAX_NOISE_MESSAGE];
-                let n = state.write_message(&self.credentials, &mut replayed)?;
-                // Deterministic given the same keys and transcript; check it.
-                if replayed[..n] != message2[..] {
-                    return Err(SessionError::Malformed);
-                }
-                Ok(state)
-            }
-        }
-    }
-
-    /// Read the peer's next message on a freshly rebuilt state. Nothing
-    /// stored changes, so a failure leaves the handshake as it was.
-    fn read(&self, message: &[u8]) -> Result<(HandshakeState, Vec<u8>), SessionError> {
-        if self.finished {
-            return Err(SessionError::HandshakeOver);
-        }
+    /// Read the peer's next handshake message and return its payload.
+    fn read(&mut self, message: &[u8]) -> Result<Vec<u8>, SessionError> {
         if message.len() > MAX_NOISE_MESSAGE {
-            return Err(SessionError::TooLarge);
+            return Err(SessionError::TooLarge); // before allocating anything
         }
-        let mut state = self.rebuild()?;
         // A payload is never longer than the message carrying it.
         let mut payload = vec![0u8; message.len()];
-        let n = state.read_message(message, &mut payload)?;
+        let n = self.state.read_message(message, &mut payload)?;
         payload.truncate(n);
-        Ok((state, payload))
+        Ok(payload)
     }
 
     /// Step 3 (initiator). Takes message 2, returns the session and message 3.
     /// Fails unless the responder proved it is the address we asked for. Any
-    /// failure leaves the handshake waiting for the genuine message 2.
-    pub fn initiator_finish(&mut self, message2: &[u8]) -> Result<(Session, Vec<u8>), SessionError> {
-        let Role::Initiator { expected_peer } = self.role else {
-            return Err(SessionError::Malformed);
-        };
-        let (mut state, payload) = self.read(message2)?;
-        let peer = authenticate(&payload, state.get_remote_static())?;
-        if expected_peer != peer {
+    /// failure ends this handshake.
+    pub fn initiator_finish(mut self, message2: &[u8]) -> Result<(Session, Vec<u8>), SessionError> {
+        let payload = self.read(message2)?;
+        let peer = authenticate(&payload, self.state.get_remote_static())?;
+        if self.expected_peer != Some(peer) {
             return Err(SessionError::UnexpectedPeer { got: peer });
         }
         let mut message3 = vec![0u8; MAX_NOISE_MESSAGE];
-        let n = state.write_message(&self.credentials, &mut message3)?;
+        let n = self.state.write_message(&self.credentials, &mut message3)?;
         message3.truncate(n);
-        let session = Session::new(state.into_stateless_transport_mode()?, peer);
-        self.finished = true;
-        Ok((session, message3))
+        Ok((Session::new(self.state.into_stateless_transport_mode()?, peer), message3))
     }
 
     /// Step 4 (responder). Takes message 3, returns the session. The caller
     /// learns who the initiator is from [`Session::peer`] and decides
     /// whether to talk to them (e.g. by checking for an open channel). Any
-    /// failure leaves the handshake waiting for the genuine message 3.
-    pub fn responder_finish(&mut self, message3: &[u8]) -> Result<Session, SessionError> {
-        if !matches!(self.role, Role::Responder { .. }) {
-            return Err(SessionError::Malformed);
-        }
-        let (state, payload) = self.read(message3)?;
-        let peer = authenticate(&payload, state.get_remote_static())?;
-        let session = Session::new(state.into_stateless_transport_mode()?, peer);
-        self.finished = true;
-        Ok(session)
+    /// failure ends this handshake.
+    pub fn responder_finish(mut self, message3: &[u8]) -> Result<Session, SessionError> {
+        let payload = self.read(message3)?;
+        let peer = authenticate(&payload, self.state.get_remote_static())?;
+        Ok(Session::new(self.state.into_stateless_transport_mode()?, peer))
     }
-}
-
-/// A fresh X25519 ephemeral private key from `snow`'s random generator.
-fn fresh_ephemeral(secret: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, SessionError> {
-    Ok(Zeroizing::new(builder(secret)?.generate_keypair()?.private))
 }
 
 fn builder(secret: &[u8; 32]) -> Result<Builder<'_>, SessionError> {
@@ -289,7 +221,7 @@ impl Session {
         if sealed.len() > NONCE_LEN + MAX_NOISE_MESSAGE {
             return Err(SessionError::TooLarge); // before allocating anything
         }
-        if sealed.len() < NONCE_LEN + TAG_LEN {
+        if sealed.len() < MIN_SEALED {
             return Err(SessionError::Malformed);
         }
         let (nonce_bytes, ciphertext) = sealed.split_at(NONCE_LEN);

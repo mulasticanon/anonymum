@@ -115,7 +115,7 @@ always refundable").
 | H7 | Circuit completeness, verifier validation, key privacy, setup and mobile proving are unproven | **Open release gate** |
 | M1 | Wallet matched the expected refund commitment anywhere in history | **Fixed in the model** (and v0.6): the wallet finds the finalised transaction that consumed the escrow's nullifier, matches the refund among its outputs only, and reports separately whether it is unspent. Tested with an identical decoy commitment made earlier |
 | M2 | All-zero padding payloads; receipts and invites replayable across devices | **Open.** The model still pads with zeros; receipt and invitation idempotency is not modelled |
-| M3 | Invalid handshake traffic could consume pending state | **Fixed in `anonymum-crypto`** for malformed, tampered, truncated and oversized frames and for a validly encrypted message 2 from an impostor, on both sides (see the note below). Reordered and delayed frames are covered only by the existing repeated-frame tests; the Nym demo's retry loop is unchanged |
+| M3 | Invalid handshake traffic could consume pending state | Malformed-frame regression covered in the prototype; production retry design open, pending the handshake pattern chosen under spec question 11 |
 | M4 | A cumulative fee sink double-counts once operator funds are live; deadlines narrow candidates | **Open.** Applies before operator payouts or migrations |
 
 ## Found while fixing the review findings
@@ -126,11 +126,16 @@ message and restores them on failure, but not its cipher state. A message 3
 that passes its first decryption, re-keys the cipher and then fails on its
 payload leaves the responder unable to read the genuine message 3. (Message
 2 escapes this by accident: its first key step overwrites the cipher key.)
-*Workaround in `anonymum-crypto`:* a handshake keeps a recipe (static key,
-a per-handshake ephemeral key from `snow`'s own generator, the transcript)
-and rebuilds a fresh `snow` state for every read attempt, so a failed
-attempt changes nothing. This uses `snow`'s `#[doc(hidden)]`
-`fixed_ephemeral_key_for_testing_only`, whose warning is against reusing an
-ephemeral key across sessions; here each key serves one handshake only.
-*For the cryptographer:* accept this, or prefer a `snow` change that also
-checkpoints the cipher state (worth reporting upstream either way).
+*In `anonymum-crypto` (owner decision, 2026-11-19):* no workaround. The
+crate uses `snow`'s public API only, does not patch `snow`, and follows the
+Noise rule that a failed handshake ends: a cryptographic failure, or a peer
+proving the wrong identity, ends that attempt, and the caller starts a fresh
+handshake with a fresh ephemeral key (bounded retries, backoff). Only frames
+rejected by the outer framing (empty, unknown type, wrong length for the
+type) are ignored without ending anything. A timeout resends the exact
+bytes already sent; every handshake frame carries a call id and an attempt
+number so a late frame from an older attempt is ignored; and the initiator
+counts the session as open only after the responder confirms it.
+*For the cryptographer:* the partial rollback is still worth reporting
+upstream, and matters for whichever handshake replaces this one
+(question 11).

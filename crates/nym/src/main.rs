@@ -12,7 +12,13 @@
 //!   at the throwaway address; the gateway holds his call until she comes
 //!   back. Inside the session they swap their long-lived addresses.
 //! * Dave has no channel and calls Bob directly. Bob's client
-//!   authenticates him, sees no channel on the chain, and drops him.
+//!   authenticates him, sees no channel on the chain, drops him and sends
+//!   no confirmation, so Dave's call never becomes a session.
+//!
+//! Every call follows the retry rules in `anonymum_crypto::wire`: a timeout
+//! resends the same bytes, a failed attempt is replaced by a fresh
+//! handshake after a backoff, and the caller treats the session as open only
+//! once the callee has confirmed it.
 //!
 //! The chain here is the in-process simulation from `anonymum-core`. The
 //! mixnet and the cryptography are real.
@@ -27,7 +33,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anonymum_core::{Address, Chain, Envelope, Event, Inbox, MessagingKey, Params, SealedNote, Tx, Verdict, COIN};
-use anonymum_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent};
+use anonymum_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent, RetryPolicy, WireError};
 use anonymum_crypto::{open_note, seal_note, Ed25519Invites, Identity, InviteSecret};
 use nym_sdk::mixnet::{
     AnonymousSenderTag, MixnetClient, MixnetClientBuilder, MixnetMessageSender, Recipient,
@@ -37,11 +43,20 @@ use nym_sdk::mixnet::{
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long Bob waits for Carol to answer before calling again. Gateways
-/// drop stored messages after 24 h by default, shorter than the 48 h a
-/// request lives, so a real client must keep retrying until expiry.
-const CALL_RETRY_EVERY: Duration = Duration::from_secs(150);
-const CALL_ATTEMPTS: u32 = 3;
+/// Alice calling Bob. Worst case before giving up: 3 attempts of 3 sends
+/// each, 60 s apart, plus backoff after any failed attempt.
+const CALL_POLICY: RetryPolicy = RetryPolicy { attempts: 3, resends: 2, base_wait: Duration::from_secs(60) };
+/// Bob calling Carol's throwaway client, which may be offline: her gateway
+/// holds the call. Gateways drop stored messages after 24 h by default, so a
+/// real client must keep retrying for as long as the request lives.
+const RENDEZVOUS_POLICY: RetryPolicy = RetryPolicy { attempts: 2, resends: 2, base_wait: Duration::from_secs(150) };
+/// Dave: one attempt, no resends, so the demo shows an unconfirmed call
+/// giving up quickly.
+const DAVE_POLICY: RetryPolicy = RetryPolicy { attempts: 1, resends: 0, base_wait: Duration::from_secs(30) };
+/// How often a responder ages its half-finished handshakes.
+const TICK: Duration = Duration::from_secs(60);
+/// How long a responder waits for a caller to finish a handshake.
+const SERVE_PATIENCE: Duration = Duration::from_secs(600);
 
 /// A Nym client plus a queue, because the mixnet hands over messages in batches.
 struct Endpoint {
@@ -199,33 +214,21 @@ async fn run() -> Result<(), AnyError> {
     // ---- Alice calls Bob --------------------------------------------------
     println!("\nAlice -> Bob: encrypted handshake through the mixnet.");
     let started = Instant::now();
-    let (mut alice_call, frame1) = Initiator::start(&alice, bob.address())?;
-    alice_net.send(bob_mix_address, frame1).await?;
-
-    let (frame, tag) = bob_net.receive().await?;
-    let alice_tag = tag.ok_or("handshake arrived without reply blocks")?;
-    let ResponderEvent::Reply(frame2) = bob_side.handle(&bob, alice_tag, &frame)? else {
-        return Err("expected a handshake reply".into());
-    };
-    bob_net.reply(alice_tag, frame2).await?;
-
-    let (frame, _) = alice_net.receive().await?;
-    let InitiatorEvent::Established { reply: frame3 } = alice_call.handle(&frame)? else {
-        return Err("expected handshake completion".into());
-    };
-    alice_net.send(bob_mix_address, frame3).await?;
-
-    let (frame, tag) = bob_net.receive().await?;
-    let ResponderEvent::Established { peer } = bob_side.handle(&bob, tag.unwrap_or(alice_tag), &frame)? else {
-        return Err("expected session".into());
-    };
-    let has_channel = chain.channel_between(&peer, &bob.address()).is_some();
-    println!(
-        "  Bob authenticated caller as {peer} (alice: {}), channel on chain: {has_channel}, took {:.1}s",
-        peer == alice.address(),
-        started.elapsed().as_secs_f32()
+    let has_channel = |peer: &Address| chain.channel_between(peer, &bob.address()).is_some();
+    let (alice_end, bob_end) = tokio::join!(
+        call(&mut alice_net, &alice, bob.address(), bob_mix_address, CALL_POLICY),
+        answer(&mut bob_net, &mut bob_side, &bob, has_channel),
     );
-    if !has_channel {
+    let (peer, alice_tag, channel) = bob_end?;
+    let (mut alice_call, alice_early) = alice_end?;
+    println!(
+        "  Bob authenticated caller as {peer} (alice: {}), channel on chain: {channel}; \
+         Alice has Bob's confirmation after {:.1}s ({} attempt(s))",
+        peer == alice.address(),
+        started.elapsed().as_secs_f32(),
+        alice_call.attempt()
+    );
+    if !channel {
         return Err("Alice should have a channel".into());
     }
 
@@ -235,11 +238,7 @@ async fn run() -> Result<(), AnyError> {
     println!("  on the wire: {} bytes of ciphertext, starts {:02x?}", sealed.len(), &sealed[..12]);
     alice_net.send(bob_mix_address, sealed).await?;
 
-    let (frame, tag) = bob_net.receive().await?;
-    let reply_tag = tag.unwrap_or(alice_tag);
-    let ResponderEvent::Message { peer, plaintext } = bob_side.handle(&bob, alice_tag, &frame)? else {
-        return Err("expected a message".into());
-    };
+    let (peer, plaintext, reply_tag) = next_delivery(&mut bob_net, &mut bob_side, &bob, alice_tag).await?;
     let envelope = Envelope { from: peer, to: bob.address(), payload: plaintext };
     let verdict = bob_inbox.admit(&chain, &envelope, clock.elapsed().as_millis() as u64);
     println!(
@@ -253,11 +252,8 @@ async fn run() -> Result<(), AnyError> {
 
     println!("\nBob -> Alice: reply through anonymous reply blocks (Bob never learns where Alice is).");
     let started = Instant::now();
-    bob_net.reply(reply_tag, bob_side.seal(&alice_tag, b"Hi Alice. Got it.")?).await?;
-    let (frame, _) = alice_net.receive().await?;
-    let InitiatorEvent::Message(text) = alice_call.handle(&frame)? else {
-        return Err("expected a message".into());
-    };
+    bob_net.reply(reply_tag, bob_side.seal(&reply_tag, b"Hi Alice. Got it.")?).await?;
+    let text = next_message(&mut alice_net, &mut alice_call, alice_early).await?;
     println!("  Alice reads: {:?} ({:.1}s)", String::from_utf8_lossy(&text), started.elapsed().as_secs_f32());
 
     // ---- Carol, a stranger, reaches Bob by reverse rendezvous ---------------
@@ -302,38 +298,24 @@ async fn run() -> Result<(), AnyError> {
 
     // ---- Dave, with no channel, calls Bob directly ---------------------------
     println!("\nDave -> Bob: handshake from a wallet with no channel.");
-    let dave_net = Endpoint::connect("dave").await?;
-    let (mut dave_call, frame1) = Initiator::start(&dave, bob.address())?;
-    dave_net.send(bob_mix_address, frame1).await?;
-    let (frame, tag) = bob_net.receive().await?;
-    let dave_tag = tag.ok_or("handshake arrived without reply blocks")?;
-    let ResponderEvent::Reply(frame2) = bob_side.handle(&bob, dave_tag, &frame)? else {
-        return Err("expected a handshake reply".into());
-    };
-    bob_net.reply(dave_tag, frame2).await?;
-    let mut dave_net = dave_net;
-    let (frame, _) = dave_net.receive().await?;
-    let InitiatorEvent::Established { reply: frame3 } = dave_call.handle(&frame)? else {
-        return Err("expected handshake completion".into());
-    };
-    dave_net.send(bob_mix_address, frame3).await?;
-    let (frame, _) = bob_net.receive().await?;
-    let ResponderEvent::Established { peer } = bob_side.handle(&bob, dave_tag, &frame)? else {
-        return Err("expected session".into());
-    };
-    let has_channel = chain.channel_between(&peer, &bob.address()).is_some();
-    println!("  Bob authenticated caller as {peer} (dave: {}), channel on chain: {has_channel}", peer == dave.address());
-    if has_channel {
+    let mut dave_net = Endpoint::connect("dave").await?;
+    let has_channel = |peer: &Address| chain.channel_between(peer, &bob.address()).is_some();
+    let (dave_end, bob_end) = tokio::join!(
+        call(&mut dave_net, &dave, bob.address(), bob_mix_address, DAVE_POLICY),
+        answer(&mut bob_net, &mut bob_side, &bob, has_channel),
+    );
+    let (peer, _, channel) = bob_end?;
+    println!("  Bob authenticated caller as {peer} (dave: {}), channel on chain: {channel}", peer == dave.address());
+    if channel {
         return Err("Dave should not have a channel".into());
     }
-    bob_side.forget(&dave_tag);
-    println!("  Bob's client forgets his session.");
-
-    dave_net.send(bob_mix_address, dave_call.seal(b"Limited offer, click here")?).await?;
-    let (frame, _) = bob_net.receive().await?;
-    match bob_side.handle(&bob, dave_tag, &frame) {
-        Err(error) => println!("  Dave's message: dropped ({error}). He must pay Bob's price to get through."),
-        Ok(_) => return Err("stranger's message was accepted".into()),
+    println!("  Bob's client forgets the handshake and sends no confirmation.");
+    match dave_end {
+        Err(error) => println!(
+            "  Dave's call: {error}. Without a confirmed session he cannot send anything; \
+             he must pay Bob's price to get through."
+        ),
+        Ok(_) => return Err("Dave's call should not have been confirmed".into()),
     }
 
     println!("\nDisconnecting.");
@@ -361,7 +343,7 @@ async fn rendezvous(
 ) -> Result<(), AnyError> {
     let started = Instant::now();
     let bob_mix_address = bob_net.address();
-    let bob_calls = call_with_retry(bob_net, bob, carol.address(), reply_to);
+    let bob_calls = call(bob_net, bob, carol.address(), reply_to, RENDEZVOUS_POLICY);
     let carol_answers = async {
         tokio::time::sleep(offline).await;
         let mut throwaway = Endpoint::connect_persistent("carol (throwaway, back online)", throwaway_dir).await?;
@@ -369,39 +351,29 @@ async fn rendezvous(
             return Err::<_, AnyError>("throwaway client came back with a different address".into());
         }
         let mut carol_side: Responder<AnonymousSenderTag> = Responder::new();
-        loop {
-            let (frame, tag) = throwaway.receive().await?;
-            let tag = tag.ok_or("call arrived without reply blocks")?;
-            match carol_side.handle(carol, tag, &frame) {
-                Ok(ResponderEvent::Reply(frame2)) => {
-                    println!(
-                        "  Carol's throwaway receives Bob's call {:.0}s after it was sent (held by her gateway).",
-                        started.elapsed().as_secs_f32()
-                    );
-                    throwaway.reply(tag, frame2).await?;
-                }
-                Ok(ResponderEvent::Established { peer }) => {
-                    if peer != bob.address() {
-                        return Err("Carol was called by someone other than Bob".into());
-                    }
-                    return Ok((throwaway, carol_side, tag));
-                }
-                Ok(other) => println!("  Carol ignores unexpected {other:?}"),
-                Err(error) => println!("  Carol ignores a frame: {error}"),
-            }
+        let (peer, tag, confirm) = serve(&mut throwaway, &mut carol_side, carol).await?;
+        if peer != bob.address() {
+            return Err("Carol was called by someone other than Bob".into());
         }
+        println!(
+            "  Carol's throwaway authenticates Bob {:.0}s after his first call (held by her gateway) and confirms.",
+            started.elapsed().as_secs_f32()
+        );
+        throwaway.reply(tag, confirm).await?;
+        Ok((throwaway, carol_side, tag))
     };
     let (bob_call, carol_end) = tokio::join!(bob_calls, carol_answers);
-    let (mut bob_to_carol, attempts) = bob_call?;
+    let (mut bob_to_carol, bob_early) = bob_call?;
     let (mut throwaway, mut carol_side, bob_tag) = carol_end?;
     println!(
-        "  Session established after {:.0}s ({attempts} call attempt(s)). Bob is the initiator.",
-        started.elapsed().as_secs_f32()
+        "  Session confirmed after {:.0}s ({} attempt(s)). Bob is the initiator.",
+        started.elapsed().as_secs_f32(),
+        bob_to_carol.attempt()
     );
 
     println!("\nInside the session they swap long-lived mixnet addresses.");
     throwaway.reply(bob_tag, carol_side.seal(&bob_tag, carol_long_lived.to_string().as_bytes())?).await?;
-    let text = next_message(bob_net, &mut bob_to_carol).await?;
+    let text = next_message(bob_net, &mut bob_to_carol, bob_early).await?;
     let learned: Recipient = String::from_utf8(text)?.parse()?;
     println!("  Bob learns Carol's long-lived address: matches {}", learned == carol_long_lived);
     if learned != carol_long_lived {
@@ -409,10 +381,7 @@ async fn rendezvous(
     }
 
     bob_net.send(reply_to, bob_to_carol.seal(bob_mix_address.to_string().as_bytes())?).await?;
-    let (frame, tag) = throwaway.receive().await?;
-    let ResponderEvent::Message { plaintext, .. } = carol_side.handle(carol, tag.unwrap_or(bob_tag), &frame)? else {
-        return Err("expected Bob's address".into());
-    };
+    let (_, plaintext, _) = next_delivery(&mut throwaway, &mut carol_side, carol, bob_tag).await?;
     let learned: Recipient = String::from_utf8(plaintext)?.parse()?;
     println!("  Carol learns Bob's long-lived address: matches {}", learned == bob_mix_address);
     if learned != bob_mix_address {
@@ -552,48 +521,139 @@ async fn cmd_talk(args: &[String]) -> Result<(), AnyError> {
     Ok(())
 }
 
-/// Bob calls Carol at her throwaway address, calling again if she does not
-/// answer in time. Every attempt resends the *same* first frame: if the
-/// gateway later delivers several copies, Carol's responder answers them
-/// all identically, so exactly one handshake exists. (A first live run with
-/// a fresh handshake per attempt failed this way.) Fresh reply blocks are
-/// attached to every send. Returns the session and the attempts used.
-async fn call_with_retry(
-    bob_net: &mut Endpoint,
-    bob: &Identity,
-    carol: anonymum_core::Address,
-    to: Recipient,
-) -> Result<(Initiator, u32), AnyError> {
-    let (mut call, frame1) = Initiator::start(bob, carol)?;
-    for attempt in 1..=CALL_ATTEMPTS {
-        bob_net.send(to, frame1.clone()).await?;
-        if attempt > 1 {
-            println!("  Bob calls again (attempt {attempt}, same first frame).");
-        }
-        let deadline = tokio::time::Instant::now() + CALL_RETRY_EVERY;
-        while let Some((frame, _)) = bob_net.receive_until(deadline).await? {
-            match call.handle(&frame) {
-                Ok(InitiatorEvent::Established { reply }) => {
-                    bob_net.send(to, reply).await?;
-                    return Ok((call, attempt));
-                }
-                Ok(_) | Err(_) => continue,
-            }
-        }
-    }
-    Err(format!("Carol did not answer after {CALL_ATTEMPTS} attempts").into())
+// ---- driving the wire layer over the mixnet ----------------------------------
+
+fn deadline_for(call: &Initiator) -> tokio::time::Instant {
+    tokio::time::Instant::now() + call.wait().unwrap_or(Duration::ZERO)
 }
 
-/// The next message on an established call, skipping duplicate handshake
-/// replies that arrive late when a call was sent more than once.
-async fn next_message(net: &mut Endpoint, call: &mut Initiator) -> Result<Vec<u8>, AnyError> {
+/// Call `peer` at mixnet address `to` and drive the handshake until the
+/// callee confirms it. A timeout resends the same bytes (so a gateway that
+/// delivers several copies yields one handshake: the callee answers repeats
+/// identically); a failed attempt is followed, after a backoff, by a fresh
+/// handshake; the policy bounds both. Returns the confirmed call, plus the
+/// callee's first message if that is what confirmed it.
+async fn call(
+    net: &mut Endpoint,
+    me: &Identity,
+    peer: Address,
+    to: Recipient,
+    policy: RetryPolicy,
+) -> Result<(Initiator, Option<Vec<u8>>), AnyError> {
+    let (mut call, first) = Initiator::start_with(me, peer, policy)?;
+    net.send(to, first).await?;
+    let mut deadline = deadline_for(&call);
+    loop {
+        match net.receive_until(deadline).await? {
+            Some((frame, _)) => match call.handle(&frame) {
+                Ok(InitiatorEvent::Send(frame3)) => {
+                    net.send(to, frame3).await?;
+                    deadline = deadline_for(&call);
+                }
+                Ok(InitiatorEvent::Established) => return Ok((call, None)),
+                Ok(InitiatorEvent::Message(text)) => return Ok((call, Some(text))),
+                Err(WireError::AttemptFailed(error)) => {
+                    println!("  {}: attempt {} failed ({error}); a fresh one follows", net.name, call.attempt());
+                    deadline = deadline_for(&call);
+                }
+                Err(error) => println!("  {} ignores a frame: {error}", net.name),
+            },
+            None => match call.on_timeout(me) {
+                Ok(Some(frame)) => {
+                    println!("  {}: no answer yet, sending again (attempt {})", net.name, call.attempt());
+                    net.send(to, frame).await?;
+                    deadline = deadline_for(&call);
+                }
+                Ok(None) => return Ok((call, None)),
+                Err(error) => {
+                    return Err(format!("{} gave up after {} attempt(s): {error}", net.name, call.attempt()).into())
+                }
+            },
+        }
+    }
+}
+
+/// Answer callers until one finishes a handshake. Returns who it is, their
+/// reply handle and the confirmation to send if we keep them. Half-finished
+/// handshakes are dropped after a few ticks; gives up after SERVE_PATIENCE.
+async fn serve(
+    net: &mut Endpoint,
+    side: &mut Responder<AnonymousSenderTag>,
+    me: &Identity,
+) -> Result<(Address, AnonymousSenderTag, Vec<u8>), AnyError> {
+    let give_up = tokio::time::Instant::now() + SERVE_PATIENCE;
+    loop {
+        let deadline = give_up.min(tokio::time::Instant::now() + TICK);
+        match net.receive_until(deadline).await? {
+            None => {
+                for _ in side.tick() {
+                    println!("  {} drops a handshake that was never finished", net.name);
+                }
+                if tokio::time::Instant::now() >= give_up {
+                    return Err(format!("{}: no caller finished a handshake in {SERVE_PATIENCE:?}", net.name).into());
+                }
+            }
+            Some((_, None)) => println!("  {} ignores a frame without reply blocks", net.name),
+            Some((frame, Some(tag))) => match side.handle(me, tag, &frame) {
+                Ok(ResponderEvent::Reply(reply)) => net.reply(tag, reply).await?,
+                Ok(ResponderEvent::Established { peer, reply }) => return Ok((peer, tag, reply)),
+                Ok(ResponderEvent::Message { .. }) => println!("  {} ignores a message during a handshake", net.name),
+                Err(error) => println!("  {} ignores a frame: {error}", net.name),
+            },
+        }
+    }
+}
+
+/// Bob's side of an incoming call: confirm callers with a channel, forget
+/// (without confirming) callers without one.
+async fn answer(
+    net: &mut Endpoint,
+    side: &mut Responder<AnonymousSenderTag>,
+    me: &Identity,
+    has_channel: impl Fn(&Address) -> bool,
+) -> Result<(Address, AnonymousSenderTag, bool), AnyError> {
+    let (peer, tag, confirm) = serve(net, side, me).await?;
+    let channel = has_channel(&peer);
+    if channel {
+        net.reply(tag, confirm).await?;
+    } else {
+        side.forget(&tag);
+    }
+    Ok((peer, tag, channel))
+}
+
+/// The next message from an established caller. Late handshake frames are
+/// answered (a resent message 3 gets the confirmation again) or ignored.
+async fn next_delivery(
+    net: &mut Endpoint,
+    side: &mut Responder<AnonymousSenderTag>,
+    me: &Identity,
+    fallback: AnonymousSenderTag,
+) -> Result<(Address, Vec<u8>, AnonymousSenderTag), AnyError> {
+    loop {
+        let (frame, tag) = net.receive().await?;
+        let tag = tag.unwrap_or(fallback);
+        match side.handle(me, tag, &frame) {
+            Ok(ResponderEvent::Message { peer, plaintext }) => return Ok((peer, plaintext, tag)),
+            Ok(ResponderEvent::Reply(reply)) => net.reply(tag, reply).await?,
+            Ok(other) => println!("  {} ignores {other:?}", net.name),
+            Err(error) => println!("  {} ignores a frame: {error}", net.name),
+        }
+    }
+}
+
+/// The next message on a confirmed call (or the one that confirmed it),
+/// ignoring late handshake frames.
+async fn next_message(net: &mut Endpoint, call: &mut Initiator, early: Option<Vec<u8>>) -> Result<Vec<u8>, AnyError> {
+    if let Some(text) = early {
+        return Ok(text);
+    }
     loop {
         let (frame, _) = net.receive().await?;
         match call.handle(&frame) {
             Ok(InitiatorEvent::Message(text)) => return Ok(text),
-            Err(anonymum_crypto::wire::WireError::UnexpectedFrame) => continue,
-            Ok(other) => return Err(format!("unexpected {other:?}").into()),
-            Err(error) => return Err(error.into()),
+            Ok(other) => println!("  {} ignores {other:?}", net.name),
+            Err(error) => println!("  {} ignores a frame: {error}", net.name),
         }
     }
 }

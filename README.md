@@ -11,8 +11,8 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing. | 31 tests |
-| `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 (see below). Not an automated test. |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing with handshake retries (a failed attempt ends and a fresh one follows; the caller waits for the callee's confirmation). | 38 tests |
+| `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 and 2026-11-19 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
@@ -55,12 +55,20 @@ gateway (`ResolutionFailed`), so the 200 s case has not passed end to end.
 An earlier 200 s run, before the retry fix, failed on crossed replies (see
 CLAUDE.md). `ANONYMUM_OFFLINE_SECS` sets the offline time.
 
+With the confirmed handshake (2026-11-19, design review M3): every call now
+waits for the callee's confirmation and retries by the rules in
+`anonymum_crypto::wire`. Live run, offline 60 s: Alice confirmed in 5.8 s,
+Carol's session confirmed after 71 s on the first attempt, Dave (no channel,
+no confirmation) gave up after his single 30 s attempt; whole demo passed in
+175 s. Loss cases (lost message 3, lost confirmation, late frames) are
+covered by unit tests, not by live runs.
+
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
 `nym-node`'s gateway config; operators can change it). That is shorter than
 the 48 h a request lives, so the accepting side must keep calling again until
-the request would have expired. The demo retries every 150 s; a real client
-would retry on a slower schedule.
+the request would have expired. The demo resends every 150 s when calling a
+throwaway client; a real client would retry on a slower schedule.
 
 ## Substrate pallet and local node (roadmap step 4)
 
@@ -180,7 +188,7 @@ I14).
 | Piece | Status |
 |---|---|
 | Fee and channel rules, blocks, invite-only | Built, tested |
-| Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live, including once end to end through the dev chain (`e2e.mjs`). Retry logic lives in the demo binary, not yet in a reusable client |
+| Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live, including once end to end through the dev chain (`e2e.mjs`). Retry rules live in `anonymum_crypto::wire`; the demo binary drives them |
 | Invites | Real Ed25519 signatures, bound to opener and recipient |
 | End-to-end encryption | Noise XX (X25519, ChaCha20-Poly1305, BLAKE2s). Addresses are proven inside the encrypted handshake, so observers learn neither party |
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |

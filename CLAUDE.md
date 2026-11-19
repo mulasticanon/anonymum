@@ -46,7 +46,7 @@ Windows machine (see the update below).
 | Crate | Contents | Verified |
 |---|---|---|
 | `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 48 h expiry, client-side inbox admission, token-bucket rate limit, storage deposits. Zero dependencies. | 61 tests, run by CI on Linux and Windows |
-| `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `note` (`seal_note` / `open_note`, Noise N), `wire` framing (`Initiator`, `Responder<T>`; a repeated first frame gets the same reply; a frame that fails validation never destroys a pending handshake; oversized frames refused before allocation). | 31 tests, run by CI on Linux and Windows |
+| `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `note` (`seal_note` / `open_note`, Noise N), `wire` framing (`Initiator`, `Responder<T>`; handshake frames carry a call id and attempt number; framing rejects are ignored, a cryptographic failure ends the attempt and the caller retries with a fresh handshake (bounded, with backoff); timeouts resend the same bytes; late frames from older attempts are ignored; the session counts as open only after the responder's confirmation; per-type frame lengths, the largest plaintext fits). | 38 tests, run by CI on Linux and Windows |
 | `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 57 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
 | `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce and the key paths of the refund and cancel keys; refunds found via the consuming transaction). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 51 tests (section 5 properties, randomised conservation, 5b acceptance); every rule mutation-checked |
@@ -185,8 +185,9 @@ accepting side must retry until the request's 48 h would be up. A first live
 retry with a fresh handshake per attempt failed: both stored copies arrived
 and the replies crossed. Fix: retries resend the *same* first frame, and
 `Responder` answers an identical repeat with the cached reply (tests in
-`crates/crypto/tests/wire.rs`). The retry loop lives in the demo
-(`call_with_retry`), not yet in a reusable client.
+`crates/crypto/tests/wire.rs`). Since 2026-11-19 the retry rules live in
+`anonymum_crypto::wire` (`Initiator::on_timeout` / `wait`, `RetryPolicy`); the demo's `call` /
+`serve` helpers drive them over the mixnet.
 
 Still visible on-chain until roadmap step 5: that wallet Y requested wallet
 X, the sealed note, messaging keys, and who blocked whom. Keep the pallet
