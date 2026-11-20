@@ -155,7 +155,15 @@ try {
   console.log('\n4. Bob reads the request from chain state, opens the note, and accepts.');
   const onChain = (await api.query.anonymum.requests(requestId)).unwrap();
   check(onChain.note.toHex() === '0x' + note, 'the note in chain state is byte-for-byte what Carol sealed');
-  const opened = rust('open', '--wallet', join(bobDir, 'bob.wallet'), '--note', onChain.note.toHex().slice(2));
+  // The request's creation time, from chain state: the block it was made in
+  // (its expiry block minus the lifetime) and that block's timestamp. The
+  // sender's card must have been valid then.
+  const ttlBlocks = Math.ceil(api.consts.anonymum.requestTtlMillis.toNumber() / api.consts.anonymum.expectedBlockTimeMillis.toNumber());
+  const createdBlock = onChain.expiresAt.toNumber() - ttlBlocks;
+  const createdHash = await api.rpc.chain.getBlockHash(createdBlock);
+  const createdAt = String(Math.floor((await api.query.timestamp.now.at(createdHash)).toNumber() / 1000));
+  check(Number(createdAt) > 0, `request created in block ${createdBlock} at ${new Date(Number(createdAt) * 1000).toISOString()} (from chain state)`);
+  const opened = rust('open', '--wallet', join(bobDir, 'bob.wallet'), '--note', onChain.note.toHex().slice(2), '--created', createdAt);
   check(opened.intro === INTRO, `Bob reads the intro: "${opened.intro}"`);
   check(opened.reply === throwaway.address, "and Carol's throwaway route, with no sender hint");
   r = await send(bobAccount, api.tx.anonymum.acceptContact(requestId));
@@ -167,7 +175,7 @@ try {
   const noteFromChain = onChain.note.toHex().slice(2);
   const carolRun = process_('carol', ['answer', '--carol', join(carolDir, 'carol.wallet'), '--keep', keepFile,
     '--dir', throwawayDir, '--card', bob.card]);
-  const bobRun = process_('bob', ['callback', '--bob', join(bobDir, 'bob.wallet'), '--note', noteFromChain]);
+  const bobRun = process_('bob', ['callback', '--bob', join(bobDir, 'bob.wallet'), '--note', noteFromChain, '--created', createdAt]);
   const [carolEnd, bobEnd] = await Promise.all([carolRun, bobRun]);
   check(carolEnd.code === 0 && carolEnd.fields.answer === 'ok', "Carol's process let in only Bob's callback and finished");
   check(bobEnd.code === 0 && bobEnd.fields.callback === 'ok', "Bob's process called back from the note alone and checked Carol's contact key");

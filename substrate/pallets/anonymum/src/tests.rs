@@ -653,12 +653,12 @@ fn going_invite_only_leaves_pending_requests_answerable() {
     });
 }
 
-// ---- C: 48-hour expiry ------------------------------------------------------
+// ---- C: 24-hour expiry (D2) ------------------------------------------------------
 
 #[test]
 fn request_ttl_is_48_hours_of_blocks() {
     new_test_ext().execute_with(|| {
-        assert_eq!(Anonymum::request_ttl_blocks(), 28_800);
+        assert_eq!(Anonymum::request_ttl_blocks(), 14_400);
     });
 }
 
@@ -669,12 +669,12 @@ fn request_expires_exactly_at_48_hours_minus_decline_fee() {
         let request = last_request();
         System::reset_events();
 
-        System::set_block_number(28_800);
-        Anonymum::on_initialize(28_800);
+        System::set_block_number(14_400);
+        Anonymum::on_initialize(14_400);
         assert!(new_events().is_empty(), "still pending one block before");
 
-        System::set_block_number(28_801);
-        Anonymum::on_initialize(28_801);
+        System::set_block_number(14_401);
+        Anonymum::on_initialize(14_401);
         assert_eq!(
             new_events(),
             vec![Event::RequestRefunded {
@@ -686,7 +686,7 @@ fn request_expires_exactly_at_48_hours_minus_decline_fee() {
             }]
         );
         assert_eq!(free("carol"), 10 * COIN - COLD_FEE - DECLINE_FEE);
-        assert!(!ExpiryQueue::<Test>::contains_key(28_801));
+        assert!(!ExpiryQueue::<Test>::contains_key(14_401));
     });
 }
 
@@ -696,7 +696,7 @@ fn an_answered_request_is_skipped_at_expiry() {
         assert_ok!(req("carol", "bob", COIN));
         assert_ok!(Anonymum::accept_contact(signed("bob"), last_request()));
         System::reset_events();
-        Anonymum::on_initialize(28_801);
+        Anonymum::on_initialize(14_401);
         assert!(new_events().is_empty());
         assert_eq!(free("bob"), 11 * COIN);
     });
@@ -733,8 +733,8 @@ fn coins_are_conserved_across_a_mixed_history() {
         assert_ok!(req("carol", "bob", COIN));
         assert_ok!(req("carol", "alice", COIN));
         assert_ok!(Anonymum::block(signed("alice"), account("carol")));
-        System::set_block_number(28_801);
-        Anonymum::on_initialize(28_801);
+        System::set_block_number(14_401);
+        Anonymum::on_initialize(14_401);
         assert_ok!(req("alice", "carol", COIN));
         assert_ok!(Anonymum::cancel_request(signed("carol"), last_request()));
         assert_conserved(start);
@@ -918,7 +918,7 @@ fn queued(at: u64) -> usize {
 fn early_resolutions_free_their_expiry_slots() {
     new_test_ext().execute_with(|| {
         // MaxRequestsPerBlock is 4. Fill block 1's slot (expiring at 28,801).
-        let expiry = 1 + 28_800;
+        let expiry = 1 + 14_400;
         let s: Vec<AccountId32> = (0..10).map(|i| funded(&format!("early{i}"))).collect();
         for who in &s[..4] {
             assert_ok!(Anonymum::request_contact(RuntimeOrigin::signed(who.clone()), account("bob"), COIN, note()));
@@ -1040,11 +1040,11 @@ fn the_fee_split_cannot_overflow() {
 #[test]
 fn an_expiry_height_that_would_overflow_is_refused_charging_nothing() {
     new_test_ext().execute_with(|| {
-        // The mock's lifetime is 28,800 blocks: the last height that fits is
-        // u64::MAX - 28,800.
-        System::set_block_number(u64::MAX - 28_799);
+        // The mock's lifetime is 14,400 blocks: the last height that fits is
+        // u64::MAX - 14,400.
+        System::set_block_number(u64::MAX - 14_399);
         assert_noop!(req("carol", "bob", COIN), DispatchError::Arithmetic(ArithmeticError::Overflow));
-        System::set_block_number(u64::MAX - 28_800);
+        System::set_block_number(u64::MAX - 14_400);
         assert_ok!(req("carol", "bob", COIN));
     });
 }

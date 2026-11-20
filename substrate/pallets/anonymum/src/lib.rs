@@ -2,7 +2,7 @@
 //!
 //! A port of `anonymum-core`'s `chain.rs` to FRAME: invites, paid contact
 //! requests carrying a sealed note, escrow, channels, blocks, invite-only
-//! wallets, messaging keys, fees and 48-hour expiry. The rules and their
+//! wallets, messaging keys, fees and 24-hour expiry. The rules and their
 //! failure paths match the core crate one for one; the tests in `tests.rs`
 //! are ported from `crates/core/tests/protocol.rs`.
 //!
@@ -125,7 +125,7 @@ pub mod pallet {
         /// Price a stranger pays, unless the recipient set their own.
         #[pallet::constant]
         type DefaultContactPrice: Get<BalanceOf<Self>>;
-        /// Lifetime of an unanswered request, in milliseconds (48 h).
+        /// Lifetime of an unanswered request, in milliseconds (24 h, D2).
         #[pallet::constant]
         type RequestTtlMillis: Get<u64>;
         /// Target block time, in milliseconds, to turn the TTL into blocks.
@@ -367,7 +367,7 @@ pub mod pallet {
 
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-        /// Refund requests whose 48 hours are up.
+        /// Refund requests whose 24 hours are up.
         fn on_initialize(now: BlockNumberFor<T>) -> Weight {
             let due = ExpiryQueue::<T>::take(now);
             let count = due.len() as u64;
@@ -675,7 +675,7 @@ pub mod pallet {
             Prices::<T>::get(who).unwrap_or_else(T::DefaultContactPrice::get)
         }
 
-        /// The request lifetime in blocks, rounded up (48 h at 6 s = 28,800).
+        /// The request lifetime in blocks, rounded up (24 h at 6 s = 14,400).
         pub fn request_ttl_blocks() -> BlockNumberFor<T> {
             let block_ms = T::ExpectedBlockTimeMillis::get().max(1);
             T::RequestTtlMillis::get().div_ceil(block_ms).saturated_into()

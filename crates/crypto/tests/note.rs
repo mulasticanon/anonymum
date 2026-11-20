@@ -152,3 +152,34 @@ fn stranger_flow_through_the_transparent_chain() {
     let opened = open_note(&bob, &NET, note, NOW).unwrap();
     assert_eq!((opened.route, opened.intro.as_str()), (ROUTE, "hi Bob"));
 }
+
+// ---- the sender's card is checked at the request's creation time ------------
+
+#[test]
+fn a_card_valid_at_creation_but_expired_by_opening_time_still_opens() {
+    let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+    let note = seal(&bob, &carol, "hi"); // Carol's card is valid in [0, 100)
+    // By the time Bob opens it (today's clock), the card has expired...
+    let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(card(&carol).verify(&NET, today), Err(anonymum_crypto::ContactError::Expired));
+    // ...but it was valid when the request was created on chain, at 99.
+    let opened = open_note(&bob, &NET, &note, 99).unwrap();
+    assert_eq!(opened.sender(), carol.signing_key());
+}
+
+#[test]
+fn a_card_expired_or_not_yet_valid_at_creation_is_refused() {
+    let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+    let note = seal(&bob, &carol, "hi"); // valid in [0, 100)
+    assert!(matches!(
+        open_note(&bob, &NET, &note, 100),
+        Err(NoteError::BadCard(anonymum_crypto::ContactError::Expired))
+    ));
+    let later = seal_note(&NET, &bob.inbox_key().public(), &carol, &carol.card(NET, 1_000, 60, 100), &ROUTE, "hi", &ADMISSION)
+        .unwrap();
+    assert!(matches!(
+        open_note(&bob, &NET, &later, 59),
+        Err(NoteError::BadCard(anonymum_crypto::ContactError::NotYetValid))
+    ));
+    assert!(open_note(&bob, &NET, &later, 60).is_ok());
+}

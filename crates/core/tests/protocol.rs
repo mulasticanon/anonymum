@@ -657,23 +657,23 @@ fn going_invite_only_leaves_pending_requests_answerable() {
     assert!(chain.channel_between(&bob, &carol).is_some());
 }
 
-// ---- C: 48-hour expiry ----------------------------------------------------
+// ---- C: 24-hour expiry (D2) -----------------------------------------------
 
 #[test]
-fn request_ttl_is_48_hours_of_blocks() {
+fn request_ttl_is_24_hours_of_blocks() {
     let p = Params::default();
-    assert_eq!(p.request_ttl_secs, 48 * 3600);
-    assert_eq!(p.request_ttl_blocks(), 28_800, "48 h at 6 s blocks");
+    assert_eq!(p.request_ttl_secs, 24 * 3600);
+    assert_eq!(p.request_ttl_blocks(), 14_400, "24 h at 6 s blocks");
     let slow = Params { block_time_ms: 7_000, ..Params::default() };
-    assert_eq!(slow.request_ttl_blocks(), 24_686, "rounded up: never shorter than 48 h");
-    assert!(slow.request_ttl_blocks() * 7 >= 48 * 3600);
+    assert_eq!(slow.request_ttl_blocks(), 12_343, "rounded up: never shorter than 24 h");
+    assert!(slow.request_ttl_blocks() * 7 >= 24 * 3600);
 }
 
 #[test]
-fn request_expires_exactly_at_48_hours() {
+fn request_expires_exactly_at_24_hours() {
     let (mut chain, _, bob, carol) = setup();
     chain.apply(carol, req(bob, COIN)).unwrap();
-    assert!(chain.advance_blocks(28_799).is_empty(), "still pending one block before");
+    assert!(chain.advance_blocks(14_399).is_empty(), "still pending one block before");
     let events = chain.advance_blocks(1);
     assert!(matches!(events[0], Event::RequestRefunded { reason: RefundReason::Expired, .. }));
 }

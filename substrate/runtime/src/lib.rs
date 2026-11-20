@@ -101,7 +101,8 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 3: register_invite refuses weak (small-order) Ed25519 invite keys.
 	// 4: contact notes grow to 667 bytes (format v4, Noise X, deniable sender
 	// authentication); 587-byte notes are refused.
-	spec_version: 4,
+	// 5: contact requests live 24 h (D2), not 48 h.
+	spec_version: 5,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -251,7 +252,7 @@ impl pallet_anonymum::Config for Runtime {
 	type InviteOpenFee = ConstU128<{ COIN / 100 }>;
 	type ColdNetworkFee = ConstU128<{ COIN / 2 }>;
 	type DefaultContactPrice = ConstU128<COIN>;
-	type RequestTtlMillis = ConstU64<{ 48 * 60 * 60 * 1000 }>;
+	type RequestTtlMillis = ConstU64<{ 24 * 60 * 60 * 1000 }>; // D2: 24 h
 	// Run the dev node with `--dev-block-time 6000` to match.
 	type ExpectedBlockTimeMillis = ConstU64<6_000>;
 	type FeeBurnPercent = ConstU8<50>;

@@ -196,6 +196,10 @@ whatever the payment proofs hide. Rules:
      recipient calls the sender's handshake key itself, so a forger holding
      only the inbox secret cannot complete the callback. There is no
      separate per-request callback key any more (see I16).
+   - **The sender's card must be valid at the request's creation time**
+     (the time the request was created on chain, read from chain state).
+     It may expire before the recipient opens the note; a card expired or
+     not yet valid at creation is refused.
    - Forward secrecy for notes is still open.
 5. **Invitations** are issued by a contact identity to a holder key, and
    name the network, an expiry and the purpose. The recipient's app checks

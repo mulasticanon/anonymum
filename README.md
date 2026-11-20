@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise X, deniable sender authentication) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 99 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise X, deniable sender authentication) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 101 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -103,11 +103,16 @@ With the deniable note (format v4, Noise X, 667 bytes; runtime
 dev node, Bob calling Carol's handshake key from the note he decrypted; the
 live demo passed in 267 s, Eve and Dave again getting nothing.
 
+With 24-hour requests and the sender's card checked at the request's
+creation time read from chain state (runtime `spec_version` 5,
+2026-11-20): `smoke.mjs` and `e2e.mjs` passed against the dev node.
+
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
-`nym-node`'s gateway config; operators can change it). That is shorter than
-the 48 h a request lives, so the accepting side must keep calling again until
-the request would have expired. The demo resends every 150 s when calling a
+`nym-node`'s gateway config; operators can change it). A request lives the
+same 24 h (decision D2; 48 h before 2026-11-20), but an operator may hold
+messages for less, so the accepting side must keep calling again until the
+request would have expired. The demo resends every 150 s when calling a
 throwaway client; a real client would retry on a slower schedule.
 
 ## Substrate pallet and local node (roadmap step 4)
@@ -290,8 +295,10 @@ I14).
    caller key the invitation names. Wallets can be invite-only; requests to
    them fail before any fee. (The transparent chain still records requests
    wallet to wallet, and still needs a wallet-bound key published.)
-10. **Requests expire after 48 hours**, defined as a duration and converted to
-    blocks from the block time (6 s blocks: 28,800).
+10. **Requests expire after 24 hours** (decision D2, matching how long Nym
+    gateways hold messages; 48 hours before 2026-11-20), defined as a
+    duration and converted to blocks from the block time (6 s blocks:
+    14,400). Invites keep their own expiry, set by their owner.
 
 ## Open questions for you
 
@@ -333,7 +340,7 @@ I14).
 2. **Done** — real invites, identities, end-to-end sessions.
 3. **Done** — Nym transport demo, run live over the mixnet.
    **Done** — closing blocks, direct blocking, reverse rendezvous for
-   strangers, invite-only wallets, 48 h expiry.
+   strangers, invite-only wallets, request expiry (24 h since 2026-11-20).
 4. **Done** — `chain.rs` ported to a Substrate pallet; local dev chain runs it
    with real transactions. Not done: benchmarked weights, a real network
    with consensus, our own node binary.

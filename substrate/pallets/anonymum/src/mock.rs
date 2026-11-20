@@ -52,7 +52,7 @@ impl pallet_anonymum::Config for Test {
     type InviteOpenFee = ConstU128<{ COIN / 100 }>;
     type ColdNetworkFee = ConstU128<{ COIN / 2 }>;
     type DefaultContactPrice = ConstU128<COIN>;
-    type RequestTtlMillis = ConstU64<{ 48 * 60 * 60 * 1000 }>;
+    type RequestTtlMillis = ConstU64<{ 24 * 60 * 60 * 1000 }>;
     type ExpectedBlockTimeMillis = ConstU64<6_000>;
     type FeeBurnPercent = ConstU8<50>;
     type DeclineFeeBps = ConstU16<100>;

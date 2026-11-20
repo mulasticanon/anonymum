@@ -34,7 +34,8 @@ pub struct Params {
     /// Price a stranger pays the recipient, unless the recipient set their own.
     pub default_contact_price: Amount,
     /// How long an unanswered contact request lives before it expires and
-    /// is refunded, in seconds. Decided: 48 hours.
+    /// is refunded, in seconds. Decided: 24 hours (D2, owner decision O4),
+    /// matching how long Nym gateways hold messages for an offline client.
     pub request_ttl_secs: u64,
     /// Target time between blocks, in milliseconds. Substrate's default is
     /// 6 s. Used only to turn durations into block counts.
@@ -64,7 +65,7 @@ impl Default for Params {
             invite_open_fee: COIN / 100,
             cold_network_fee: COIN / 2,
             default_contact_price: COIN,
-            request_ttl_secs: 48 * 60 * 60,
+            request_ttl_secs: 24 * 60 * 60,
             block_time_ms: 6_000,
             fee_burn_percent: 50,
             decline_fee_bps: 100,
@@ -78,7 +79,7 @@ impl Default for Params {
 
 impl Params {
     /// The request lifetime in blocks, rounded up so a request never lives
-    /// shorter than `request_ttl_secs`. 48 h at 6 s blocks = 28,800.
+    /// shorter than `request_ttl_secs`. 24 h at 6 s blocks = 14,400.
     pub fn request_ttl_blocks(&self) -> BlockHeight {
         self.request_ttl_secs.saturating_mul(1_000).div_ceil(self.block_time_ms.max(1))
     }

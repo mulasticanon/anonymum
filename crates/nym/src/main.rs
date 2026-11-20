@@ -69,7 +69,7 @@ const SHORT_POLICY: RetryPolicy = RetryPolicy { attempts: 1, resends: 0, base_wa
 /// on every frame it handles).
 const EXPIRY_CHECK: Duration = Duration::from_secs(30);
 /// How long a stranger's throwaway listener accepts the recipient's callback
-/// (the request lives 48 h on this chain; gateways hold messages 24 h).
+/// (the request lives 24 h, as long as gateways hold messages).
 const CALLBACK_WINDOW: Duration = Duration::from_secs(24 * 3_600);
 /// Carol's receipt for Bob's long-lived route at the end of rendezvous.
 const RECEIPT: &[u8] = b"route received";
@@ -215,6 +215,8 @@ async fn run() -> Result<(), AnyError> {
     );
 
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
+    // The simulation counts blocks, not seconds; this anchors height 0.
+    let chain_started = now_secs();
     chain.mint(alice_wallet.address(), 10 * COIN);
     chain.mint(carol_wallet.address(), 10 * COIN);
     chain.mint(bob_wallet.address(), COIN); // storage deposits
@@ -333,7 +335,11 @@ async fn run() -> Result<(), AnyError> {
     // Bob's client tries his inbox key on the request's note: no sender
     // address or hint. Everything he needs to call back comes from the note.
     let req = chain.request(request).ok_or("request vanished")?.clone();
-    let opened = open_note(&bob, &NETWORK, &req.note, now_secs())?;
+    // The sender's card must have been valid when the request was created:
+    // that time comes from chain state (creation height x block time).
+    let created_height = req.expires_at - chain.params().request_ttl_blocks();
+    let created_at = chain_started + created_height * chain.params().block_time_ms / 1_000;
+    let opened = open_note(&bob, &NETWORK, &req.note, created_at)?;
     println!(
         "  Bob's client opens the note with his inbox key alone. Sender's contact key {}, intro: {:?}",
         short(&opened.sender()),
@@ -498,10 +504,12 @@ async fn stranger_side(
 //   anonymum-nym seal --card HEX --sender F --reply R --intro TEXT --keep F
 //                                    seal a note; keep the admission
 //                                    stand-in in Carol's file F
-//   anonymum-nym open --wallet F --note HEX    (no sender hint)
+//   anonymum-nym open --wallet F --note HEX --created SECS
+//                                    no sender hint; SECS is the request's
+//                                    creation time from chain state
 //   anonymum-nym answer --carol F --keep F --dir D --card HEX
 //                                    Carol's process: answer Bob's callback
-//   anonymum-nym callback --bob F --note HEX
+//   anonymum-nym callback --bob F --note HEX --created SECS
 //                                    Bob's process: open the note himself
 //                                    and call back
 //
@@ -633,7 +641,8 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
 fn cmd_open(args: &[String]) -> Result<(), AnyError> {
     let contact = load_contact(flag(args, "--wallet")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
-    let opened = open_note(&contact, &NETWORK, &note, now_secs())?;
+    let created: u64 = flag(args, "--created")?.parse()?;
+    let opened = open_note(&contact, &NETWORK, &note, created)?;
     println!("reply={}", to_hex(&opened.route));
     println!("sender={}", to_hex(&opened.sender()));
     println!("callback={}", to_hex(&opened.callback()));
@@ -666,7 +675,8 @@ async fn cmd_answer(args: &[String]) -> Result<(), AnyError> {
 async fn cmd_callback(args: &[String]) -> Result<(), AnyError> {
     let bob = load_contact(flag(args, "--bob")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
-    let opened = open_note(&bob, &NETWORK, &note, now_secs())?;
+    let created: u64 = flag(args, "--created")?.parse()?;
+    let opened = open_note(&bob, &NETWORK, &note, created)?;
     let mut bob_net = Endpoint::connect("bob").await?;
     let learned = recipient_side(&mut bob_net, &bob, &opened).await?;
     println!("mine={}", bob_net.address());

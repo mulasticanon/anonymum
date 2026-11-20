@@ -210,11 +210,19 @@ pub fn seal_note(
     Ok(SealedNote(out))
 }
 
-/// Try to open a note on `network` with `me`'s inbox key, at wall-clock time
-/// `now` (for the card's validity). Needs nothing else: no sender address,
-/// no hint. A note for someone else, another network, another admission
-/// commitment or another note format fails with [`NoteError::Noise`].
-pub fn open_note(me: &ContactIdentity, network: &Network, note: &SealedNote, now: u64) -> Result<ContactNote, NoteError> {
+/// Try to open a note on `network` with `me`'s inbox key. `created_at` is
+/// the wall-clock time (seconds) at which the request carrying the note was
+/// created on chain, taken from chain state: the sender's card must have
+/// been valid then (it may have expired since). Needs nothing else: no
+/// sender address, no hint. A note for someone else, another network,
+/// another admission commitment or another note format fails with
+/// [`NoteError::Noise`].
+pub fn open_note(
+    me: &ContactIdentity,
+    network: &Network,
+    note: &SealedNote,
+    created_at: u64,
+) -> Result<ContactNote, NoteError> {
     if note.0.len() != SEALED_NOTE_LEN {
         return Err(NoteError::BadSize { len: note.0.len() });
     }
@@ -245,7 +253,7 @@ pub fn open_note(me: &ContactIdentity, network: &Network, note: &SealedNote, now
         not_after: u64::from_be_bytes(body[89..97].try_into().expect("8 bytes")),
         signature: body[97..161].try_into().expect("64 bytes"),
     };
-    card.verify(network, now).map_err(NoteError::BadCard)?;
+    card.verify(network, created_at).map_err(NoteError::BadCard)?;
     let intro_len = u16::from_be_bytes([body[LEN_AT], body[LEN_AT + 1]]) as usize;
     if intro_len > INTRO_MAX_BYTES {
         return Err(NoteError::IntroTooLong { len: intro_len });
@@ -550,7 +558,7 @@ mod tests {
         let mut wrong_card = payload(&card_of(&ContactIdentity::generate()), &ROUTE, b"hi");
         wrong_card[0] = VERSION;
         assert!(matches!(open_note(&bob, &NET, &reseal(wrong_card), NOW), Err(NoteError::BadCard(_))));
-        // An expired card.
+        // A card that had expired when the request was created.
         assert!(matches!(
             open_note(&bob, &NET, &reseal(payload(&card, &ROUTE, b"hi")), 100),
             Err(NoteError::BadCard(crate::contact::ContactError::Expired))
