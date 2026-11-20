@@ -17,16 +17,21 @@
 //    the inbox key on Bob's contact card, and sends a paid request.
 // 4. Bob reads the note back from chain state, opens it with his inbox key
 //    alone (no sender address), and accepts.
-// 5. Bob calls Carol's callback key at the throwaway route over Nym (Noise
-//    IK); they swap long-lived routes inside the encrypted session.
+// 5. Once the acceptance is final, Bob calls Carol's callback key at the
+//    throwaway route over Nym (Noise IK); they swap long-lived routes inside
+//    the encrypted session. Bob and Carol run as two separate processes that
+//    share nothing but the chain and the mixnet: Bob's gets only his own
+//    wallet file and the note bytes read from chain state, so the callback
+//    key, route and request reference come only from the note he decrypts;
+//    Carol's gets only her own files and Bob's public card.
 //
 // DEV ONLY: wallets are plain files in a temporary folder, deleted at the end.
 
 import { ApiPromise, WsProvider, Keyring } from '@polkadot/api';
 import { cryptoWaitReady } from '@polkadot/util-crypto';
 import { hexToU8a, u8aToHex } from '@polkadot/util';
-import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +57,24 @@ function rust(...args) {
   );
 }
 
+/** Run an anonymum-nym subcommand as its own process; resolve with its output. */
+function process_(label, args) {
+  return new Promise((resolvePromise) => {
+    const child = spawn(BIN, args, { stdio: ['ignore', 'pipe', 'inherit'] });
+    let out = '';
+    child.stdout.on('data', (chunk) => {
+      out += chunk;
+      for (const line of chunk.toString().split(/\r?\n/)) if (line) console.log(`    [${label}] ${line}`);
+    });
+    child.on('close', (code) => {
+      const fields = Object.fromEntries(
+        out.split(/\r?\n/).filter((l) => l.includes('=')).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]),
+      );
+      resolvePromise({ code, fields });
+    });
+  });
+}
+
 function walletSigningSeed(file) {
   const line = readFileSync(file, 'utf8').split(/\r?\n/).find((l) => l.startsWith('signing='));
   return hexToU8a('0x' + line.slice('signing='.length).trim());
@@ -60,7 +83,7 @@ function walletSigningSeed(file) {
 await cryptoWaitReady();
 const api = await ApiPromise.create({ provider: new WsProvider('ws://127.0.0.1:9944'), noInitWarn: true });
 
-/** Sign, submit, wait until in a block (or finalized). Returns our events and any error. */
+/** Sign, submit, wait until finalized. Returns our events and any error. */
 function send(signer, tx) {
   return new Promise((resolvePromise, reject) => {
     tx.signAndSend(signer, ({ status, events, dispatchError }) => {
@@ -68,7 +91,7 @@ function send(signer, tx) {
         reject(new Error(`transaction ${status.type}`));
         return;
       }
-      if (!status.isInBlock && !status.isFinalized) return;
+      if (!status.isFinalized) return;
       let error = null;
       if (dispatchError) {
         const meta = dispatchError.isModule ? api.registry.findMetaError(dispatchError.asModule) : null;
@@ -80,17 +103,22 @@ function send(signer, tx) {
 }
 
 const work = mkdtempSync(join(tmpdir(), 'anonymum-e2e-'));
-const throwawayDir = join(work, 'carol-throwaway');
+// Each person's files in their own folder; Bob's process is never given Carol's.
+const bobDir = join(work, 'bob');
+const carolDir = join(work, 'carol');
+mkdirSync(bobDir);
+mkdirSync(carolDir);
+const throwawayDir = join(carolDir, 'throwaway');
 try {
   console.log(`Connected to ${await api.rpc.system.chain()}, runtime ${api.runtimeVersion.specName}`);
 
   // ---- 1. wallets -----------------------------------------------------------
   console.log('\n1. Two wallets from anonymum-crypto; their Ed25519 keys are their chain accounts.');
-  const bob = rust('wallet', join(work, 'bob.wallet'));
-  const carol = rust('wallet', join(work, 'carol.wallet'));
+  const bob = rust('wallet', join(bobDir, 'bob.wallet'));
+  const carol = rust('wallet', join(carolDir, 'carol.wallet'));
   const ed = new Keyring({ type: 'ed25519', ss58Format: 42 });
-  const bobAccount = ed.addFromSeed(walletSigningSeed(join(work, 'bob.wallet')));
-  const carolAccount = ed.addFromSeed(walletSigningSeed(join(work, 'carol.wallet')));
+  const bobAccount = ed.addFromSeed(walletSigningSeed(join(bobDir, 'bob.wallet')));
+  const carolAccount = ed.addFromSeed(walletSigningSeed(join(carolDir, 'carol.wallet')));
   check(u8aToHex(bobAccount.publicKey) === '0x' + bob.address, "Bob's chain account is his wallet's Ed25519 address");
   check(u8aToHex(carolAccount.publicKey) === '0x' + carol.address, "Carol's chain account is her wallet's Ed25519 address");
 
@@ -111,8 +139,8 @@ try {
   console.log("\n3. Carol creates a throwaway Nym client, seals a note to the inbox key on Bob's card, and requests contact.");
   const throwaway = rust('throwaway', throwawayDir);
   check(throwaway.address.length === 192, 'throwaway Nym address created (96 bytes) and persisted; client now offline');
-  const keepFile = join(work, 'carol.keep');
-  const { note } = rust('seal', '--card', bob.card, '--sender', join(work, 'carol.wallet'),
+  const keepFile = join(carolDir, 'carol.keep');
+  const { note } = rust('seal', '--card', bob.card, '--sender', join(carolDir, 'carol.wallet'),
     '--reply', throwaway.address, '--intro', INTRO, '--keep', keepFile);
   check(note.length === 2 * 587, 'sealed note is 587 bytes (admission commitment + Noise N via snow)');
   check(!note.includes(carol.address) && !note.includes(bob.address), 'no wallet address in the note');
@@ -125,18 +153,24 @@ try {
   console.log('\n4. Bob reads the request from chain state, opens the note, and accepts.');
   const onChain = (await api.query.anonymum.requests(requestId)).unwrap();
   check(onChain.note.toHex() === '0x' + note, 'the note in chain state is byte-for-byte what Carol sealed');
-  const opened = rust('open', '--wallet', join(work, 'bob.wallet'), '--note', onChain.note.toHex().slice(2));
+  const opened = rust('open', '--wallet', join(bobDir, 'bob.wallet'), '--note', onChain.note.toHex().slice(2));
   check(opened.intro === INTRO, `Bob reads the intro: "${opened.intro}"`);
   check(opened.reply === throwaway.address, "and Carol's throwaway route, with no sender hint");
   r = await send(bobAccount, api.tx.anonymum.acceptContact(requestId));
-  check(r.error === null && r.events.some((e) => e.method === 'ChannelOpened'), 'Bob accepted; channel open on chain');
+  check(r.error === null && r.events.some((e) => e.method === 'ChannelOpened'), 'Bob accepted; channel open on chain (finalized)');
 
-  // ---- 5. They talk over Nym --------------------------------------------------
-  console.log('\n5. Bob calls Carol over the live Nym mixnet at the address from the note.\n');
-  const talk = spawnSync(BIN, ['talk', '--bob', join(work, 'bob.wallet'), '--carol', join(work, 'carol.wallet'),
-    '--keep', keepFile, '--dir', throwawayDir, '--reply', opened.reply], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
-  process.stdout.write(talk.stdout.split(/\r?\n/).map((l) => '    ' + l).join('\n') + '\n');
-  check(talk.status === 0 && talk.stdout.includes('talk=ok'), 'Bob and Carol completed the handshake and swapped long-lived addresses over Nym');
+  // ---- 5. They talk over Nym, as two separate processes ---------------------
+  console.log('\n5. Two processes: Carol answers on her throwaway route; Bob opens the note from chain state and calls back.\n');
+  // Read from chain state in step 4 (accepting removes the request).
+  const noteFromChain = onChain.note.toHex().slice(2);
+  const carolRun = process_('carol', ['answer', '--carol', join(carolDir, 'carol.wallet'), '--keep', keepFile,
+    '--dir', throwawayDir, '--card', bob.card]);
+  const bobRun = process_('bob', ['callback', '--bob', join(bobDir, 'bob.wallet'), '--note', noteFromChain]);
+  const [carolEnd, bobEnd] = await Promise.all([carolRun, bobRun]);
+  check(carolEnd.code === 0 && carolEnd.fields.answer === 'ok', "Carol's process let in only Bob's callback and finished");
+  check(bobEnd.code === 0 && bobEnd.fields.callback === 'ok', "Bob's process called back from the note alone and checked Carol's contact key");
+  check(bobEnd.fields.learned === carolEnd.fields.mine && carolEnd.fields.learned === bobEnd.fields.mine,
+    'they swapped long-lived routes over Nym');
 
   console.log('\nAll end-to-end checks passed.');
 } finally {

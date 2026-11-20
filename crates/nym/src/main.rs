@@ -31,17 +31,19 @@
 //!     cargo run -p anonymum-nym
 //!
 //! Set ANONYMUM_OFFLINE_SECS to change how long Carol's throwaway client
-//! stays offline (default 60).
+//! stays offline (default 60). Set ANONYMUM_DROP_FIRST_ACK=1 to make Bob drop
+//! the first acknowledgement he sends, to watch Alice recover.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anonymum_core::{Chain, Event, MessagingKey, Params, SealedNote, Tx, COIN};
 use anonymum_crypto::wire::{Initiator, InitiatorEvent, Responder, ResponderEvent, RetryPolicy, WireError};
 use anonymum_crypto::{
-    open_note, random_bytes, seal_note, ContactCard, ContactIdentity, Ed25519Invites, Gate, Grant, Identity,
-    InviteSecret, Network, Purpose, StaticKey,
+    open_note, random_bytes, seal_note, ContactCard, ContactIdentity, ContactNote, Ed25519Invites, Grant, Identity,
+    InviteSecret, Network, Now, Purpose, StaticKey,
 };
 use nym_sdk::mixnet::{
     AnonymousSenderTag, MixnetClient, MixnetClientBuilder, MixnetMessageSender, Recipient, StoragePaths,
@@ -62,8 +64,17 @@ const RENDEZVOUS_POLICY: RetryPolicy = RetryPolicy { attempts: 2, resends: 2, ba
 /// Dave and Eve: one attempt, no resends, so the demo shows an unanswered
 /// call giving up quickly.
 const SHORT_POLICY: RetryPolicy = RetryPolicy { attempts: 1, resends: 0, base_wait: Duration::from_secs(30) };
-/// How often a responder ages its answered, unconfirmed handshakes.
-const TICK: Duration = Duration::from_secs(60);
+/// How often an idle responder checks its deadlines (they are also checked
+/// on every frame it handles).
+const EXPIRY_CHECK: Duration = Duration::from_secs(30);
+/// How long a stranger's throwaway listener accepts the recipient's callback
+/// (the request lives 48 h on this chain; gateways hold messages 24 h).
+const CALLBACK_WINDOW: Duration = Duration::from_secs(24 * 3_600);
+/// Carol's receipt for Bob's long-lived route at the end of rendezvous.
+const RECEIPT: &[u8] = b"route received";
+/// Test switch (env ANONYMUM_DROP_FIRST_ACK): Bob drops the first ACK he
+/// would send, to show the caller recover through the real driver.
+static DROP_FIRST_ACK: AtomicBool = AtomicBool::new(false);
 /// How long a responder waits for a caller to finish a handshake.
 const SERVE_PATIENCE: Duration = Duration::from_secs(600);
 
@@ -179,6 +190,10 @@ async fn run() -> Result<(), AnyError> {
     let offline = Duration::from_secs(
         std::env::var("ANONYMUM_OFFLINE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60),
     );
+    if std::env::var_os("ANONYMUM_DROP_FIRST_ACK").is_some() {
+        DROP_FIRST_ACK.store(true, Ordering::SeqCst);
+        println!("(ANONYMUM_DROP_FIRST_ACK: Bob will drop the first acknowledgement he sends.)");
+    }
 
     // ---- wallets, contact identities and chain ------------------------------
     let (alice_wallet, bob_wallet, carol_wallet) = (Identity::generate(), Identity::generate(), Identity::generate());
@@ -227,50 +242,57 @@ async fn run() -> Result<(), AnyError> {
     let carol_net = Endpoint::connect("carol (long-lived)").await?;
     // Invited contacts get Bob's route with his card, out of band.
     let bob_route = bob_net.address();
-    let mut bob_side: Responder<AnonymousSenderTag> = Responder::new(bob.handshake_key(), NETWORK, Gate::new(NETWORK));
+    let mut bob_side: Responder<AnonymousSenderTag> = Responder::for_identity(&bob, NETWORK);
 
     // ---- Alice, invited -------------------------------------------------------
     println!("\nAlice makes a caller key for Bob; Bob gives her his card, his route and an invitation to that key.");
     let alice_key = StaticKey::generate();
     let invitation = bob.invite(NETWORK, alice_key.public(), Purpose::Contact, now_secs() + 3_600);
-    bob_side.gate_mut().record_invitation(invitation.clone());
+    bob_side.record_invitation(invitation.clone(), Now::system())?;
     card.verify(&NETWORK, now_secs())?;
     invitation.verify(&card.signing_key, &NETWORK, now_secs())?;
-    println!("  Alice checked the card and the invitation (issuer, network, expiry, signature).");
+    println!("  Alice checked the card and the invitation (issuer, network, keys, expiry, signature).");
 
-    println!("\nAlice -> Bob: Noise IK handshake through the mixnet.");
+    println!("\nAlice -> Bob: Noise IK handshake, then a message and a reply, through the mixnet.");
     let started = Instant::now();
-    let (alice_end, bob_end) = tokio::join!(
-        call(&mut alice_net, &alice_key, card.handshake_key, invitation.id, bob_route, CALL_POLICY),
-        serve(&mut bob_net, &mut bob_side, SERVE_PATIENCE),
-    );
-    let (peer, alice_tag, grant) = bob_end?.ok_or("Alice never finished the handshake")?;
-    let (mut alice_call, alice_early) = alice_end?;
+    let alice_talks = async {
+        let (mut call, early) =
+            call(&mut alice_net, &alice_key, card.handshake_key, invitation.id, bob_route, CALL_POLICY).await?;
+        let confirmed = started.elapsed().as_secs_f32();
+        let sealed = call.seal(b"Hi Bob. Nobody else can read this.")?;
+        println!("  on the wire: {} bytes of ciphertext, starts {:02x?}", sealed.len(), &sealed[..12]);
+        alice_net.send(bob_route, sealed).await?;
+        let text = next_message(&mut alice_net, &mut call, early).await?;
+        Ok::<_, AnyError>((call.attempt(), confirmed, text))
+    };
+    let bob_answers = async {
+        let (peer, tag, grant) =
+            serve(&mut bob_net, &mut bob_side, SERVE_PATIENCE).await?.ok_or("Alice never finished the handshake")?;
+        // Bob keeps reading: a resent CONFIRM gets its ACK again, then
+        // Alice's message arrives.
+        let (_, plaintext, reply_tag) = next_delivery(&mut bob_net, &mut bob_side, tag).await?;
+        bob_net.reply(reply_tag, bob_side.seal(&reply_tag, b"Hi Alice. Got it.", Now::system())?).await?;
+        Ok::<_, AnyError>((peer, grant, plaintext))
+    };
+    let (alice_end, bob_end) = tokio::join!(alice_talks, bob_answers);
+    let (peer, grant, plaintext) = bob_end?;
+    let (attempts, confirmed, text) = alice_end?;
+    let why = match grant {
+        Grant::Invitation { .. } => "her invitation",
+        Grant::Contact => "a contact",
+        Grant::Callback => "a callback",
+    };
     println!(
-        "  Bob let in caller key {} ({grant:?}; Alice's: {}) and acknowledged; Alice confirmed after {:.1}s ({} attempt(s)). Invitation now used: {}",
+        "  Bob let in caller key {} ({why}; Alice's: {}); Alice confirmed after {confirmed:.1}s ({attempts} attempt(s)). Invitation now used: {}",
         short(&peer),
         peer == alice_key.public(),
-        started.elapsed().as_secs_f32(),
-        alice_call.attempt(),
         bob_side.gate().is_honoured(&invitation.id)
     );
+    println!("  Bob reads: {:?}", String::from_utf8_lossy(&plaintext));
+    println!("  Alice reads Bob's reply (via reply blocks; Bob never learns where she is): {:?}", String::from_utf8_lossy(&text));
     if grant != (Grant::Invitation { id: invitation.id }) {
         return Err("Alice should have come in on her invitation".into());
     }
-
-    println!("\nAlice -> Bob: a message.");
-    let started = Instant::now();
-    let sealed = alice_call.seal(b"Hi Bob. Nobody else can read this.")?;
-    println!("  on the wire: {} bytes of ciphertext, starts {:02x?}", sealed.len(), &sealed[..12]);
-    alice_net.send(bob_route, sealed).await?;
-    let (_, plaintext, reply_tag) = next_delivery(&mut bob_net, &mut bob_side, alice_tag).await?;
-    println!("  Bob reads: {:?} ({:.1}s)", String::from_utf8_lossy(&plaintext), started.elapsed().as_secs_f32());
-
-    println!("\nBob -> Alice: reply through anonymous reply blocks (Bob never learns where Alice is).");
-    let started = Instant::now();
-    bob_net.reply(reply_tag, bob_side.seal(&reply_tag, b"Hi Alice. Got it.")?).await?;
-    let text = next_message(&mut alice_net, &mut alice_call, alice_early).await?;
-    println!("  Alice reads: {:?} ({:.1}s)", String::from_utf8_lossy(&text), started.elapsed().as_secs_f32());
 
     // ---- Carol, a stranger, by note and reverse rendezvous ---------------------
     println!("\nCarol -> Bob: a stranger. Bob's route is not published; she has only his card.");
@@ -282,7 +304,15 @@ async fn run() -> Result<(), AnyError> {
     // Stand-in for the admission commitment (the transparent chain has none).
     let admission = random_bytes();
     let intro = "Hello Bob, it's Carol from the climbing club. Can we talk about Saturday?";
-    let note = seal_note(&card.inbox_key, &carol, &callback.public(), &throwaway_route.to_bytes(), intro, &admission)?;
+    let note = seal_note(
+        &NETWORK,
+        &card.inbox_key,
+        &carol,
+        &callback.public(),
+        &throwaway_route.to_bytes(),
+        intro,
+        &admission,
+    )?;
     println!("  sealed note: {} bytes, same size for every request, opens with Bob's inbox key alone", note.0.len());
     let events = chain.apply(
         carol_wallet.address(),
@@ -296,38 +326,49 @@ async fn run() -> Result<(), AnyError> {
     println!("  Carol's throwaway client goes offline (kept on disk).");
 
     // Bob's client tries his inbox key on the request's note: no sender
-    // address or hint is used.
+    // address or hint. Everything he needs to call back comes from the note.
     let req = chain.request(request).ok_or("request vanished")?.clone();
-    let opened = open_note(&bob, &req.note)?;
+    let opened = open_note(&bob, &NETWORK, &req.note)?;
     println!(
         "  Bob's client opens the note with his inbox key alone. Sender's contact key {}, intro: {:?}",
         short(&opened.sender),
         opened.intro
     );
-    if opened.sender != carol.signing_key() || opened.callback != callback.public() {
-        return Err("note carried the wrong sender or callback key".into());
-    }
-    let reply_to = Recipient::try_from_bytes(opened.route)?;
     chain.apply(bob_wallet.address(), Tx::AcceptContact { request })?;
     println!("  On-chain: Bob accepts (the claim is final in this simulation).");
 
-    println!("\nBob calls Carol's callback key at the throwaway route; she is offline for {}s.", offline.as_secs());
+    println!(
+        "\nBob calls the callback key from the note at its throwaway route; Carol is offline for {}s.",
+        offline.as_secs()
+    );
     println!("Eve learned the route and calls too.");
-    let eve_net = Endpoint::connect("eve").await?;
-    rendezvous(
-        &mut bob_net,
-        &bob,
-        &card,
-        &carol,
-        &callback,
-        opened.admission,
-        carol_net.address(),
-        reply_to,
-        &throwaway_dir,
-        offline,
-        Some(eve_net),
-    )
-    .await?;
+    let mut eve_net = Endpoint::connect("eve").await?;
+    let started = Instant::now();
+    let reply_to = Recipient::try_from_bytes(opened.route)?;
+    let bob_calls = recipient_side(&mut bob_net, &bob, &opened);
+    let eve_calls = async {
+        let eve_key = StaticKey::generate();
+        let result = call(&mut eve_net, &eve_key, opened.callback, opened.admission, reply_to, SHORT_POLICY).await;
+        Ok::<_, AnyError>(result.is_ok())
+    };
+    let carol_answers = stranger_side(&throwaway_dir, &callback, &card, admission, &carol, carol_net.address(), offline);
+    let (bob_end, eve_end, carol_end) = tokio::join!(bob_calls, eve_calls, carol_answers);
+    let carol_route = bob_end?;
+    let bob_route_learned = carol_end?;
+    if eve_end? {
+        return Err("Eve's call was answered".into());
+    }
+    println!("  Eve's call: nothing came back; she gave up.");
+    println!(
+        "  Routes swapped after {:.0}s: Bob has Carol's ({}), Carol has Bob's ({}).",
+        started.elapsed().as_secs_f32(),
+        carol_route == carol_net.address(),
+        bob_route_learned == bob_route
+    );
+    if carol_route != carol_net.address() || bob_route_learned != bob_route {
+        return Err("route exchange failed".into());
+    }
+    eve_net.client.disconnect().await;
 
     // ---- Dave: Bob's real card and route, no invitation ---------------------------
     println!("\nDave -> Bob: he has Bob's real card and route, but no invitation.");
@@ -355,105 +396,90 @@ async fn run() -> Result<(), AnyError> {
     Ok(())
 }
 
-/// Bob calls Carol's callback key at her throwaway route (retrying). Carol's
-/// throwaway client comes back after `offline` and answers only Bob's
-/// handshake key, about this request; inside the session the two swap
-/// long-lived routes. Then Carol discards the throwaway client and deletes
-/// it from disk. If `eve` is given, Eve calls the throwaway route too and
-/// must get nothing. Shared by the demo and `talk`.
-#[allow(clippy::too_many_arguments)]
-async fn rendezvous(
-    bob_net: &mut Endpoint,
-    bob: &ContactIdentity,
-    bob_card: &ContactCard,
-    carol: &ContactIdentity,
-    callback: &StaticKey,
-    reference: [u8; 32],
-    carol_long_lived: Recipient,
-    reply_to: Recipient,
+/// The recipient's half of reverse rendezvous. Everything comes from the
+/// note the recipient opened: the callback key to call, the route to call it
+/// at, the request reference to name, and the sender's contact key the
+/// stranger must present. Calls (retrying), checks the presented contact
+/// key, and swaps long-lived routes. Returns the stranger's route.
+async fn recipient_side(net: &mut Endpoint, me: &ContactIdentity, note: &ContactNote) -> Result<Recipient, AnyError> {
+    let route = Recipient::try_from_bytes(note.route)?;
+    let my_route = net.address();
+    let (mut call, early) =
+        call(net, me.handshake_key(), note.callback, note.admission, route, RENDEZVOUS_POLICY).await?;
+    println!("  Bob: the stranger's side acknowledged (attempt {}).", call.attempt());
+    let text = String::from_utf8(next_message(net, &mut call, early).await?)?;
+    let (their_route, their_key) = text.split_once(' ').ok_or("malformed hello")?;
+    if their_key != to_hex(&note.sender) {
+        return Err("the stranger presented a contact key other than the note's sender".into());
+    }
+    let their_route: Recipient = their_route.parse()?;
+    println!("  Bob: Carol presented the contact key from the note and her long-lived route.");
+    net.send(route, call.seal(my_route.to_string().as_bytes())?).await?;
+    // Wait for Carol's receipt before going on (or exiting): a client that
+    // disconnects at once can lose what it just sent.
+    let receipt = next_message(net, &mut call, None).await?;
+    if receipt != RECEIPT {
+        return Err("unexpected reply instead of the receipt".into());
+    }
+    println!("  Bob: Carol confirmed she has his route.");
+    Ok(their_route)
+}
+
+/// The stranger's half of reverse rendezvous. The throwaway client comes
+/// back after `offline` and answers only the recipient's handshake key (from
+/// the card the note was sealed to), naming this request, within
+/// CALLBACK_WINDOW. It sends the stranger's long-lived route and contact key
+/// at once, learns the recipient's route, and is deleted from disk.
+async fn stranger_side(
     throwaway_dir: &PathBuf,
+    callback: &StaticKey,
+    recipient_card: &ContactCard,
+    reference: [u8; 32],
+    me: &ContactIdentity,
+    my_long_lived: Recipient,
     offline: Duration,
-    eve: Option<Endpoint>,
-) -> Result<(), AnyError> {
+) -> Result<Recipient, AnyError> {
+    tokio::time::sleep(offline).await;
     let started = Instant::now();
-    let bob_route = bob_net.address();
-    let bob_calls = call(bob_net, bob.handshake_key(), callback.public(), reference, reply_to, RENDEZVOUS_POLICY);
-    let eve_calls = async {
-        let Some(mut eve_net) = eve else { return Ok::<_, AnyError>(None) };
-        let eve_key = StaticKey::generate();
-        let result = call(&mut eve_net, &eve_key, callback.public(), reference, reply_to, SHORT_POLICY).await;
-        eve_net.client.disconnect().await;
-        Ok(Some(result.is_ok()))
-    };
-    let carol_answers = async {
-        tokio::time::sleep(offline).await;
-        let mut throwaway = Endpoint::connect_persistent("carol (throwaway, back online)", throwaway_dir).await?;
-        if throwaway.address() != reply_to {
-            return Err::<_, AnyError>("throwaway client came back with a different address".into());
-        }
-        let mut gate = Gate::new(NETWORK);
-        gate.expect_callback(bob_card.handshake_key, reference);
-        let mut carol_side: Responder<AnonymousSenderTag> = Responder::new(callback, NETWORK, gate);
-        let (peer, tag, grant) = serve(&mut throwaway, &mut carol_side, SERVE_PATIENCE)
-            .await?
-            .ok_or("Bob's callback never finished")?;
-        if peer != bob_card.handshake_key || grant != Grant::Callback {
-            return Err("Carol let in someone other than Bob".into());
-        }
-        println!(
-            "  Carol's throwaway let in Bob's key only, {:.0}s after his first call (held by her gateway).",
-            started.elapsed().as_secs_f32()
-        );
-        Ok((throwaway, carol_side, tag))
-    };
-    let (bob_call, eve_end, carol_end) = tokio::join!(bob_calls, eve_calls, carol_answers);
-    let (mut bob_to_carol, bob_early) = bob_call?;
-    let (mut throwaway, mut carol_side, bob_tag) = carol_end?;
-    match eve_end? {
-        Some(true) => return Err("Eve's call was answered".into()),
-        Some(false) => println!("  Eve's call: nothing came back; she gave up."),
-        None => {}
+    let mut throwaway = Endpoint::connect_persistent("carol (throwaway, back online)", throwaway_dir).await?;
+    let mut side: Responder<AnonymousSenderTag> = Responder::for_callback(
+        callback,
+        NETWORK,
+        recipient_card.handshake_key,
+        reference,
+        Instant::now() + CALLBACK_WINDOW,
+    )?;
+    let (peer, tag, grant) =
+        serve(&mut throwaway, &mut side, SERVE_PATIENCE).await?.ok_or("Bob's callback never finished")?;
+    if peer != recipient_card.handshake_key || grant != Grant::Callback {
+        return Err("the throwaway let in someone other than the recipient".into());
     }
     println!(
-        "  Session confirmed after {:.0}s ({} attempt(s)). Bob is the caller.",
-        started.elapsed().as_secs_f32(),
-        bob_to_carol.attempt()
+        "  Carol's throwaway let in Bob's key only ({:.0}s after coming back online; his call was held by her gateway).",
+        started.elapsed().as_secs_f32()
     );
-
-    println!("\nInside the session they swap long-lived routes and Carol presents her contact key.");
-    let hello = format!("{carol_long_lived} {}", to_hex(&carol.signing_key()));
-    throwaway.reply(bob_tag, carol_side.seal(&bob_tag, hello.as_bytes())?).await?;
-    let text = String::from_utf8(next_message(bob_net, &mut bob_to_carol, bob_early).await?)?;
-    let (route, key) = text.split_once(' ').ok_or("malformed hello")?;
-    let learned: Recipient = route.parse()?;
-    println!(
-        "  Bob learns Carol's long-lived route (matches {}) and her contact key (matches the note: {})",
-        learned == carol_long_lived,
-        key == to_hex(&carol.signing_key())
-    );
-    if learned != carol_long_lived {
-        return Err("route exchange failed".into());
-    }
-
-    bob_net.send(reply_to, bob_to_carol.seal(bob_route.to_string().as_bytes())?).await?;
-    let (_, plaintext, _) = next_delivery(&mut throwaway, &mut carol_side, bob_tag).await?;
+    // Sent at once: a valid message also establishes the session for Bob if
+    // our ACK was lost.
+    let hello = format!("{my_long_lived} {}", to_hex(&me.signing_key()));
+    throwaway.reply(tag, side.seal(&tag, hello.as_bytes(), Now::system())?).await?;
+    let (_, plaintext, _) = next_delivery(&mut throwaway, &mut side, tag).await?;
     let learned: Recipient = String::from_utf8(plaintext)?.parse()?;
-    println!("  Carol learns Bob's long-lived route: matches {}", learned == bob_route);
-    if learned != bob_route {
-        return Err("route exchange failed".into());
-    }
-
+    throwaway.reply(tag, side.seal(&tag, RECEIPT, Now::system())?).await?;
+    // Give the receipt time to leave before the throwaway disconnects.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     throwaway.client.disconnect().await;
     std::fs::remove_dir_all(throwaway_dir)?;
-    println!("  Carol discards the throwaway client and deletes it from disk.");
-    Ok(())
+    println!("  Carol learned Bob's long-lived route and deleted the throwaway client.");
+    Ok(learned)
 }
 
 // ---- subcommands for the end-to-end run against a dev node (audit F8) ------
 //
 // `substrate/scripts/e2e.mjs` drives these: it does the chain transactions
 // (Polkadot.js, signing with each wallet's Ed25519 account key) and calls
-// this binary for everything cryptographic and for the mixnet.
+// this binary for everything cryptographic and for the mixnet. The two
+// people run as separate processes that share only the chain and the
+// mixnet.
 //
 //   anonymum-nym wallet <file>       create (or load) a wallet and a separate
 //                                    contact identity; print the address,
@@ -462,9 +488,13 @@ async fn rendezvous(
 //                                    print its address, then go offline
 //   anonymum-nym seal --card HEX --sender F --reply R --intro TEXT --keep F
 //                                    seal a note; keep the callback key and
-//                                    admission stand-in in file F
+//                                    admission stand-in in Carol's file F
 //   anonymum-nym open --wallet F --note HEX    (no sender hint)
-//   anonymum-nym talk --bob F --carol F --keep F --dir D --reply R
+//   anonymum-nym answer --carol F --keep F --dir D --card HEX
+//                                    Carol's process: answer Bob's callback
+//   anonymum-nym callback --bob F --note HEX
+//                                    Bob's process: open the note himself
+//                                    and call back
 //
 // Wallet files hold the private keys in hex. DEV ONLY: they are plain files
 // for this test, not encrypted storage.
@@ -478,7 +508,8 @@ async fn dispatch() -> Result<(), AnyError> {
         Some("throwaway") => cmd_throwaway(rest).await,
         Some("seal") => cmd_seal(rest),
         Some("open") => cmd_open(rest),
-        Some("talk") => cmd_talk(rest).await,
+        Some("answer") => cmd_answer(rest).await,
+        Some("callback") => cmd_callback(rest).await,
         Some(other) => Err(format!("unknown command {other:?}").into()),
     }
 }
@@ -572,6 +603,7 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
     let callback = StaticKey::generate();
     let admission = random_bytes();
     let note = seal_note(
+        &NETWORK,
         &card.inbox_key,
         &sender,
         &callback.public(),
@@ -590,7 +622,7 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
 fn cmd_open(args: &[String]) -> Result<(), AnyError> {
     let contact = load_contact(flag(args, "--wallet")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
-    let opened = open_note(&contact, &note)?;
+    let opened = open_note(&contact, &NETWORK, &note)?;
     println!("reply={}", to_hex(&opened.route));
     println!("sender={}", to_hex(&opened.sender));
     println!("callback={}", to_hex(&opened.callback));
@@ -599,24 +631,38 @@ fn cmd_open(args: &[String]) -> Result<(), AnyError> {
     Ok(())
 }
 
-async fn cmd_talk(args: &[String]) -> Result<(), AnyError> {
-    let bob = load_contact(flag(args, "--bob")?)?;
+/// Carol's process: her own contact identity and keep file, Bob's public
+/// card, her throwaway directory. Nothing of Bob's private state.
+async fn cmd_answer(args: &[String]) -> Result<(), AnyError> {
     let carol = load_contact(flag(args, "--carol")?)?;
     let keep = flag(args, "--keep")?;
     let callback = StaticKey::from_bytes(field(keep, "callback")?);
     let admission = field(keep, "admission")?;
+    let card = ContactCard::from_bytes(&from_hex(flag(args, "--card")?)?)?;
+    card.verify(&NETWORK, now_secs())?;
     let dir = PathBuf::from(flag(args, "--dir")?);
-    let reply_to = Recipient::try_from_bytes(fixed::<96>(flag(args, "--reply")?)?)?;
-    let card = bob.card(NETWORK, COIN, 0, now_secs() + 86_400);
-    println!("Connecting Bob's and Carol's long-lived clients...");
-    let mut bob_net = Endpoint::connect("bob").await?;
     let carol_net = Endpoint::connect("carol (long-lived)").await?;
-    println!("\nBob calls Carol's callback key at the throwaway route from her note.");
-    rendezvous(&mut bob_net, &bob, &card, &carol, &callback, admission, carol_net.address(), reply_to, &dir, Duration::ZERO, None)
-        .await?;
+    let learned = stranger_side(&dir, &callback, &card, admission, &carol, carol_net.address(), Duration::ZERO).await?;
+    println!("mine={}", carol_net.address());
     carol_net.client.disconnect().await;
+    println!("learned={learned}");
+    println!("answer=ok");
+    Ok(())
+}
+
+/// Bob's process: his own wallet file and the note bytes as read from the
+/// chain. The callback key, route and request reference come only from the
+/// note he decrypts.
+async fn cmd_callback(args: &[String]) -> Result<(), AnyError> {
+    let bob = load_contact(flag(args, "--bob")?)?;
+    let note = SealedNote(from_hex(flag(args, "--note")?)?);
+    let opened = open_note(&bob, &NETWORK, &note)?;
+    let mut bob_net = Endpoint::connect("bob").await?;
+    let learned = recipient_side(&mut bob_net, &bob, &opened).await?;
+    println!("mine={}", bob_net.address());
     bob_net.client.disconnect().await;
-    println!("talk=ok");
+    println!("learned={learned}");
+    println!("callback=ok");
     Ok(())
 }
 
@@ -674,10 +720,11 @@ async fn call(
     }
 }
 
-/// Answer authorised callers until one confirms a session; send it the ACK.
-/// Unauthorised callers are sent nothing. Returns `Ok(None)` if nobody
-/// confirmed within `patience`. Answered but unconfirmed handshakes are
-/// dropped after a few ticks.
+/// Answer authorised callers until one confirms a session; send it the ACK
+/// (unless the ACK-loss test switch drops the first one). Unauthorised
+/// callers are sent nothing. Returns `Ok(None)` if nobody confirmed within
+/// `patience`. Callers keep reading afterwards (`next_delivery`), so a
+/// resent CONFIRM gets its ACK again.
 async fn serve(
     net: &mut Endpoint,
     side: &mut Responder<AnonymousSenderTag>,
@@ -685,10 +732,10 @@ async fn serve(
 ) -> Result<Option<([u8; 32], AnonymousSenderTag, Grant)>, AnyError> {
     let give_up = tokio::time::Instant::now() + patience;
     loop {
-        let deadline = give_up.min(tokio::time::Instant::now() + TICK);
+        let deadline = give_up.min(tokio::time::Instant::now() + EXPIRY_CHECK);
         match net.receive_until(deadline).await? {
             None => {
-                for _ in side.tick() {
+                for _ in side.expire(Now::system()).pending {
                     println!("  {} drops a handshake that was never confirmed", net.name);
                 }
                 if tokio::time::Instant::now() >= give_up {
@@ -696,10 +743,14 @@ async fn serve(
                 }
             }
             Some((_, None)) => println!("  {} ignores a frame without reply blocks", net.name),
-            Some((frame, Some(tag))) => match side.handle(tag, &frame, now_secs()) {
+            Some((frame, Some(tag))) => match side.handle(tag, &frame, Now::system()) {
                 Ok(ResponderEvent::Reply(reply)) => net.reply(tag, reply).await?,
                 Ok(ResponderEvent::Established { peer, grant, reply }) => {
-                    net.reply(tag, reply).await?;
+                    if DROP_FIRST_ACK.swap(false, Ordering::SeqCst) {
+                        println!("  {}: (test) drops its first acknowledgement", net.name);
+                    } else {
+                        net.reply(tag, reply).await?;
+                    }
                     return Ok(Some((peer, tag, grant)));
                 }
                 Ok(ResponderEvent::Message { .. }) => println!("  {} ignores a message during a handshake", net.name),
@@ -722,9 +773,12 @@ async fn next_delivery(
     loop {
         let (frame, tag) = net.receive().await?;
         let tag = tag.unwrap_or(fallback);
-        match side.handle(tag, &frame, now_secs()) {
+        match side.handle(tag, &frame, Now::system()) {
             Ok(ResponderEvent::Message { peer, plaintext }) => return Ok((peer, plaintext, tag)),
-            Ok(ResponderEvent::Reply(reply)) => net.reply(tag, reply).await?,
+            Ok(ResponderEvent::Reply(reply)) => {
+                println!("  {}: a repeated frame; sends its cached answer again", net.name);
+                net.reply(tag, reply).await?
+            }
             Ok(other) => println!("  {} ignores {other:?}", net.name),
             Err(error) => println!("  {} ignores a frame: {error}", net.name),
         }
@@ -746,4 +800,3 @@ async fn next_message(net: &mut Endpoint, call: &mut Initiator, early: Option<Ve
         }
     }
 }
-

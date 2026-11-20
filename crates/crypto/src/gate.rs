@@ -8,7 +8,7 @@
 //!   network, and not yet honoured;
 //! * an existing contact; or
 //! * an expected callback: the recipient of a request this side made,
-//!   calling about that request (reverse rendezvous);
+//!   calling about that request before its deadline (reverse rendezvous);
 //!
 //! and in every case not blocked, with the reference named inside the
 //! encrypted first message matching. Anyone else gets no reply at all.
@@ -17,10 +17,48 @@
 //! recorded as a contact) once the caller has confirmed a fresh session, so
 //! a replayed first message cannot use an invitation twice; and a blocked
 //! key is refused whatever it replays.
+//!
+//! The gate belongs to one [`crate::wire::Responder`], built from the same
+//! network id, and can only be changed through that responder, so a
+//! revocation always ends sessions and drops cached replies with it. It has
+//! no public constructor:
+//!
+//! ```compile_fail
+//! let gate = anonymum_crypto::Gate::new([0; 32]);
+//! ```
+//!
+//! and no public way to change it from outside a responder:
+//!
+//! ```compile_fail
+//! # use anonymum_crypto::{wire::Responder, ContactIdentity};
+//! let me = ContactIdentity::generate();
+//! let mut side: Responder<u32> = Responder::for_identity(&me, [0; 32]);
+//! side.gate_mut().block([1; 32]);
+//! ```
+//!
+//! State lives in memory only: durable and multi-device grant state is an
+//! open question (issues file, review finding 8).
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::contact::{Invitation, Network, Purpose};
+use crate::contact::{check_key, ContactError, Invitation, Network, Purpose};
+
+/// The time, as the gate and the wire layer need it: wall-clock seconds for
+/// invitation expiry (an absolute date both sides can check) and a monotonic
+/// instant for deadlines. Tests inject both.
+#[derive(Clone, Copy, Debug)]
+pub struct Now {
+    pub unix: u64,
+    pub mono: Instant,
+}
+
+impl Now {
+    pub fn system() -> Now {
+        let unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        Now { unix, mono: Instant::now() }
+    }
+}
 
 /// Why a caller was let in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,83 +71,117 @@ pub enum Grant {
     Callback,
 }
 
-#[derive(Default)]
 pub struct Gate {
     network: Network,
+    /// Our contact signing key, if we issue invitations.
+    issuer: Option<[u8; 32]>,
     /// Invitations we issued and have not honoured, by holder key.
     issued: HashMap<[u8; 32], Invitation>,
     honoured: HashSet<[u8; 32]>,
     /// Caller key -> the reference its calls must name.
     contacts: HashMap<[u8; 32], [u8; 32]>,
-    callbacks: HashMap<[u8; 32], [u8; 32]>,
+    /// Caller key -> (reference, deadline).
+    callbacks: HashMap<[u8; 32], ([u8; 32], Instant)>,
     blocked: HashSet<[u8; 32]>,
 }
 
 impl Gate {
-    pub fn new(network: Network) -> Self {
-        Gate { network, ..Default::default() }
+    pub(crate) fn new(network: Network, issuer: Option<[u8; 32]>) -> Self {
+        Gate {
+            network,
+            issuer,
+            issued: HashMap::new(),
+            honoured: HashSet::new(),
+            contacts: HashMap::new(),
+            callbacks: HashMap::new(),
+            blocked: HashSet::new(),
+        }
     }
 
-    /// Remember an invitation we issued, so its holder can call.
-    pub fn record_invitation(&mut self, invitation: Invitation) {
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Remember an invitation so its holder can call. It must be one we
+    /// issued (our signing key, valid signature), for our network, with a
+    /// valid holder key, and unexpired at `now`.
+    pub(crate) fn record_invitation(&mut self, invitation: Invitation, now: Now) -> Result<(), ContactError> {
+        let issuer = self.issuer.ok_or(ContactError::WrongIssuer)?;
+        invitation.verify(&issuer, &self.network, now.unix)?;
         self.issued.insert(invitation.holder, invitation);
+        Ok(())
     }
 
-    /// Accept a call from `caller` about the request `reference` (the
-    /// stranger's side of reverse rendezvous).
-    pub fn expect_callback(&mut self, caller: [u8; 32], reference: [u8; 32]) {
-        self.callbacks.insert(caller, reference);
+    /// Accept a call from `caller` about the request `reference` until
+    /// `deadline` (the stranger's side of reverse rendezvous).
+    pub(crate) fn expect_callback(
+        &mut self,
+        caller: [u8; 32],
+        reference: [u8; 32],
+        deadline: Instant,
+    ) -> Result<(), ContactError> {
+        check_key(&caller)?;
+        self.callbacks.insert(caller, (reference, deadline));
+        Ok(())
     }
 
-    pub fn add_contact(&mut self, caller: [u8; 32], reference: [u8; 32]) {
-        self.contacts.insert(caller, reference);
-    }
-
-    /// End a relationship (without blocking).
-    pub fn remove_contact(&mut self, caller: &[u8; 32]) {
+    pub(crate) fn remove_contact(&mut self, caller: &[u8; 32]) {
         self.contacts.remove(caller);
+    }
+
+    pub(crate) fn block(&mut self, caller: [u8; 32]) {
+        self.blocked.insert(caller);
+    }
+
+    pub(crate) fn unblock(&mut self, caller: &[u8; 32]) {
+        self.blocked.remove(caller);
     }
 
     pub fn is_contact(&self, caller: &[u8; 32]) -> bool {
         self.contacts.contains_key(caller)
     }
 
-    pub fn block(&mut self, caller: [u8; 32]) {
-        self.blocked.insert(caller);
-    }
-
-    pub fn unblock(&mut self, caller: &[u8; 32]) {
-        self.blocked.remove(caller);
+    pub fn is_blocked(&self, caller: &[u8; 32]) -> bool {
+        self.blocked.contains(caller)
     }
 
     pub fn is_honoured(&self, invitation_id: &[u8; 32]) -> bool {
         self.honoured.contains(invitation_id)
     }
 
-    /// May `caller`, naming `reference`, be answered at time `now`?
-    pub fn authorise(&self, caller: &[u8; 32], reference: &[u8; 32], now: u64) -> Option<Grant> {
+    /// Is `caller` a current, unblocked contact for `reference`? Checked on
+    /// every use of an established session.
+    pub fn admits(&self, caller: &[u8; 32], reference: &[u8; 32]) -> bool {
+        !self.blocked.contains(caller) && self.contacts.get(caller) == Some(reference)
+    }
+
+    /// May `caller`, naming `reference`, be answered at `now`?
+    pub fn authorise(&self, caller: &[u8; 32], reference: &[u8; 32], now: Now) -> Option<Grant> {
         if self.blocked.contains(caller) {
             return None;
         }
         if self.contacts.get(caller) == Some(reference) {
             return Some(Grant::Contact);
         }
-        if self.callbacks.get(caller) == Some(reference) {
-            return Some(Grant::Callback);
+        if let Some((expected, deadline)) = self.callbacks.get(caller) {
+            if expected == reference && now.mono < *deadline {
+                return Some(Grant::Callback);
+            }
         }
         let invitation = self.issued.get(caller)?;
         let usable = &invitation.id == reference
             && invitation.network == self.network
             && invitation.purpose == Purpose::Contact
-            && now < invitation.expires_at
+            && now.unix < invitation.expires_at
             && !self.honoured.contains(&invitation.id);
         usable.then_some(Grant::Invitation { id: invitation.id })
     }
 
     /// After a fresh session confirmation: check again and commit the grant.
     /// Returns `false` (and changes nothing) if it no longer holds, e.g. the
-    /// caller was blocked meanwhile or the invitation was honoured already.
-    pub(crate) fn commit(&mut self, caller: &[u8; 32], reference: &[u8; 32], grant: Grant, now: u64) -> bool {
+    /// caller was blocked meanwhile, the invitation was honoured already or
+    /// the callback deadline passed.
+    pub(crate) fn commit(&mut self, caller: &[u8; 32], reference: &[u8; 32], grant: Grant, now: Now) -> bool {
         if self.authorise(caller, reference, now) != Some(grant) {
             return false;
         }

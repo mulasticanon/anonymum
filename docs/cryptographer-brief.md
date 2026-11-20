@@ -49,7 +49,7 @@ to write that bounded statement is part of the request.
 | Item | Where | Status |
 |---|---|---|
 | Shielded design specification, v0.7 | `docs/shielded-spec-v0.md` | **The main thing to review.** Rules only; no cryptographic suite chosen |
-| Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I27, questions raised while prototyping section 2a |
+| Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I27, questions raised while prototyping section 2a; R1-R12, the source review of cdad354 and their status |
 | Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 51 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
 | Research report | `docs/Shielded_Payments_Technical_Research_2026-11-19.md` | 25,000 words, AI-written. Two claims spot-checked against primary sources (ZIP 257; Polkadot RFC-0163). The rest unchecked |
 | Alternative, heavier protocol | `docs/Shielded_Payments_Protocol_v0.1.md` | AI-written. Kept for comparison; section 8 of the spec lists the differences |
@@ -154,6 +154,18 @@ composition and whether it answers questions 11 and 12:
   that cost against forwarding a note to a third person and claiming
   another identity?
 - `invite.rs`: the transparent chain's one-time invites (Ed25519), kept.
+- Since the source review of cdad354 (`docs/source-review-cdad354-2026-11-20.md`,
+  AI-written): revocation is atomic, received X25519 keys are checked for
+  small order with `x25519-dalek`'s `was_contributory` (ephemeral keys
+  inside `snow` are not; see the issues file), the call id and attempt are
+  in the IK prologue, every sealed record carries its type, and pending
+  handshakes, idle sessions and callback grants expire by deadline.
+- **Open questions for you** (issues file, "Open questions recorded
+  2026-11-20"): durable and multi-device grant state; Bob's callback using
+  the handshake key on his card (I16); the note signature as transferable
+  proof (I27); timing equivalence between authorised and unauthorised
+  callers, which nobody has measured; and whether the unchecked ephemeral
+  keys inside `snow` are acceptable.
 - Known limits: IK's replayable message 1 (a still-authorised caller's
   recorded message 1 gets a reply: an availability signal, question 11);
   IK's weaker caller privacy if the answerer's handshake key leaks; Noise N

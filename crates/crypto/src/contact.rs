@@ -37,6 +37,11 @@ pub enum ContactError {
     WrongIssuer,
     UnknownPurpose,
     Malformed,
+    /// An X25519 public key whose key agreement would not depend on our
+    /// secret (a small-order point; RFC 7748 section 6.1).
+    WeakKey,
+    /// A price that does not fit the shielded design's 64-bit amounts.
+    PriceOutOfRange,
 }
 
 impl fmt::Display for ContactError {
@@ -54,6 +59,33 @@ pub fn random_bytes() -> [u8; 32] {
     OsRng.fill_bytes(&mut out);
     out
 }
+
+/// Is `public` an X25519 key whose key agreement depends on our secret?
+///
+/// RFC 7748 section 6.1 lets a party check that the shared secret is not
+/// all zeros. We use x25519-dalek's own facility for that check,
+/// `SharedSecret::was_contributory`, on an agreement between `public` and a
+/// fresh random secret. Clamped X25519 scalars are multiples of the
+/// cofactor, so the result is all zeros for every secret exactly when
+/// `public` has small order; one fresh secret therefore decides it. No list
+/// of bad points is kept here. Applied to every X25519 key we receive from
+/// someone else: card keys, invitation holder keys, a note's callback key,
+/// the key a caller presents, and the keys we are asked to call or seal to.
+pub fn is_contributory_key(public: &[u8; 32]) -> bool {
+    StaticSecret::random_from_rng(OsRng).diffie_hellman(&PublicKey::from(*public)).was_contributory()
+}
+
+pub(crate) fn check_key(public: &[u8; 32]) -> Result<(), ContactError> {
+    if is_contributory_key(public) {
+        Ok(())
+    } else {
+        Err(ContactError::WeakKey)
+    }
+}
+
+/// Largest price a card may quote: the shielded design's amounts are
+/// unsigned 64-bit (spec section 3).
+pub const MAX_PRICE: Amount = u64::MAX as Amount;
 
 /// An X25519 private key: a handshake key, an inbox key, or a caller key.
 #[derive(Clone)]
@@ -205,11 +237,16 @@ impl ContactCard {
         out
     }
 
-    /// Signature, network and validity at time `now`.
+    /// Signature, network, keys, price and validity at time `now`.
     pub fn verify(&self, network: &Network, now: u64) -> Result<(), ContactError> {
         verify(&self.signing_key, &self.signed_bytes(), &self.signature)?;
         if &self.network != network {
             return Err(ContactError::WrongNetwork);
+        }
+        check_key(&self.handshake_key)?;
+        check_key(&self.inbox_key)?;
+        if self.price > MAX_PRICE {
+            return Err(ContactError::PriceOutOfRange);
         }
         if now < self.not_before {
             return Err(ContactError::NotYetValid);
@@ -312,6 +349,7 @@ impl Invitation {
             return Err(ContactError::WrongNetwork);
         }
         verify(&self.issuer, &self.signed_bytes(), &self.signature)?;
+        check_key(&self.holder)?;
         if now >= self.expires_at {
             return Err(ContactError::Expired);
         }
@@ -348,5 +386,91 @@ impl Invitation {
             id: take(bytes, at),
             signature: take(bytes, at),
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// Small-order points on Curve25519 and their non-canonical encodings
+    /// (the u-coordinates 0, 1, the two order-8 points, p-1, p, p+1), as
+    /// listed for X25519 implementations; used only as test vectors here.
+    pub(crate) const SMALL_ORDER: [[u8; 32]; 7] = [
+        hex32("0000000000000000000000000000000000000000000000000000000000000000"),
+        hex32("0100000000000000000000000000000000000000000000000000000000000000"),
+        hex32("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        hex32("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+        hex32("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+        hex32("eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"),
+    ];
+
+    const fn hex32(s: &str) -> [u8; 32] {
+        let b = s.as_bytes();
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            out[i] = (nibble(b[2 * i]) << 4) | nibble(b[2 * i + 1]);
+            i += 1;
+        }
+        out
+    }
+
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            _ => c - b'a' + 10,
+        }
+    }
+
+    const NET: Network = [9; 32];
+
+    /// A card signed over arbitrary keys, as a malicious holder could make.
+    fn signed_card(id: &ContactIdentity, handshake: [u8; 32], inbox: [u8; 32], price: Amount) -> ContactCard {
+        let mut card = id.card(NET, price, 0, 100);
+        card.handshake_key = handshake;
+        card.inbox_key = inbox;
+        card.signature = id.sign(&card.signed_bytes());
+        card
+    }
+
+    #[test]
+    fn small_order_points_are_not_contributory_and_real_keys_are() {
+        for weak in SMALL_ORDER {
+            assert!(!is_contributory_key(&weak), "{weak:02x?}");
+        }
+        for _ in 0..16 {
+            assert!(is_contributory_key(&StaticKey::generate().public()));
+        }
+    }
+
+    #[test]
+    fn a_signed_card_with_a_small_order_key_is_refused() {
+        let id = ContactIdentity::generate();
+        let good = StaticKey::generate().public();
+        for weak in SMALL_ORDER {
+            assert_eq!(signed_card(&id, weak, good, 1).verify(&NET, 50), Err(ContactError::WeakKey));
+            assert_eq!(signed_card(&id, good, weak, 1).verify(&NET, 50), Err(ContactError::WeakKey));
+        }
+        assert_eq!(signed_card(&id, good, StaticKey::generate().public(), 1).verify(&NET, 50), Ok(()));
+    }
+
+    #[test]
+    fn a_card_price_must_fit_64_bits() {
+        let id = ContactIdentity::generate();
+        let (h, i) = (StaticKey::generate().public(), StaticKey::generate().public());
+        assert_eq!(signed_card(&id, h, i, MAX_PRICE).verify(&NET, 50), Ok(()));
+        assert_eq!(signed_card(&id, h, i, MAX_PRICE + 1).verify(&NET, 50), Err(ContactError::PriceOutOfRange));
+        assert_eq!(signed_card(&id, h, i, u128::MAX).verify(&NET, 50), Err(ContactError::PriceOutOfRange));
+    }
+
+    #[test]
+    fn an_invitation_to_a_small_order_holder_key_is_refused() {
+        let id = ContactIdentity::generate();
+        for weak in SMALL_ORDER {
+            let invitation = id.invite(NET, weak, Purpose::Contact, 100);
+            assert_eq!(invitation.verify(&id.signing_key(), &NET, 50), Err(ContactError::WeakKey));
+        }
     }
 }

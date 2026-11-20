@@ -120,8 +120,9 @@ half-open convention is used everywhere. A one-second window, as in the
 alternative protocol's reference profile, would be includable in roughly
 one block in six on a 6-second chain.
 
-**P10. Encrypted payload size is open.** The current 427-byte note cannot
-carry a quantum-resistant key exchange (ML-KEM-768 alone needs 1,088
+**P10. Encrypted payload size is open.** The prototype's stranger note
+(587 bytes since the section 2a prototype of 2026-11-20; 427 bytes before)
+cannot carry a quantum-resistant key exchange (ML-KEM-768 alone needs 1,088
 bytes). The model treats payloads as opaque fixed-size slots; the size and
 the encryption suite are for the cryptographer to fix.
 
@@ -152,9 +153,10 @@ whatever the payment proofs hide. Rules:
    - Proposed pattern: Noise IK. The caller already holds the answerer's
      handshake key (from the card, invitation or note). IK lets the
      answerer read the caller's authenticated key in the first message and
-     decide before replying. Noise XX, used today, makes the answerer
-     reveal itself first; Noise XK would make it reply before learning who
-     is calling.
+     decide before replying. Noise XX (the prototype's pattern until
+     2026-11-20, now replaced by IK there) makes the answerer reveal
+     itself first; Noise XK would make it reply before learning who is
+     calling.
    - Invited caller: the answerer checks the caller's key against the
      invitation or contact list, and block status, before message 2.
    - Paying stranger: reverse rendezvous is kept. The stranger's sealed
@@ -476,7 +478,8 @@ and reward payout; network-layer privacy of submission and queries.
     over-funded and the excess retired. Until this is settled, `F` cannot
     be changed on a network with open escrows.
 11. Is Noise IK, with the authorisation check before the first reply, the
-    right replacement for Noise XX here? Are the mitigations for its
+    right replacement for Noise XX (which the prototype used until
+    2026-11-20)? Are the mitigations for its
     replayable first message and weaker caller privacy (section 2a,
     rule 3) sufficient, and does a reply to a replayed authorised message
     leak availability in a way that matters?

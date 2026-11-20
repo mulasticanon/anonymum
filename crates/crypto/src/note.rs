@@ -14,8 +14,10 @@
 //!
 //! Field layout (fixed size, [`SEALED_NOTE_LEN`]):
 //! `admission commitment (32) || Noise N message (555)`. The Noise N
-//! prologue includes the admission commitment, so the note opens only next
-//! to the admission record of the same transaction. In the shielded design
+//! prologue and the signed bytes include the network id and the admission
+//! commitment, so the note opens only on its network and next to the
+//! admission record it names. (There is no pool id yet; one would join the
+//! network id here.) The callback key inside is checked before use. In the shielded design
 //! that commitment is a separate public field of the transaction (spec
 //! section 3); the transparent prototype chain has no such field, so here
 //! the note field carries it.
@@ -31,12 +33,12 @@ use std::fmt;
 use anonymum_core::crypto::SealedNote;
 use snow::Builder;
 
-use crate::contact::{verify_signature, ContactIdentity};
+use crate::contact::{is_contributory_key, verify_signature, ContactIdentity, Network};
 
 const PATTERN: &str = "Noise_N_25519_ChaChaPoly_BLAKE2s";
-const PROLOGUE: &[u8] = b"anonymum/contact-note/v2";
-const SIGNED: &[u8] = b"anonymum/contact-note-signature/v2";
-const VERSION: u8 = 2;
+const PROLOGUE: &[u8] = b"anonymum/contact-note/v3";
+const SIGNED: &[u8] = b"anonymum/contact-note-signature/v3";
+const VERSION: u8 = 3;
 
 /// Bytes reserved for the throwaway route (sized for a Nym `Recipient`).
 pub const ROUTE_LEN: usize = 96;
@@ -77,6 +79,8 @@ pub enum NoteError {
     BadSignature,
     /// Decrypted, but not a well-formed note.
     Malformed,
+    /// A key whose key agreement would not depend on our secret.
+    WeakKey,
 }
 
 impl fmt::Display for NoteError {
@@ -93,12 +97,12 @@ impl From<snow::Error> for NoteError {
     }
 }
 
-fn signed_message(admission: &[u8; ADMISSION_LEN], inbox: &[u8; 32], body: &[u8]) -> Vec<u8> {
-    [SIGNED, admission.as_slice(), inbox.as_slice(), body].concat()
+fn signed_message(network: &Network, admission: &[u8; ADMISSION_LEN], inbox: &[u8; 32], body: &[u8]) -> Vec<u8> {
+    [SIGNED, network.as_slice(), admission.as_slice(), inbox.as_slice(), body].concat()
 }
 
-fn prologue(admission: &[u8; ADMISSION_LEN]) -> Vec<u8> {
-    [PROLOGUE, admission.as_slice()].concat()
+fn prologue(network: &Network, admission: &[u8; ADMISSION_LEN]) -> Vec<u8> {
+    [PROLOGUE, network.as_slice(), admission.as_slice()].concat()
 }
 
 fn builder() -> Builder<'static> {
@@ -106,8 +110,9 @@ fn builder() -> Builder<'static> {
 }
 
 /// Seal a note from `sender` to the holder of `recipient_inbox`, bound to
-/// the transaction's admission commitment.
+/// `network` and the transaction's admission commitment.
 pub fn seal_note(
+    network: &Network,
     recipient_inbox: &[u8; 32],
     sender: &ContactIdentity,
     callback: &[u8; 32],
@@ -119,6 +124,9 @@ pub fn seal_note(
     if intro.len() > INTRO_MAX_BYTES {
         return Err(NoteError::IntroTooLong { len: intro.len() });
     }
+    if !is_contributory_key(recipient_inbox) || !is_contributory_key(callback) {
+        return Err(NoteError::WeakKey);
+    }
     let mut plaintext = vec![0u8; PLAINTEXT_LEN];
     plaintext[0] = VERSION;
     plaintext[1..33].copy_from_slice(&sender.signing_key());
@@ -127,19 +135,20 @@ pub fn seal_note(
     let len_at = 65 + ROUTE_LEN;
     plaintext[len_at..len_at + 2].copy_from_slice(&(intro.len() as u16).to_be_bytes());
     plaintext[len_at + 2..len_at + 2 + intro.len()].copy_from_slice(intro);
-    let signature = sender.sign(&signed_message(admission, recipient_inbox, &plaintext[..BODY_LEN]));
+    let signature = sender.sign(&signed_message(network, admission, recipient_inbox, &plaintext[..BODY_LEN]));
     plaintext[BODY_LEN..].copy_from_slice(&signature);
 
-    seal_plaintext(recipient_inbox, &plaintext, admission)
+    seal_plaintext(network, recipient_inbox, &plaintext, admission)
 }
 
 /// Encrypt a complete plaintext (body and signature) to `recipient_inbox`.
 fn seal_plaintext(
+    network: &Network,
     recipient_inbox: &[u8; 32],
     plaintext: &[u8],
     admission: &[u8; ADMISSION_LEN],
 ) -> Result<SealedNote, NoteError> {
-    let prologue = prologue(admission);
+    let prologue = prologue(network, admission);
     let mut noise = builder().prologue(&prologue)?.remote_public_key(recipient_inbox)?.build_initiator()?;
     let mut out = vec![0u8; SEALED_NOTE_LEN];
     out[..ADMISSION_LEN].copy_from_slice(admission);
@@ -148,15 +157,16 @@ fn seal_plaintext(
     Ok(SealedNote(out))
 }
 
-/// Try to open a note with `me`'s inbox key. Needs nothing else: no sender
-/// address, no hint. A note for someone else fails with [`NoteError::Noise`].
-pub fn open_note(me: &ContactIdentity, note: &SealedNote) -> Result<ContactNote, NoteError> {
+/// Try to open a note on `network` with `me`'s inbox key. Needs nothing
+/// else: no sender address, no hint. A note for someone else, or sealed for
+/// another network, fails with [`NoteError::Noise`].
+pub fn open_note(me: &ContactIdentity, network: &Network, note: &SealedNote) -> Result<ContactNote, NoteError> {
     if note.0.len() != SEALED_NOTE_LEN {
         return Err(NoteError::BadSize { len: note.0.len() });
     }
     let (admission, envelope) = note.0.split_at(ADMISSION_LEN);
     let admission: [u8; ADMISSION_LEN] = admission.try_into().expect("split at 32");
-    let prologue = prologue(&admission);
+    let prologue = prologue(network, &admission);
     let mut noise =
         builder().prologue(&prologue)?.local_private_key(me.inbox_key().secret())?.build_responder()?;
     let mut plaintext = vec![0u8; PLAINTEXT_LEN];
@@ -167,8 +177,12 @@ pub fn open_note(me: &ContactIdentity, note: &SealedNote) -> Result<ContactNote,
     let (body, signature) = plaintext.split_at(BODY_LEN);
     let sender: [u8; 32] = body[1..33].try_into().expect("32 bytes");
     let signature: [u8; 64] = signature.try_into().expect("64 bytes");
-    if !verify_signature(&sender, &signed_message(&admission, &me.inbox_key().public(), body), &signature) {
+    if !verify_signature(&sender, &signed_message(network, &admission, &me.inbox_key().public(), body), &signature) {
         return Err(NoteError::BadSignature);
+    }
+    let callback: [u8; 32] = body[33..65].try_into().expect("32 bytes");
+    if !is_contributory_key(&callback) {
+        return Err(NoteError::WeakKey);
     }
     let len_at = 65 + ROUTE_LEN;
     let intro_len = u16::from_be_bytes([body[len_at], body[len_at + 1]]) as usize;
@@ -182,7 +196,7 @@ pub fn open_note(me: &ContactIdentity, note: &SealedNote) -> Result<ContactNote,
     Ok(ContactNote {
         admission,
         sender,
-        callback: body[33..65].try_into().expect("32 bytes"),
+        callback,
         route: body[65..65 + ROUTE_LEN].try_into().expect("96 bytes"),
         intro: String::from_utf8(intro.to_vec()).map_err(|_| NoteError::Malformed)?,
     })
@@ -194,11 +208,16 @@ mod tests {
 
     const ROUTE: [u8; ROUTE_LEN] = [7; ROUTE_LEN];
     const ADMISSION: [u8; 32] = [0xAD; 32];
+    const NET: Network = [9; 32];
+
+    fn cb() -> [u8; 32] {
+        crate::contact::StaticKey::generate().public()
+    }
 
     /// Decrypt a note to its raw plaintext, as its recipient can.
     fn raw(me: &ContactIdentity, note: &SealedNote) -> Vec<u8> {
         let mut noise = builder()
-            .prologue(&prologue(&ADMISSION))
+            .prologue(&prologue(&NET, &ADMISSION))
             .unwrap()
             .local_private_key(me.inbox_key().secret())
             .unwrap()
@@ -214,12 +233,12 @@ mod tests {
         let (bob, carol, mallory) =
             (ContactIdentity::generate(), ContactIdentity::generate(), ContactIdentity::generate());
         let inbox = bob.inbox_key().public();
-        let honest = seal_note(&inbox, &mallory, &[1; 32], &ROUTE, "hi", &ADMISSION).unwrap();
+        let honest = seal_note(&NET, &inbox, &mallory, &cb(), &ROUTE, "hi", &ADMISSION).unwrap();
         // Mallory names Carol as the sender but can only sign with her own key.
         let mut forged = raw(&bob, &honest);
         forged[1..33].copy_from_slice(&carol.signing_key());
-        let note = seal_plaintext(&inbox, &forged, &ADMISSION).unwrap();
-        assert!(matches!(open_note(&bob, &note), Err(NoteError::BadSignature)));
+        let note = seal_plaintext(&NET, &inbox, &forged, &ADMISSION).unwrap();
+        assert!(matches!(open_note(&bob, &NET, &note), Err(NoteError::BadSignature)));
     }
 
     #[test]
@@ -227,19 +246,78 @@ mod tests {
         // Bob opens Carol's note and re-seals the same body and signature to
         // Dave. The signature covers Bob's inbox key, so Dave refuses it.
         let (bob, carol, dave) = (ContactIdentity::generate(), ContactIdentity::generate(), ContactIdentity::generate());
-        let note = seal_note(&bob.inbox_key().public(), &carol, &[1; 32], &ROUTE, "hi", &ADMISSION).unwrap();
-        let forwarded = seal_plaintext(&dave.inbox_key().public(), &raw(&bob, &note), &ADMISSION).unwrap();
-        assert!(matches!(open_note(&dave, &forwarded), Err(NoteError::BadSignature)));
+        let note = seal_note(&NET, &bob.inbox_key().public(), &carol, &cb(), &ROUTE, "hi", &ADMISSION).unwrap();
+        let forwarded = seal_plaintext(&NET, &dave.inbox_key().public(), &raw(&bob, &note), &ADMISSION).unwrap();
+        assert!(matches!(open_note(&dave, &NET, &forwarded), Err(NoteError::BadSignature)));
     }
 
     #[test]
     fn padding_and_version_are_checked() {
         let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
         let inbox = bob.inbox_key().public();
-        let note = seal_note(&inbox, &carol, &[1; 32], &ROUTE, "hi", &ADMISSION).unwrap();
+        let note = seal_note(&NET, &inbox, &carol, &cb(), &ROUTE, "hi", &ADMISSION).unwrap();
         let mut bad_version = raw(&bob, &note);
         bad_version[0] = 9;
-        let note2 = seal_plaintext(&inbox, &bad_version, &ADMISSION).unwrap();
-        assert!(matches!(open_note(&bob, &note2), Err(NoteError::Malformed)));
+        let note2 = seal_plaintext(&NET, &inbox, &bad_version, &ADMISSION).unwrap();
+        assert!(matches!(open_note(&bob, &NET, &note2), Err(NoteError::Malformed)));
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use crate::contact::StaticKey;
+
+    const ROUTE: [u8; ROUTE_LEN] = [7; ROUTE_LEN];
+    const ADMISSION: [u8; 32] = [0xAD; 32];
+    const NET_A: Network = [0xA; 32];
+    const NET_B: Network = [0xB; 32];
+
+    /// Decrypt with network A's prologue, as the recipient can.
+    fn raw_on(network: &Network, me: &ContactIdentity, note: &SealedNote) -> Vec<u8> {
+        let mut noise = builder()
+            .prologue(&prologue(network, &ADMISSION))
+            .unwrap()
+            .local_private_key(me.inbox_key().secret())
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let mut plaintext = vec![0u8; PLAINTEXT_LEN];
+        noise.read_message(&note.0[ADMISSION_LEN..], &mut plaintext).unwrap();
+        plaintext
+    }
+
+    #[test]
+    fn a_note_for_network_a_neither_opens_nor_verifies_on_network_b() {
+        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let inbox = bob.inbox_key().public();
+        let note = seal_note(&NET_A, &inbox, &carol, &StaticKey::generate().public(), &ROUTE, "hi", &ADMISSION).unwrap();
+        assert_eq!(note.0.len(), SEALED_NOTE_LEN, "still 587 bytes");
+        assert!(open_note(&bob, &NET_A, &note).is_ok());
+        // The prologue differs: it does not open on network B.
+        assert!(matches!(open_note(&bob, &NET_B, &note), Err(NoteError::Noise(_))));
+        // Re-encrypted for network B by the recipient, the sender's signature
+        // (made over network A) does not verify there.
+        let moved = seal_plaintext(&NET_B, &inbox, &raw_on(&NET_A, &bob, &note), &ADMISSION).unwrap();
+        assert!(matches!(open_note(&bob, &NET_B, &moved), Err(NoteError::BadSignature)));
+    }
+
+    #[test]
+    fn a_signed_note_with_a_small_order_callback_key_is_refused() {
+        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let inbox = bob.inbox_key().public();
+        let honest = seal_note(&NET_A, &inbox, &carol, &StaticKey::generate().public(), &ROUTE, "hi", &ADMISSION).unwrap();
+        for weak in crate::contact::tests::SMALL_ORDER {
+            // A sender who signs a weak callback key on purpose.
+            let mut plaintext = raw_on(&NET_A, &bob, &honest);
+            plaintext[33..65].copy_from_slice(&weak);
+            let signature = carol.sign(&signed_message(&NET_A, &ADMISSION, &inbox, &plaintext[..BODY_LEN]));
+            plaintext[BODY_LEN..].copy_from_slice(&signature);
+            let note = seal_plaintext(&NET_A, &inbox, &plaintext, &ADMISSION).unwrap();
+            assert!(matches!(open_note(&bob, &NET_A, &note), Err(NoteError::WeakKey)));
+            // And sealing to a weak inbox or with a weak callback is refused.
+            assert!(matches!(seal_note(&NET_A, &weak, &carol, &[9; 32], &ROUTE, "", &ADMISSION), Err(NoteError::WeakKey)));
+            assert!(matches!(seal_note(&NET_A, &inbox, &carol, &weak, &ROUTE, "", &ADMISSION), Err(NoteError::WeakKey)));
+        }
     }
 }

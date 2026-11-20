@@ -6,8 +6,8 @@
 //! * [`ContactIdentity`], [`ContactCard`], [`Invitation`] — a contact
 //!   identity separate from the wallet (spec v0.7 section 2a).
 //! * [`Gate`] — who the answering side lets in, decided before any reply.
-//! * [`Handshake`] / [`Incoming`] / [`Session`] — Noise IK sessions between
-//!   contact keys. Nobody without one of the two private keys can read the
+//! * [`wire`] — Noise IK sessions between contact keys, driven through
+//!   [`wire::Initiator`] and [`wire::Responder`] (the only way to answer). Nobody without one of the two private keys can read the
 //!   messages: no node, no developer.
 //! * [`seal_note`] / [`open_note`] — a stranger's fixed-size note, opened
 //!   with the recipient's inbox key alone.
@@ -26,9 +26,9 @@ pub mod note;
 mod session;
 pub mod wire;
 
-pub use contact::{random_bytes, ContactCard, ContactError, ContactIdentity, Invitation, Network, Purpose, StaticKey};
-pub use gate::{Gate, Grant};
+pub use contact::{is_contributory_key, random_bytes, ContactCard, ContactError, ContactIdentity, Invitation, Network, Purpose, StaticKey};
+pub use gate::{Gate, Grant, Now};
 pub use identity::Identity;
 pub use invite::{Ed25519Invites, InviteSecret};
 pub use note::{open_note, seal_note, ContactNote, NoteError};
-pub use session::{Handshake, Incoming, Session, SessionError, MAX_PLAINTEXT, REFERENCE_LEN};
+pub use session::{Session, SessionError, MAX_PLAINTEXT, REFERENCE_LEN};

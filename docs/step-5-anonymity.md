@@ -162,7 +162,7 @@ any real use.
   expiry minus the decline fee. Cheap failure is traded for privacy.
 - **"Only the closer can reopen"** becomes a rule in the closer's client.
 - **Deposits** for invites and blocks disappear with those tables.
-- **Scanning**: every client downloads every note (427 bytes each). Fine at
+- **Scanning**: every client downloads every note (587 bytes each since 2026-11-20; 427 when this was written). Fine at
   small scale; needs a detection scheme later.
 
 ## What cannot be guaranteed by any design

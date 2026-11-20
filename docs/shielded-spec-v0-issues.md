@@ -187,3 +187,58 @@ which is the point of deniability but means the note proves nothing to an
 arbiter either. Does that interact with the admission record and the
 escrow, where the payment itself is on-chain? *Prototype:* unchanged
 (signature); this needs a decision.
+
+## Source review of cdad354 (2026-11-20)
+
+`docs/source-review-cdad354-2026-11-20.md` (AI-written; not a human
+cryptographic audit) found eight items and four smaller ones in the
+section 2a prototype. Status after the fixes of 2026-11-20 in
+`crates/crypto`, the Nym demo and `e2e.mjs`:
+
+| # | Finding (short) | Status |
+|---|---|---|
+| R1 | Revocation through the public mutable gate left live sessions and cached ACKs working | **Fixed.** The gate has no public constructor or mutators; `Responder::block` and `Responder::remove_contact` change the policy, end the peer's sessions and drop its cached WELCOME and ACK together; every use of a live session (data in, data out, ACK resend) checks the gate again. Tested through both routes, and internally by changing the gate alone |
+| R2 | The note authenticates only the admission bytes it carries; nothing ties it to a particular finalised escrow (I17) | **Open.** Needs the shielded design's admission record as an independent, finalised public field. The note is now also bound to the network (prologue and signed bytes; still 587 bytes); there is no pool id yet |
+| R3 | External X25519 keys were used unvalidated | **Fixed for every key we receive or are asked to use**: card handshake and inbox keys, invitation holder keys, a note's callback key, the inbox and callback keys we seal with, the key an initiator calls, the caller key read from a HELLO, and the caller a callback listener expects. See the check below. Tested with seven small-order encodings. The caller-key check after reading a HELLO is not reachable by an honest initiator and is untested |
+| R4 | e2e started the callback before finality and rebuilt Bob's inputs from Carol's private keep file | **Fixed.** Every transaction waits for finalisation; Bob and Carol run as two processes with separate folders; Bob's process gets his own wallet file and the note bytes read from chain state, nothing else; a contact key that does not match the note's sender is now an error. Not yet run: the review's copied-field and losing-claim cases (they need the shielded admission record) |
+| R5 | Lost ACK: the demo stopped reading after its first ACK; a caller that moved to a higher attempt was welcomed but its CONFIRM was tested against the older live session | **Fixed.** A CONFIRM is matched first to the exact live attempt (resend the ACK, after a gate check), then to the matching pending attempt, which replaces the old session as a contact without using the invitation again. The demo's responders keep reading after establishing; `ANONYMUM_DROP_FIRST_ACK=1` drops the first ACK in a live run. Tests: the higher-attempt case and a driver loop under eight deterministic loss patterns |
+| R6 | Frame type, call id and attempt were outside the authenticated content | **Fixed.** Call id and attempt are in the IK prologue; every sealed record carries its type, and CONFIRM and ACK also carry call id and attempt, inside the ciphertext; a record whose inner type or labels do not match is refused without using up its counter. Data frames carry at most 65,518 bytes (one byte for the type) |
+| R7 | Bob's callback uses his card key (I16); the note signature is transferable (I27) | **Open, with the cryptographer**, unchanged by the owner's decision (see the open questions below) |
+| R8 | In-memory grant state; no idle or callback expiry; pending expiry only on receive timeouts | **Partly fixed.** Answered handshakes expire after `PENDING_TIMEOUT` (180 s), sessions after `SESSION_IDLE_TIMEOUT` (30 min) without traffic, callback grants at their deadline, all checked against an injected monotonic clock on every operation. **Open:** durable and multi-device grant state, crash recovery of an invitation consumed while its ACK is outstanding |
+| R9 | `Incoming::accept` could build a WELCOME without a gate | **Fixed.** The answering handshake types are crate-private; `Responder` is the only way to answer (compile-fail doc tests) |
+| R10 | `record_invitation` trusted its caller | **Fixed.** It checks issuer (our signing key), signature, network, holder key and expiry; a callback listener records none |
+| R11 | Responder and gate took the network separately | **Fixed.** `Responder::for_identity` / `for_callback` build the gate from the same network id |
+| R12 | Card price is 128-bit; the shielded model's amounts are 64-bit; runtime spec version 0 | **Fixed.** `ContactCard::verify` refuses a price above `u64::MAX`. The dev runtime's `spec_version` is 1; notes stored before the 587-byte format cannot be opened, by design (the dev chain starts from a fresh genesis) |
+
+**The key check chosen (for the cryptographer).** `is_contributory_key`
+computes an X25519 agreement between the received public key and a fresh
+random secret with `x25519-dalek` 2.0.1 and asks the library's own
+`SharedSecret::was_contributory`, which reports whether the output is all
+zeros (RFC 7748 section 6.1). Clamped X25519 scalars are multiples of the
+cofactor 8, so the output is all zeros for every secret exactly when the
+point has small order; one fresh secret decides it. No list of bad points is
+kept in the code (the tests use the seven well-known small-order encodings
+as vectors). Mixed-order points pass, as they do for X25519 itself. **Not
+covered:** the *ephemeral* keys inside IK messages and Noise N notes are
+handled by `snow`'s default resolver, which does not reject an all-zero
+result, and `snow`'s public API gives no hook to check them before use.
+Is that acceptable for IK and N here, or must the resolver fail closed?
+
+## Open questions recorded 2026-11-20 (not to be solved yet)
+
+- **Durable and multi-device grant state** (review finding 8). Invitations
+  honoured, contacts, callbacks and blocks live in one process's memory.
+  What must survive a restart, how two devices of one person agree that an
+  invitation was used once, and how a crash between committing a grant and
+  delivering its ACK is recovered.
+- **Bob's callback uses his card's handshake key** (I16, review finding 7).
+  A recorder of the callback's first message who later learns the callback
+  secret learns Bob's key and the request reference. How should the
+  stranger privately authorise a request-scoped callback key instead?
+- **The note's signature is transferable proof of who made contact** (I27).
+  Should authentication that only the two parties can verify replace it?
+- **Timing equivalence between authorised and unauthorised callers is
+  unmeasured.** Both get no frame from an unauthorised refusal, but the
+  work before refusing differs (a blocked key, an unknown key and a wrong
+  answerer key each stop at a different point). Nobody has measured what a
+  caller, a gateway or a network observer can tell.

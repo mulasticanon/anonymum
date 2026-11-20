@@ -93,7 +93,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: alloc::borrow::Cow::Borrowed("anonymum-runtime"),
 	impl_name: alloc::borrow::Cow::Borrowed("anonymum-runtime"),
 	authoring_version: 1,
-	spec_version: 0,
+	// 1: contact notes grew from 427 to 587 bytes (spec v0.7 section 2a).
+	// Notes stored before the change cannot be opened by the new format,
+	// by design; the dev chain starts from a fresh genesis each run.
+	spec_version: 1,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,

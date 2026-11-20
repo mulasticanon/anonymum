@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 52 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 79 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -82,6 +82,16 @@ Dev chain rerun for the 587-byte note (2026-11-20): runtime rebuilt,
 real note went through the chain byte for byte, Bob opened it from chain
 state with his inbox key alone, and his callback over Nym was confirmed on
 the first attempt.
+
+After the source review of cdad354 (2026-11-20): live demo with
+`ANONYMUM_DROP_FIRST_ACK=1` passed in 288 s. Bob dropped his first
+acknowledgement; Alice resent her confirmation after 60 s and Bob, still
+reading, sent the cached acknowledgement again. Eve and Dave again got
+nothing. On the dev chain (runtime `spec_version` 1), `smoke.mjs` passed
+and `e2e.mjs` passed with Bob and Carol as two separate processes that
+share only the chain and the mixnet; every transaction waited for
+finality, and Bob's process got the callback key, route and request
+reference only from the note it decrypted.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -289,6 +299,13 @@ I14).
   authorised caller's recorded first message gets a reply: an availability
   signal (spec question 11). If an answerer's handshake key leaks, recorded
   first messages reveal the callers' keys.
+- Received X25519 keys are checked for small order (cards, invitations,
+  notes, callers), but the ephemeral keys inside `snow`'s handshakes are
+  not: its public API offers no hook. Open for the cryptographer.
+- Whether a caller can tell an authorised refusal from an unauthorised one
+  by timing has not been measured.
+- Grant state (invitations used, contacts, blocks) is in memory only: no
+  durable or multi-device guarantee yet.
 - Forward secrecy is per session, not per message. Sessions should be
   renewed often; a double ratchet would do this automatically.
 - Reading an IK first message costs the answerer two key agreements before
