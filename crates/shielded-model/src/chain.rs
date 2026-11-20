@@ -32,6 +32,14 @@ pub const STRANGER_SLOT: usize = 2;
 pub const STRANGER_NOTE_LEN: usize = 1_787;
 /// Exact length of each slot, in order.
 pub const PAYLOAD_LENS: [usize; N_PAY] = [COIN_PAYLOAD_LEN, COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN];
+
+/// The permanent 32-byte commitment to a stranger-note slot:
+/// `H("stranger-note-slot", slot)`. The proof binds to this hash, not to
+/// the slot's bytes, so a transaction stays checkable after the slot is
+/// pruned (issue I28).
+pub fn stranger_note_hash(slot: &[u8]) -> Hash {
+    h("stranger-note-slot", &[slot])
+}
 /// Request lifetime: claims stop and timeouts start here (O4, O8).
 pub const TTL: Time = 24 * 60 * 60;
 
@@ -88,7 +96,12 @@ pub struct PublicTx {
     pub commitments: [Commitment; N_OUT],
     /// Commitment to the admission record (empty for non-requests).
     pub admission: Commitment,
+    /// Slots 0 and 1 (coin notes, permanent) and 2 (the stranger note,
+    /// pruned 24 hours after the window starts; empty in the chain's log).
     pub payloads: [Vec<u8>; N_PAY],
+    /// [`stranger_note_hash`] of slot 2, kept permanently. The chain checks
+    /// that the submitted slot matches it.
+    pub stranger_note_hash: Hash,
     /// Validity window: one cell of the window grid, half-open
     /// `[not_before, not_after)` (spec v0.5, I1).
     pub not_before: Time,
@@ -97,9 +110,12 @@ pub struct PublicTx {
 }
 
 impl PublicTx {
-    /// Digest of every public field, including the payload bytes. The
-    /// witness must carry the same digest: this models the proof (and the
-    /// sender's authorisation) being bound to the whole public part.
+    /// Digest of every public field: the coin-note slots' bytes and the
+    /// stranger note's permanent hash (not its bytes, which are pruned).
+    /// The witness must carry the same digest: this models the proof (and
+    /// the sender's authorisation) being bound to the whole public part.
+    /// It needs only permanent data, so it can be recomputed from the
+    /// chain's log at any time.
     pub fn digest(&self) -> Hash {
         let mut parts: Vec<Vec<u8>> = vec![
             self.chain_id.to_le_bytes().to_vec(),
@@ -109,7 +125,8 @@ impl PublicTx {
         parts.extend(self.nullifiers.iter().map(|n| n.0.to_vec()));
         parts.extend(self.commitments.iter().map(|c| c.0.to_vec()));
         parts.push(self.admission.0.to_vec());
-        parts.extend(self.payloads.iter().cloned());
+        parts.extend(self.payloads[..N_COIN].iter().cloned());
+        parts.push(self.stranger_note_hash.to_vec());
         parts.push(self.not_before.to_le_bytes().to_vec());
         parts.push(self.not_after.to_le_bytes().to_vec());
         parts.push(self.base_fee.to_le_bytes().to_vec());
@@ -182,6 +199,8 @@ pub enum Reject {
     WrongVersion,
     WrongBaseFee,
     MalformedPayload,
+    /// The stranger-note slot does not hash to `stranger_note_hash`.
+    StrangerNoteMismatch,
     WindowNotShared,
     OutsideWindow,
     UnknownRoot,
@@ -292,7 +311,8 @@ impl Chain {
         &self.log
     }
     /// The stranger-note slot of the logged transaction `index`, while it
-    /// is kept (24 hours from its window start).
+    /// is kept (24 hours from its window start). Its permanent hash stays in
+    /// `log()[index].stranger_note_hash`.
     pub fn stranger_note(&self, index: usize) -> Option<&[u8]> {
         self.stranger_notes.get(&index).map(|(_, bytes)| bytes.as_slice())
     }
@@ -404,6 +424,9 @@ impl Chain {
         if public.payloads.iter().zip(PAYLOAD_LENS).any(|(slot, len)| slot.len() != len) {
             return Err(Reject::MalformedPayload);
         }
+        if stranger_note_hash(&public.payloads[STRANGER_SLOT]) != public.stranger_note_hash {
+            return Err(Reject::StrangerNoteMismatch);
+        }
         // Windows come from the shared grid: one grid cell, half-open.
         if public.not_before % p.window != 0 || public.not_after != public.not_before.checked_add(p.window).ok_or(Reject::Overflow)? {
             return Err(Reject::WindowNotShared);
@@ -422,7 +445,8 @@ impl Chain {
         }
 
         // ---- hidden statement, common part ------------------------------
-        // 6. The proof is bound to every public field and the payloads.
+        // 6. The proof is bound to every public field: the coin-note
+        // slots and the stranger note's hash.
         if witness.bound_digest != public.digest() {
             return Err(Reject::BindingMismatch);
         }

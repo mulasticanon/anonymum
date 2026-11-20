@@ -49,7 +49,7 @@ Windows machine (see the update below).
 | `crates/crypto` (`anonymum-crypto`) | `Identity` (wallet: Ed25519 address + X25519 key bound to it, for the transparent chain only), `InviteSecret` / `Ed25519Invites` (chain invites); spec v0.7 section 2a prototype: `contact` (`ContactIdentity` with signing, handshake and inbox keys; `ContactCard`; `Invitation` to a holder key; `StaticKey` caller keys), `gate` (`Gate`: authorise before replying, commit on confirmation; changed only through the responder), crate-private Noise IK handshake types, `note` (stranger's note opened with the inbox key alone, bound to network and admission commitment), `wire` (HELLO / WELCOME / CONFIRM / ACK; unauthorised callers get nothing; call id and attempt in the IK prologue; inner record types; atomic revocation; deadlines with an injected `Now`). Received X25519 keys checked with `was_contributory`; block and remove cancel the key's unused invitation and callback grant too; sessions keyed by caller key with caps (`Limits`, one candidate handle per caller); send counter cannot wrap. Unreviewed. | 106 tests, run by CI on Linux and Windows |
 | `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 64 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
-| `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce and the key paths of the refund and cancel keys; refunds found via the consuming transaction). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 57 tests (section 5 properties, randomised conservation, 5b acceptance, slots and pruning); every rule mutation-checked |
+| `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce and the key paths of the refund and cancel keys; refunds found via the consuming transaction). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 61 tests (section 5 properties, randomised conservation, 5b acceptance, slots and pruning); every rule mutation-checked |
 | `crates/nym` (`anonymum-nym`) | Binary: Alice (invite), Carol (stranger, reverse rendezvous with a persisted throwaway client and retrying caller), Dave (dropped); subcommands `wallet`/`throwaway`/`seal`/`open`/`talk` for `substrate/scripts/e2e.mjs`. | Manual live runs on Windows, see README |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
@@ -392,13 +392,13 @@ The current source for the shielded design is
 for reference) differs from it, the spec wins. The research report gives
 background; section 15.1 gate 1 is what the spec's decisions answer.
 `crates/shielded-model` is a plain-Rust reference model of the spec's rules
-(no proofs, not private or secure; 57 tests). Since 2026-11-20 it has
+(no proofs, not private or secure; 61 tests). Since 2026-11-20 it has
 two 200-byte coin-note slots plus one 1,787-byte stranger-note slot per
 transaction, prunes stranger notes 24 h after their window starts
-(`Chain::prune_stranger_notes`; I28: no hash kept), enforces the empty
+(`Chain::prune_stranger_notes`; the proof binds to a permanent `stranger_note_hash`, I28), enforces the empty
 admission record's zero fields (W3, `Reject::NonEmptyAdmission`), and its
-recovery copy re-derives the refund and cancel authorities from the key
-paths to fit 200 bytes. Spec problems found while
+recovery copy (versioned, `RECOVERY_VERSION` = 1, 11 bytes spare) re-derives
+the refund and cancel authorities from the key paths to fit 200 bytes. Spec problems found while
 building it are in `docs/shielded-spec-v0-issues.md`: I1-I12 from v0.4,
 all resolved in v0.5 except I8 (open); I13-I14 new in v0.5, for the
 owner and the cryptographer.

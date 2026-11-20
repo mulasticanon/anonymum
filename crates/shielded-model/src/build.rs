@@ -83,6 +83,7 @@ impl TxBuilder {
             nullifiers,
             commitments,
             admission: admission.commitment(),
+            stranger_note_hash: stranger_note_hash(&self.payloads[STRANGER_SLOT]),
             payloads: self.payloads,
             not_before,
             not_after: not_before + p.window,
@@ -118,6 +119,14 @@ pub fn nullifier_of(input: &InputWitness) -> Nullifier {
 /// statement's checks instead of stopping at `BindingMismatch`.
 pub fn rebind(public: &PublicTx, witness: &mut Witness) {
     witness.bound_digest = public.digest();
+}
+
+/// Replace the stranger-note slot, update its hash and re-bind: what an
+/// honest sender does when the slot carries a real note.
+pub fn set_stranger_note(public: &mut PublicTx, witness: &mut Witness, note: Vec<u8>) {
+    public.stranger_note_hash = stranger_note_hash(&note);
+    public.payloads[STRANGER_SLOT] = note;
+    rebind(public, witness);
 }
 
 /// Recompute every public field derived from the witness (nullifiers,

@@ -397,6 +397,28 @@ each stranger slot permanently and the proof binds to that hash. The
 reference model (`Chain::prune_stranger_notes`) drops the bytes and keeps
 no hash; it has no proofs to recheck. For the cryptographer.
 
+*Resolved in the model, 2026-11-20 (unreviewed).* `PublicTx` has a
+permanent `stranger_note_hash` (`H("stranger-note-slot", slot)`);
+`PublicTx::digest`, which models the proof binding, covers that hash and
+the two coin-note slots, not the stranger slot's bytes. `Chain::submit`
+rejects a slot that does not match its hash
+(`Reject::StrangerNoteMismatch`, no charge), keeps the hash in the log and
+the bytes in the 24-hour store. Tests in `slots_and_pruning.rs`: a
+mismatched hash or slot is rejected at no charge; after pruning, the
+logged transaction's digest still equals the digest its witness was bound
+to; a different note under its own correct hash fails the binding check.
+What stays for the cryptographer: which hash the circuit uses for this
+commitment, and whether the proof should bind to it directly or through
+a transaction-wide hash.
+
+**Recovery copy versioned (2026-11-20, unreviewed).** The 200-byte
+recovery copy's plaintext now starts with a version byte (`RECOVERY_VERSION
+= 1`) that names both the byte layout and the key-derivation scheme. A
+copy of any other version is refused (`RecoveryError::UnsupportedVersion`),
+and a scan that meets one of the wallet's own copies in an unknown version
+fails instead of returning a shorter list. The layout is documented in
+`wallet.rs`; 11 bytes of the slot remain spare.
+
 **I29. Hybrid post-quantum stranger note (format v5), prototyped.**
 `anonymum-crypto::note`, unreviewed.
 - *Card:* one ML-KEM-768 encapsulation key (`pq_inbox_key`, 1,184 bytes),

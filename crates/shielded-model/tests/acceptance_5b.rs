@@ -80,7 +80,7 @@ fn decline(w: &mut World, escrow: &EscrowNote, pos: u64, tag: &str) {
 /// consuming transaction, and whether it is spent.
 fn restore_and_find(w: &World, backup: [u8; 32]) -> (Wallet, KeyPath, Note, u64, Time, bool) {
     let restored = Wallet::from_backup(backup);
-    let recovered = restored.recover_escrows(&w.chain);
+    let recovered = restored.recover_escrows(&w.chain).unwrap();
     assert_eq!(recovered.len(), 1, "one escrow recovered from the chain alone");
     let states = restored.refund_states(&w.chain, &recovered[0]);
     assert_eq!(states.len(), 1);
@@ -147,7 +147,7 @@ fn restore_works_at_the_largest_index_and_at_sparse_indices() {
         let (escrow, pos) = open_from_wallet(&mut w, &sender, 0, 250, &refund, &cancel, "o");
 
         let restored = Wallet::from_backup(backup);
-        let recovered = restored.recover_escrows(&w.chain);
+        let recovered = restored.recover_escrows(&w.chain).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!((recovered[0].refund.index, recovered[0].cancel.index), (refund_index, cancel_index));
         // The restored wallet holds the cancel authority directly and uses it.
@@ -177,7 +177,7 @@ fn a_wallet_that_opened_many_escrows_recovers_every_one() {
         }
     }
     let restored = Wallet::from_backup(backup);
-    let recovered = restored.recover_escrows(&w.chain);
+    let recovered = restored.recover_escrows(&w.chain).unwrap();
     assert_eq!(recovered.len(), n as usize);
     for (escrow, pos, refund, cancel) in &opened {
         let r = recovered.iter().find(|r| r.escrow == *escrow).expect("recovered");
@@ -231,7 +231,7 @@ fn a_wallet_without_the_backup_recovers_nothing_and_paths_must_match() {
     let thief = Wallet::from_backup(blinding("other"));
     let mut w = funded_world(&sender, &[1_000]);
     open_from_wallet(&mut w, &sender, 0, 101, &KeyPath::new("refund", 0), &KeyPath::new("cancel", 0), "o");
-    assert!(thief.recover_escrows(&w.chain).is_empty());
+    assert!(thief.recover_escrows(&w.chain).unwrap().is_empty());
     // A copy whose paths do not derive the escrow's keys is refused at sealing.
     let escrow = escrow_note(101, &parties(), "e");
     let nonce = [1; 12];
@@ -260,7 +260,7 @@ fn a_recovery_copy_opens_with_one_decryption_and_no_chain_context() {
     assert_ne!(slot, wallet.seal_recovery(&escrow, &refund, &cancel, [0x5D; 12]).unwrap());
     let mut tampered = slot.clone();
     tampered[40] ^= 1;
-    assert_eq!(wallet.open_recovery(&vec![0; COIN_PAYLOAD_LEN]), None);
-    assert_eq!(wallet.open_recovery(&tampered), None);
-    assert_eq!(Wallet::from_backup(blinding("other")).open_recovery(&slot), None);
+    assert_eq!(wallet.open_recovery(&vec![0; COIN_PAYLOAD_LEN]), Err(RecoveryError::NotThisWallet));
+    assert_eq!(wallet.open_recovery(&tampered), Err(RecoveryError::NotThisWallet));
+    assert_eq!(Wallet::from_backup(blinding("other")).open_recovery(&slot), Err(RecoveryError::NotThisWallet));
 }

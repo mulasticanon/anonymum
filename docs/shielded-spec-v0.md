@@ -382,12 +382,17 @@ Nodes keep each transaction's stranger-note slot for 24 hours from the
 start of its validity window, then may discard it: a request lives 24
 hours (O4), so no recipient needs the note afterwards. The tree, the
 nullifiers, the admission commitment and the coin-note slots stay
-permanent; pruning changes none of them. Open (I28): the proof is bound
-to the payload slots (statement 6), so a node that syncs history after a
-note was pruned cannot recheck that proof unless the chain keeps a
-commitment to the pruned slot (for example its 32-byte hash) that the
-proof binds to instead. The reference model prunes the bytes and keeps
-no such hash.
+permanent; pruning changes none of them.
+
+**Every transaction carries a permanent stranger-note hash** (I28,
+2026-11-20, unreviewed): `stranger_note_hash = H("stranger-note-slot",
+slot)`, a 32-byte public field. The proof binds to this hash and to the
+coin-note slots' bytes, never to the stranger slot's bytes (statement 6).
+The chain checks that a submitted slot hashes to it and rejects the
+transaction at no charge otherwise. So a node that syncs history after a
+note was pruned can still recompute every transaction's binding from
+permanent data. The model's hash is a BLAKE2s stand-in; the real one is
+whatever the circuit uses (section 8).
 
 Hidden statement, common part:
 
@@ -399,7 +404,8 @@ Hidden statement, common part:
 4. All values fit their range; no arithmetic wraps.
 5. Value is conserved:
    `sum(inputs) = sum(ordinary outputs) + sum(escrow outputs: price + fee_reserve) + sum(retired outputs) + F`.
-6. The proof is bound to every public field and to the payload slots.
+6. The proof is bound to every public field: the coin-note slots' bytes
+   and the stranger note's permanent hash (not its prunable bytes).
 
 Branches:
 
@@ -473,7 +479,11 @@ slot, the same work as finding any other note (I11). To fit the 200-byte
 slot, the copy records the escrow's price, reserve, recipient, seed and
 blinding and the two key paths, but not the refund identity and cancel
 authority themselves: the wallet derives both from the key paths, and the
-escrow commitment confirms them when the escrow is found.
+escrow commitment confirms them when the escrow is found. The copy's first
+plaintext byte is a version (1 today) naming both its layout and the
+key-derivation scheme; a wallet refuses a copy of a version it does not
+know rather than derive keys from it (2026-11-20, unreviewed). Version 1
+leaves 11 bytes of the slot spare.
 
 **Finding a refund.** A wallet does not look for the expected refund
 commitment anywhere in history. It first finds the finalised transaction

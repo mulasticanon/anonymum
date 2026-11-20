@@ -50,7 +50,7 @@ to write that bounded statement is part of the request.
 |---|---|---|
 | Shielded design specification, v0.7 | `docs/shielded-spec-v0.md` | **The main thing to review.** Rules only; no cryptographic suite chosen |
 | Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I27, questions raised while prototyping section 2a; R1-R12, the source review of cdad354 and their status |
-| Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 51 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
+| Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 61 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
 | Research report | `docs/Shielded_Payments_Technical_Research_2026-11-19.md` | 25,000 words, AI-written. Two claims spot-checked against primary sources (ZIP 257; Polkadot RFC-0163). The rest unchecked |
 | Alternative, heavier protocol | `docs/Shielded_Payments_Protocol_v0.1.md` | AI-written. Kept for comparison; section 8 of the spec lists the differences |
 | Messaging cryptography | `crates/crypto` (about 1,700 lines) | Working code, tested. Section 2a prototype: contact identities, cards and invitations; Noise IK with the authorisation check before any reply; the stranger's note opened with the inbox key alone. **Unreviewed (questions 11 and 12)** |
@@ -188,8 +188,11 @@ composition and whether it answers questions 11 and 12:
 - **Payload slots, pruning and the hybrid note** (issues file I28, I29;
   2026-11-20, unreviewed): every transaction has two 200-byte coin slots
   and one 1,787-byte stranger slot; the stranger slot is pruned 24 hours
-  after its window starts, which leaves those proofs uncheckable for a
-  late-syncing node unless a hash of the slot is kept (I28). The note is
+  after its window starts. Each transaction keeps a permanent 32-byte hash
+  of its stranger slot, which the proof binds to instead of the bytes, so
+  proofs stay checkable after pruning (I28, resolved in the model; which
+  hash the circuit uses is yours). The recovery copy now carries a
+  version byte for its layout and key derivation. The note is
   now hybrid: ML-KEM-768 ciphertext in the Noise prologue and its shared
   secret as the psk of `Noise_Xpsk0` (`ml-kem` 0.3.3); one ML-KEM key per
   card, signed through its BLAKE2s hash (card 1,408 bytes). Sender
