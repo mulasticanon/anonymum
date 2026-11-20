@@ -11,10 +11,18 @@
 //!   reward pool is the pallet's account, and burns reduce total issuance.
 //! * Invite proofs: the crates verify with `ed25519-dalek`'s
 //!   `verify_strict`; this pallet uses the host function
-//!   `sp_io::crypto::ed25519_verify`, which accepts some signatures that
-//!   `verify_strict` rejects (e.g. non-canonical encodings). Only the invite's
-//!   owner chooses the key, so this is not exploitable today, but the two
-//!   are not byte-for-byte the same check (audit F6).
+//!   `sp_io::crypto::ed25519_verify`. In the SDK version this workspace
+//!   builds against (sp-io 49, sp-core 43) its native implementation uses
+//!   `ed25519-zebra` (ZIP 215 rules: small-order keys and points allowed,
+//!   cofactored check), or `ed25519-dalek`'s non-strict `verify` when the
+//!   node registers `UseDalekExt`; on a live chain the node binary's own
+//!   copy decides. Either way it accepts signatures `verify_strict`
+//!   rejects: `tests.rs` shows an invite with a small-order key that any
+//!   opener can use. Only the invite's owner chooses the key (audit F6;
+//!   2026-11-20 audit HIGH-04).
+//! * Signed messages (v2) carry the chain's genesis hash, and the key
+//!   binding also the signing account, so a signature made for another
+//!   chain or another account is refused.
 //! * Balances are `u128` in the simulation, this pallet's mock and the dev
 //!   runtime. (The runtime used `u64` until audit F6.)
 //! * Accounts must keep the existential deposit: payments use
@@ -46,18 +54,22 @@ mod tests;
 use alloc::vec::Vec;
 use polkadot_sdk::polkadot_sdk_frame as frame;
 
-/// The exact bytes an invite proof signs (same as `anonymum-core`).
-pub fn invite_message(opener: &[u8], recipient: &[u8]) -> Vec<u8> {
-    let mut message = b"anonymum/invite/v1".to_vec();
+/// The exact bytes an invite proof signs (same as `anonymum-core`): the
+/// chain's genesis hash, the opener and the recipient.
+pub fn invite_message(genesis: &[u8], opener: &[u8], recipient: &[u8]) -> Vec<u8> {
+    let mut message = b"anonymum/invite/v2".to_vec();
+    message.extend_from_slice(genesis);
     message.extend_from_slice(opener);
     message.extend_from_slice(recipient);
     message
 }
 
 /// The exact bytes an account signs to bind its messaging key (same as
-/// `anonymum-core`).
-pub fn key_binding_message(key: &[u8; 32]) -> Vec<u8> {
-    let mut message = b"anonymum/msgkey-binding/v1".to_vec();
+/// `anonymum-core`): the chain's genesis hash, the account and the key.
+pub fn key_binding_message(genesis: &[u8], account: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    let mut message = b"anonymum/msgkey-binding/v2".to_vec();
+    message.extend_from_slice(genesis);
+    message.extend_from_slice(account);
     message.extend_from_slice(key);
     message
 }
@@ -77,7 +89,7 @@ pub mod pallet {
     use frame::deps::sp_core::ed25519;
     use frame::deps::sp_io;
     use frame::deps::sp_runtime::traits::{AccountIdConversion, IdentifyAccount, Verify};
-    use frame::deps::sp_runtime::SaturatedConversion;
+    use frame::deps::sp_runtime::{ArithmeticError, Percent, SaturatedConversion};
     use frame::prelude::*;
     use frame::traits::fungible::{Inspect, Mutate, MutateHold};
     use frame::traits::tokens::{Fortitude, Precision, Preservation, Restriction};
@@ -404,7 +416,8 @@ pub mod pallet {
             binding: T::Signature,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            ensure!(binding.verify(&key_binding_message(&key)[..], &who), Error::<T>::BadKeyBinding);
+            let message = key_binding_message(Self::genesis_hash().as_ref(), &who.encode(), &key);
+            ensure!(binding.verify(&message[..], &who), Error::<T>::BadKeyBinding);
             // One deposit per key: return the old one, hold the current one.
             if let Some(old) = MessagingKeys::<T>::get(&who) {
                 Self::release_hold(HoldReason::KeyDeposit, &who, old.deposit);
@@ -428,7 +441,7 @@ pub mod pallet {
             ensure!(!Invites::<T>::contains_key(&owner, key), Error::<T>::InviteAlreadyRegistered);
             let deposit = T::InviteDeposit::get();
             Self::hold(HoldReason::InviteDeposit, &owner, deposit)?;
-            let seq = Self::take_seq();
+            let seq = Self::take_seq()?;
             Invites::<T>::insert(&owner, key, Invite { expires_at, seq, deposit });
             Self::deposit_event(Event::InviteRegistered { owner, key });
             Ok(())
@@ -485,7 +498,7 @@ pub mod pallet {
             if let Some(block) = Blocks::<T>::get(&recipient, &opener) {
                 ensure!(invite.seq >= block.seq, Error::<T>::Blocked);
             }
-            let message = invite_message(&opener.encode(), &recipient.encode());
+            let message = invite_message(Self::genesis_hash().as_ref(), &opener.encode(), &recipient.encode());
             ensure!(
                 sp_io::crypto::ed25519_verify(
                     &ed25519::Signature::from_raw(proof),
@@ -501,8 +514,7 @@ pub mod pallet {
             if let Some(id) = RequestByPair::<T>::get(pair::<T>(&opener, &recipient)) {
                 Self::refund(id, RefundReason::Superseded);
             }
-            Self::open_channel(opener, recipient, OpenedVia::Invite);
-            Ok(())
+            Self::open_channel(opener, recipient, OpenedVia::Invite)
         }
 
         /// Expensive path: pay the network fee and escrow the recipient's
@@ -531,8 +543,10 @@ pub mod pallet {
             let available = T::Currency::reducible_balance(&from, Preservation::Preserve, Fortitude::Polite);
             ensure!(available >= fee.saturating_add(price), Error::<T>::InsufficientFunds);
 
-            let expires_at = frame_system::Pallet::<T>::block_number() + Self::request_ttl_blocks();
-            let id = Self::take_id();
+            let expires_at = frame_system::Pallet::<T>::block_number()
+                .checked_add(&Self::request_ttl_blocks())
+                .ok_or(ArithmeticError::Overflow)?;
+            let id = Self::take_id()?;
             ExpiryQueue::<T>::try_mutate(expires_at, |queue| queue.try_push(id))
                 .map_err(|_| Error::<T>::ExpiryQueueFull)?;
             Self::pay_network_fee(&from, fee)?;
@@ -565,8 +579,8 @@ pub mod pallet {
             )?;
             Requests::<T>::remove(request);
             RequestByPair::<T>::remove(pair::<T>(&req.from, &req.to));
-            Self::open_channel(req.from, req.to, OpenedVia::PaidRequest);
-            Ok(())
+            Self::unqueue(request, req.expires_at);
+            Self::open_channel(req.from, req.to, OpenedVia::PaidRequest)
         }
 
         /// Either side cancels: the price returns minus the burned decline fee.
@@ -670,15 +684,37 @@ pub mod pallet {
             amount / denom * bps + up
         }
 
+        /// The burned share of a network fee, rounded down; cannot overflow.
+        pub fn burn_share(fee: BalanceOf<T>) -> BalanceOf<T> {
+            Percent::from_percent(T::FeeBurnPercent::get().min(100)).mul_floor(fee)
+        }
+
+        /// The chain's genesis hash, which signed messages carry.
+        pub fn genesis_hash() -> T::Hash {
+            frame_system::Pallet::<T>::block_hash(BlockNumberFor::<T>::zero())
+        }
+
         /// Burn part of a network fee and pay the rest into the pool.
         fn pay_network_fee(from: &T::AccountId, fee: BalanceOf<T>) -> DispatchResult {
             let available = T::Currency::reducible_balance(from, Preservation::Preserve, Fortitude::Polite);
             ensure!(available >= fee, Error::<T>::InsufficientFunds);
-            let percent: BalanceOf<T> = u32::from(T::FeeBurnPercent::get().min(100)).into();
-            let burn = fee * percent / 100u32.into();
+            let burn = Self::burn_share(fee);
             T::Currency::burn_from(from, burn, Preservation::Preserve, Precision::Exact, Fortitude::Polite)?;
-            T::Currency::transfer(from, &Self::pool_account(), fee - burn, Preservation::Preserve)?;
+            T::Currency::transfer(from, &Self::pool_account(), fee.saturating_sub(burn), Preservation::Preserve)?;
             Ok(())
+        }
+
+        /// Free a resolved request's slot in the expiry queue (2026-11-20
+        /// audit HIGH-01), so early answers do not use up the block's cap.
+        fn unqueue(id: RequestId, expires_at: BlockNumberFor<T>) {
+            ExpiryQueue::<T>::mutate_exists(expires_at, |queue| {
+                if let Some(ids) = queue {
+                    ids.retain(|queued| *queued != id);
+                    if ids.is_empty() {
+                        *queue = None;
+                    }
+                }
+            });
         }
 
         /// End a request without a paid channel. The decline fee is burned
@@ -686,6 +722,7 @@ pub mod pallet {
         fn refund(id: RequestId, reason: RefundReason<T::AccountId>) {
             let Some(req) = Requests::<T>::take(id) else { return };
             RequestByPair::<T>::remove(pair::<T>(&req.from, &req.to));
+            Self::unqueue(id, req.expires_at);
             let burned = match reason {
                 RefundReason::Superseded | RefundReason::Blocked => Zero::zero(),
                 RefundReason::CancelledBy(_) | RefundReason::Expired => {
@@ -708,7 +745,7 @@ pub mod pallet {
         }
 
         /// A channel needs both sides' consent, so it clears blocks both ways.
-        fn open_channel(a: T::AccountId, b: T::AccountId, via: OpenedVia) {
+        fn open_channel(a: T::AccountId, b: T::AccountId, via: OpenedVia) -> DispatchResult {
             let (a, b) = pair::<T>(&a, &b);
             for (blocker, target) in [(&a, &b), (&b, &a)] {
                 if let Some(entry) = Blocks::<T>::take(blocker, target) {
@@ -720,11 +757,12 @@ pub mod pallet {
                     });
                 }
             }
-            let id = Self::take_id();
+            let id = Self::take_id()?;
             let opened_at = frame_system::Pallet::<T>::block_number();
             Channels::<T>::insert(id, Channel { a: a.clone(), b: b.clone(), opened_at, via });
             ChannelByPair::<T>::insert((a.clone(), b.clone()), id);
             Self::deposit_event(Event::ChannelOpened { channel: id, a, b, via });
+            Ok(())
         }
 
         fn remove_channel(channel: ChannelId, ch: &Channel<T::AccountId, BlockNumberFor<T>>, by: T::AccountId) {
@@ -736,7 +774,7 @@ pub mod pallet {
         fn add_block(blocker: T::AccountId, target: T::AccountId) -> DispatchResult {
             let deposit = T::BlockDeposit::get();
             Self::hold(HoldReason::BlockDeposit, &blocker, deposit)?;
-            let seq = Self::take_seq();
+            let seq = Self::take_seq()?;
             Blocks::<T>::insert(&blocker, &target, BlockEntry { seq, deposit });
             Self::deposit_event(Event::Blocked { by: blocker, target });
             Ok(())
@@ -757,17 +795,17 @@ pub mod pallet {
             }
         }
 
-        fn take_id() -> u64 {
-            NextId::<T>::mutate(|n| {
-                *n += 1;
-                *n
+        fn take_id() -> Result<u64, DispatchError> {
+            NextId::<T>::try_mutate(|n| {
+                *n = n.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+                Ok(*n)
             })
         }
 
-        fn take_seq() -> u64 {
-            NextSeq::<T>::mutate(|n| {
-                *n += 1;
-                *n
+        fn take_seq() -> Result<u64, DispatchError> {
+            NextSeq::<T>::try_mutate(|n| {
+                *n = n.checked_add(1).ok_or(ArithmeticError::Overflow)?;
+                Ok(*n)
             })
         }
     }

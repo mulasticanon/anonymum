@@ -114,8 +114,10 @@ try {
 
   // ---- 1. wallets -----------------------------------------------------------
   console.log('\n1. Two wallets from anonymum-crypto; their Ed25519 keys are their chain accounts.');
-  const bob = rust('wallet', join(bobDir, 'bob.wallet'));
-  const carol = rust('wallet', join(carolDir, 'carol.wallet'));
+  // The key binding (v2) names this chain's genesis hash and the account.
+  const genesisHex = api.genesisHash.toHex().slice(2);
+  const bob = rust('wallet', join(bobDir, 'bob.wallet'), '--genesis', genesisHex);
+  const carol = rust('wallet', join(carolDir, 'carol.wallet'), '--genesis', genesisHex);
   const ed = new Keyring({ type: 'ed25519', ss58Format: 42 });
   const bobAccount = ed.addFromSeed(walletSigningSeed(join(bobDir, 'bob.wallet')));
   const carolAccount = ed.addFromSeed(walletSigningSeed(join(carolDir, 'carol.wallet')));

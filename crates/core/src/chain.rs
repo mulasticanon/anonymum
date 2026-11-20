@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::crypto::{
-    invite_message, InviteKey, InviteProof, InviteScheme, KeyBinding, MessagingKey, SealedNote,
+    invite_message, key_binding_message, InviteKey, InviteProof, InviteScheme, KeyBinding, MessagingKey, SealedNote,
     SEALED_NOTE_LEN,
 };
 use crate::ledger::{InsufficientFunds, Ledger};
@@ -53,6 +53,9 @@ pub struct Params {
     pub invite_deposit: Amount,
     pub block_deposit: Amount,
     pub key_deposit: Amount,
+    /// Which chain this is (a real chain's genesis hash). Signed messages
+    /// carry it, so a signature made for another chain is refused.
+    pub genesis: [u8; 32],
 }
 
 impl Default for Params {
@@ -68,6 +71,7 @@ impl Default for Params {
             invite_deposit: COIN / 100,
             block_deposit: COIN / 100,
             key_deposit: COIN / 100,
+            genesis: *b"anonymum-core-simulation-genesis",
         }
     }
 }
@@ -395,7 +399,8 @@ impl<S: InviteScheme> Chain<S> {
                 self.events.push(Event::AcceptStrangersSet { who: sender, accept });
             }
             Tx::PublishMessagingKey { key, binding } => {
-                if !self.scheme.verify_key_binding(&sender, &key, &binding) {
+                let message = key_binding_message(&self.params.genesis, &sender, &key);
+                if !self.scheme.verify_key_binding(&sender, &message, &binding) {
                     return Err(Error::BadKeyBinding);
                 }
                 // One deposit per key; replacing a key carries it over.
@@ -524,7 +529,7 @@ impl<S: InviteScheme> Chain<S> {
                 return Err(Error::Blocked);
             }
         }
-        if !self.scheme.verify(&key, &invite_message(&opener, &recipient), &proof) {
+        if !self.scheme.verify(&key, &invite_message(&self.params.genesis, &opener, &recipient), &proof) {
             return Err(Error::BadInviteProof);
         }
         // All checks passed; the fee is the last thing that can fail.

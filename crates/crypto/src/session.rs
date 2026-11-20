@@ -71,6 +71,8 @@ pub enum SessionError {
     WeakKey,
     /// Decrypted, but the content was refused (wrong record type).
     Refused,
+    /// The send counter is used up; start a new session.
+    Exhausted,
 }
 
 impl fmt::Display for SessionError {
@@ -215,12 +217,14 @@ impl Session {
         if plaintext.len() > MAX_PLAINTEXT {
             return Err(SessionError::TooLarge);
         }
+        // Noise reserves the last nonce value; refuse rather than wrap.
         let nonce = self.next_send;
+        let next = nonce.checked_add(1).filter(|n| *n < u64::MAX).ok_or(SessionError::Exhausted)?;
         let mut out = vec![0u8; NONCE_LEN + plaintext.len() + TAG_LEN];
         out[..NONCE_LEN].copy_from_slice(&nonce.to_le_bytes());
         let n = self.transport.write_message(nonce, plaintext, &mut out[NONCE_LEN..])?;
         out.truncate(NONCE_LEN + n);
-        self.next_send += 1;
+        self.next_send = next;
         Ok(out)
     }
 
@@ -482,6 +486,18 @@ mod tests {
         for weak in crate::contact::tests::SMALL_ORDER {
             assert!(matches!(Handshake::initiate(&alice, &weak, &NET, &CTX, &REF), Err(SessionError::WeakKey)));
         }
+    }
+
+    #[test]
+    fn the_send_counter_refuses_to_wrap() {
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (mut a, mut b) = connect(&alice, &bob);
+        // u64::MAX is reserved by Noise; the last usable nonce is MAX - 1.
+        a.next_send = u64::MAX - 2;
+        let last = a.seal(b"last").unwrap();
+        assert_eq!(b.open(&last).unwrap(), b"last");
+        assert!(matches!(a.seal(b"one too many"), Err(SessionError::Exhausted)));
+        assert!(matches!(a.seal(b"still"), Err(SessionError::Exhausted)), "and stays refused");
     }
 
     #[test]

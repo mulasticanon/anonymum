@@ -160,6 +160,14 @@ composition and whether it answers questions 11 and 12:
   inside `snow` are not; see the issues file), the call id and attempt are
   in the IK prologue, every sealed record carries its type, and pending
   handshakes, idle sessions and callback grants expire by deadline.
+- **Also for you** (issues file, "AI-written audit of 3f7092d"): no
+  forward secrecy for notes sealed to a long-lived inbox key (inbox key
+  rotation as a candidate mitigation); no delay between claim finality and
+  the callback; dummy payload slots that must be indistinguishable from
+  real ones, and the model's 252-byte slot against the 587-byte note;
+  post-quantum key exchange and ratcheting as long-term questions; and
+  the host Ed25519 check (ZIP 215 via `ed25519-zebra`) accepting small-order
+  invite keys that `verify_strict` refuses.
 - **Open questions for you** (issues file, "Open questions recorded
   2026-11-20"): durable and multi-device grant state; Bob's callback using
   the handshake key on his card (I16); the note signature as transferable

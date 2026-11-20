@@ -220,7 +220,8 @@ async fn run() -> Result<(), AnyError> {
     // The transparent prototype chain still requires a published wallet key
     // before it accepts requests to Bob (a known gap until stage 5). Notes
     // are sealed to the inbox key on his card, not to this key.
-    chain.apply(bob_wallet.address(), bob_wallet.publish_key_tx())?;
+    let genesis = chain.params().genesis;
+    chain.apply(bob_wallet.address(), bob_wallet.publish_key_tx(&genesis))?;
 
     println!("\nOn-chain: Bob creates a chain invite, Alice uses it to open a channel.");
     let chain_invite = InviteSecret::generate();
@@ -231,7 +232,7 @@ async fn run() -> Result<(), AnyError> {
         Tx::OpenWithInvite {
             recipient: bob_wallet.address(),
             key: handed_over.public(),
-            proof: handed_over.sign_for(&alice_wallet.address(), &bob_wallet.address()),
+            proof: handed_over.sign_for(&genesis, &alice_wallet.address(), &bob_wallet.address()),
         },
     )?;
 
@@ -481,7 +482,8 @@ async fn stranger_side(
 // people run as separate processes that share only the chain and the
 // mixnet.
 //
-//   anonymum-nym wallet <file>       create (or load) a wallet and a separate
+//   anonymum-nym wallet <file> --genesis HEX
+//                                    create (or load) a wallet and a separate
 //                                    contact identity; print the address,
 //                                    messaging key, binding and contact card
 //   anonymum-nym throwaway <dir>     create a persisted throwaway Nym client;
@@ -579,7 +581,9 @@ fn cmd_wallet(args: &[String]) -> Result<(), AnyError> {
     }
     let wallet = load_wallet(path)?;
     let contact = load_contact(path)?;
-    let Tx::PublishMessagingKey { key, binding } = wallet.publish_key_tx() else { unreachable!() };
+    // The binding (v2) names the chain's genesis hash, given by the caller.
+    let genesis = fixed::<32>(flag(args, "--genesis")?)?;
+    let Tx::PublishMessagingKey { key, binding } = wallet.publish_key_tx(&genesis) else { unreachable!() };
     let MessagingKey(key) = key;
     println!("address={}", to_hex(&wallet.address().0));
     println!("msgkey={}", to_hex(&key));

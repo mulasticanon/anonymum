@@ -96,7 +96,9 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 1: contact notes grew from 427 to 587 bytes (spec v0.7 section 2a).
 	// Notes stored before the change cannot be opened by the new format,
 	// by design; the dev chain starts from a fresh genesis each run.
-	spec_version: 1,
+	// 2: signed messages v2 (genesis hash in invite proofs and key bindings,
+	// account in key bindings); v1 signatures no longer verify.
+	spec_version: 2,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,

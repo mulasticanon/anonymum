@@ -15,11 +15,11 @@ Four crates, plus a Substrate port in `substrate/`:
 
 | Crate | What it is | Verified how |
 |---|---|---|
-| `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 84 tests |
+| `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 94 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
-| `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
+| `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
 
@@ -93,6 +93,11 @@ share only the chain and the mixnet; every transaction waited for
 finality, and Bob's process got the callback key, route and request
 reference only from the note it decrypted.
 
+After the AI audit of 3f7092d (2026-11-20; runtime `spec_version` 2, v2
+signed messages with the genesis hash): `smoke.mjs` and `e2e.mjs` passed
+against the dev node, which verified the real v2 key binding and invite
+proof; the live demo passed in 205 s.
+
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
 `nym-node`'s gateway config; operators can change it). That is shorter than
@@ -106,7 +111,7 @@ throwaway client; a real client would retry on a slower schedule.
 cannot disturb the pinned Nym crates.
 
     cd substrate
-    cargo test -p pallet-anonymum                 # 57 tests, mock runtime
+    cargo test -p pallet-anonymum                 # 64 tests, mock runtime
     cargo build --release -p anonymum-runtime     # native + WebAssembly runtime
 
 On Windows (Rust 1.100, 8 cores, 7.7 GB RAM, `-j 4`): the first release
@@ -154,10 +159,11 @@ Differences from the in-process simulation:
   invite. Both rates are placeholders, and the weights behind them are not
   benchmarked yet.
 - Invite proofs: the crates check with `ed25519-dalek`'s `verify_strict`,
-  the pallet with the runtime's `ed25519_verify` host function, which is
-  more permissive (it accepts some non-canonical signatures). Only the
-  invite's owner picks the key, so this is not exploitable today, but the
-  two checks differ.
+  the pallet with the runtime's `ed25519_verify` host function, which here
+  follows ZIP 215 (`ed25519-zebra`) and is more permissive: a test shows an
+  invite with a small-order key that anyone can open. Only the invite's
+  owner picks the key, so it hurts no one else today, but the two checks
+  differ.
 - Balances are `u128` everywhere: simulation, pallet mock and dev runtime
   (the runtime used `u64` until 2026-11-18).
 - Expiry uses one queue per block; at most `MaxRequestsPerBlock` (256)
@@ -219,7 +225,7 @@ I14).
 |---|---|
 | Fee and channel rules, blocks, invite-only | Built, tested |
 | Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live, including once end to end through the dev chain (`e2e.mjs`). Retry rules live in `anonymum_crypto::wire`; the demo binary drives them |
-| Invites | Real Ed25519 signatures, bound to opener and recipient |
+| Invites | Real Ed25519 signatures, bound to opener, recipient and the chain's genesis hash (v2 messages; the messaging-key binding also names the account) |
 | End-to-end encryption | Noise IK (X25519, ChaCha20-Poly1305, BLAKE2s) between contact keys, never wallet keys. The answering side reads the caller's key inside message 1 and replies only to a caller it authorised (invitation, contact, expected callback); anyone else gets nothing. **Unreviewed prototype** (spec questions 11 and 12) |
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |
 | Mixnet transport | Nym SDK; replies go through single-use reply blocks, so the recipient never learns the caller's network location. Ran once live; no automated test |

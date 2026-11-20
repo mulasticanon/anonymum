@@ -50,7 +50,7 @@ fn main() {
     for who in everyone {
         chain.mint(who, 10 * COIN);
         let key = MessagingKey(who.0);
-        let binding = anonymum_core::crypto::mock::mock_binding(&who, &key);
+        let binding = anonymum_core::crypto::mock::mock_binding(&Params::default().genesis, &who, &key);
         chain.apply(who, Tx::PublishMessagingKey { key, binding }).unwrap();
     }
     let mut bob_inbox = Inbox::new(bob, 5, 1);
@@ -70,7 +70,7 @@ fn main() {
             Tx::OpenWithInvite {
                 recipient: bob,
                 key: invite.public(),
-                proof: invite.sign(&invite_message(&alice, &bob)),
+                proof: invite.sign(&invite_message(&Params::default().genesis, &alice, &bob)),
             },
         )
         .unwrap();

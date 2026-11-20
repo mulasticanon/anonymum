@@ -45,34 +45,27 @@ impl Identity {
         PublicKey::from(&self.messaging).to_bytes()
     }
 
-    /// Signature by the address key over the encryption key.
-    pub(crate) fn binding(&self) -> [u8; 64] {
-        self.signing.sign(&binding_message(&self.messaging_public())).to_bytes()
+    /// Signature by the address key over the encryption key, for the chain
+    /// with this genesis hash.
+    pub(crate) fn binding(&self, genesis: &[u8; 32]) -> [u8; 64] {
+        let message = key_binding_message(genesis, &self.address(), &MessagingKey(self.messaging_public()));
+        self.signing.sign(&message).to_bytes()
     }
 
-    /// The transaction that publishes this wallet's messaging key on-chain,
-    /// so strangers can seal contact notes to it.
-    pub fn publish_key_tx(&self) -> Tx {
+    /// The transaction that publishes this wallet's messaging key on the
+    /// chain with genesis hash `genesis`.
+    pub fn publish_key_tx(&self, genesis: &[u8; 32]) -> Tx {
         Tx::PublishMessagingKey {
             key: MessagingKey(self.messaging_public()),
-            binding: KeyBinding(self.binding()),
+            binding: KeyBinding(self.binding(genesis)),
         }
     }
 }
 
-fn binding_message(messaging_public: &[u8; 32]) -> Vec<u8> {
-    key_binding_message(&MessagingKey(*messaging_public))
-}
-
-/// Does `address` vouch for `messaging_public`?
-pub(crate) fn verify_binding(
-    address: &Address,
-    messaging_public: &[u8; 32],
-    binding: &[u8; 64],
-) -> bool {
+/// Is `binding` `address`'s strict Ed25519 signature over `message`?
+pub(crate) fn verify_binding(address: &Address, message: &[u8], binding: &[u8; 64]) -> bool {
     let Ok(key) = VerifyingKey::from_bytes(&address.0) else {
         return false;
     };
-    key.verify_strict(&binding_message(messaging_public), &Signature::from_bytes(binding))
-        .is_ok()
+    key.verify_strict(message, &Signature::from_bytes(binding)).is_ok()
 }

@@ -242,3 +242,50 @@ Is that acceptable for IK and N here, or must the resolver fail closed?
   work before refusing differs (a blocked key, an unknown key and a wrong
   answerer key each stop at a different point). Nobody has measured what a
   caller, a gateway or a network observer can tell.
+
+## AI-written audit of 3f7092d (2026-11-20)
+
+`docs/ai-audit-3f7092d-2026-11-20.md` (AI-written; not a human audit).
+Status after the fixes of 2026-11-20:
+
+| # | Finding (short) | Status |
+|---|---|---|
+| A1 (HIGH-01) | Early answers never left `ExpiryQueue`, so a block's slot could be filled and the cap reached | **Fixed in the pallet.** Accepting, declining, cancelling, superseding or blocking removes the request's id from its slot (and an empty slot is deleted). Tested with every kind of early resolution; the "queue full charges nothing" test is kept. The in-process simulation (`anonymum-core`) scans for expiry and has no queue. Lazy, permissionless expiry and benchmarked weights (the audit's remedy) are not done |
+| A2 (HIGH-04) | Key binding and invite proofs named no chain; the binding named no account | **Fixed.** Both messages are v2: `"anonymum/msgkey-binding/v2" ‖ genesis ‖ account ‖ key` and `"anonymum/invite/v2" ‖ genesis ‖ opener ‖ recipient`, in the pallet (`block_hash(0)`), core (`Params::genesis`), crypto and both scripts. Tested: a binding for one account is refused for another; a signature for another genesis hash is refused (pallet, core, and with real keys in crypto). No nonce was added: invites are one-time and a binding is replaced by publishing a new one |
+| A2b | `sp_io::crypto::ed25519_verify` and `verify_strict` | **Checked, not changed.** In this workspace's SDK (sp-io 49, sp-core 43) the native host function verifies with `ed25519-zebra` (ZIP 215: small-order keys and points allowed, cofactored equation), or with `ed25519-dalek`'s non-strict `verify` when the node registers `UseDalekExt`; on a live chain the node binary's own copy decides. A pallet test shows an invite whose key is the identity point opened by anyone with (R = identity, S = 0); a crypto test shows `verify_strict` refusing the same. Only the invite's owner chooses its key. Candidate fix, not done: refuse small-order invite keys at registration |
+| A3 (MED-02) | Unchecked pallet arithmetic | **Fixed.** `Percent::mul_floor` for the fee split; checked adds for the expiry height and the id and sequence counters, returning `ArithmeticError::Overflow` and charging nothing. Tested at each boundary |
+| A4 (HIGH-02) | Sessions keyed by reply handle and unbounded; one caller could fill the pending table | **Fixed.** Live sessions are keyed by the caller's authenticated key (one each) with a route table from reply handle to caller. Caps with named defaults: `MAX_PENDING` 1,024, `MAX_PENDING_PER_CALLER` 4, `MAX_SESSIONS` 1,024 (`Limits`). A repeated CONFIRM from a new handle gets the cached ACK there, but the session moves only when a fresh data frame from that handle decrypts, so a replayed CONFIRM cannot redirect replies. At the session cap a new caller is refused before its CONFIRM is opened and nothing is committed. Tests for each |
+| A5 (MED-01) | Unchecked send counter | **Fixed.** `Session::seal` refuses (`Exhausted`) before the reserved nonce `u64::MAX`; it cannot wrap. No rekeying |
+| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved** (see below and earlier sections: I8, I13, I27, R8) |
+| A7 (LOW-01) | Replace the random-secret key check with a list of small-order points | **Not done, by decision**: no hand-written list of bad points; the check stays on `x25519-dalek`'s `was_contributory` |
+
+**Where the audit is wrong or overstated (my reading, for the owner).**
+- HIGH-02 says Nym sender tags "rotate across batches". In `nym-sdk` 1.21.6,
+  as recorded in CLAUDE.md, `get_or_create_sender_tag` gives one stable tag
+  per sender and recipient; a tag changes when the caller's client is
+  replaced. The fix is still right, but the trigger is a reconnection, not
+  every batch.
+- MED-01 calls a wrapping send counter "catastrophic": reaching 2^64
+  messages in one session is not practical, so this was hygiene, not a live
+  risk.
+- HIGH-01's severity assumes an attacker who pays the network fee for every
+  slot-filling request; it is still worth fixing, and is fixed.
+- CRIT-01 restates known, documented gaps (the transparent chain publishes
+  the contact graph; the shielded layer is a model) rather than a new
+  defect.
+
+**Recorded 2026-11-20 for the cryptographer (not to be solved yet).**
+- **No forward secrecy for stranger notes.** A note is sealed to a
+  long-lived inbox key; if that key leaks, every recorded note to it opens.
+  Candidate mitigation: rotate the inbox key (short card validity) and
+  erase old inbox secrets once no pending request can still use them.
+- **No delay between claim finality and the callback.** The recipient
+  calls the throwaway route as soon as the acceptance is final, so the
+  timing links the chain event to the mixnet traffic. Random delay or batched
+  callbacks are candidates.
+- **Dummy payload slots must be indistinguishable from real ones.** The
+  model pads with zeros (review M2), and its 252-byte slot cannot hold the
+  587-byte note (I24): slot size and dummy content must be fixed together.
+- **Post-quantum key exchange and ratcheting** remain long-term questions:
+  no per-message forward secrecy (no double ratchet) and no post-quantum
+  key agreement in sessions or notes.

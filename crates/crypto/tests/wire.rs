@@ -5,8 +5,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anonymum_crypto::wire::{
-    Initiator, InitiatorEvent, Responder, ResponderEvent, RetryPolicy, WireError, MAX_DATA, MAX_FRAME,
-    PENDING_TIMEOUT, SESSION_IDLE_TIMEOUT,
+    Initiator, InitiatorEvent, Limits, Responder, ResponderEvent, RetryPolicy, WireError, MAX_DATA, MAX_FRAME,
+    MAX_PENDING, MAX_PENDING_PER_CALLER, MAX_SESSIONS, PENDING_TIMEOUT, SESSION_IDLE_TIMEOUT,
 };
 use anonymum_crypto::{ContactIdentity, Grant, Network, Now, Purpose, SessionError, StaticKey};
 
@@ -31,6 +31,12 @@ impl Bob {
         let me = ContactIdentity::generate();
         let side = Responder::for_identity(&me, NET);
         Bob { me, side, now: Now { unix: UNIX, mono: Instant::now() } }
+    }
+
+    fn with_limits(limits: Limits) -> Bob {
+        let mut bob = Bob::new();
+        bob.side = Responder::for_identity(&bob.me, NET).with_limits(limits);
+        bob
     }
 
     fn invite(&mut self) -> Caller {
@@ -703,4 +709,107 @@ fn oversized_frames_are_refused_on_both_sides_and_in_a_session() {
     assert!(matches!(bob.handle(1, &huge), Err(WireError::Oversized)));
     assert!(matches!(call.handle(&huge), Err(WireError::Oversized)));
     talks(&mut call, &alice, &mut bob, 1);
+}
+
+// ---- sessions per caller, caps (2026-11-20 audit HIGH-02) ----------------------
+
+#[test]
+fn the_default_limits_are_the_named_constants() {
+    let limits = Limits::default();
+    assert_eq!((limits.pending, limits.pending_per_caller, limits.sessions), (MAX_PENDING, MAX_PENDING_PER_CALLER, MAX_SESSIONS));
+}
+
+#[test]
+fn one_authorised_caller_cannot_fill_the_pending_table_for_others() {
+    let mut bob = Bob::with_limits(Limits { pending: 6, pending_per_caller: 4, sessions: 16 });
+    let (alice, carol) = (bob.invite(), bob.invite());
+    // Alice opens ten calls from ten handles and never confirms any.
+    let mut answered = 0;
+    for tag in 100..110 {
+        let (_, hello) = bob.call(&alice, POLICY);
+        match bob.handle(tag, &hello) {
+            Ok(ResponderEvent::Reply(_)) => answered += 1,
+            Err(WireError::Busy) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(answered, 4, "her share of answered handshakes");
+    assert_eq!(bob.side.pending(), 4);
+    // Carol still gets through.
+    let mut call = establish(&carol, &mut bob, 1);
+    talks(&mut call, &carol, &mut bob, 1);
+    // A repeat of one of Alice's answered HELLOs is still answered (it
+    // replaces nothing and adds nothing).
+    assert_eq!(bob.side.pending(), 4);
+}
+
+#[test]
+fn a_reconnecting_caller_keeps_one_session_on_its_new_handle() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let _old = establish(&alice, &mut bob, 1);
+    let mut new = establish(&alice, &mut bob, 2);
+    assert_eq!(bob.side.sessions(), 1, "one session per caller key");
+    assert!(bob.side.is_live(&2) && !bob.side.is_live(&1));
+    talks(&mut new, &alice, &mut bob, 2);
+}
+
+#[test]
+fn a_caller_whose_handle_changes_after_a_lost_ack_keeps_its_session() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    let _lost = established(bob.handle(1, &confirm).unwrap(), &alice);
+    // Her resend arrives on a new handle: the cached ACK is sent there.
+    let again = call.on_timeout().unwrap().unwrap();
+    let ack = reply(bob.handle(2, &again).unwrap());
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    assert!(bob.side.is_live(&1), "a repeated CONFIRM alone moves nothing");
+    // Her first fresh message on the new handle moves the session there.
+    let frame = call.seal(b"from my new handle").unwrap();
+    assert!(matches!(bob.handle(2, &frame), Ok(ResponderEvent::Message { .. })));
+    assert!(bob.side.is_live(&2) && !bob.side.is_live(&1));
+    assert_eq!(bob.side.sessions(), 1);
+    let frame = bob.seal(2, b"answer on the new handle").unwrap();
+    assert_eq!(call.handle(&frame).unwrap(), InitiatorEvent::Message(b"answer on the new handle".to_vec()));
+}
+
+#[test]
+fn a_replayed_confirm_or_data_frame_cannot_redirect_a_session() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    let ack = established(bob.handle(1, &confirm).unwrap(), &alice);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    let data = call.seal(b"hello").unwrap();
+    assert!(matches!(bob.handle(1, &data), Ok(ResponderEvent::Message { .. })));
+    // Someone replays both from handle 99.
+    let _ = bob.handle(99, &confirm);
+    assert!(matches!(bob.handle(99, &data), Err(WireError::Session(SessionError::Replay))));
+    assert!(bob.side.is_live(&1) && !bob.side.is_live(&99), "the session stays on Alice's handle");
+    talks(&mut call, &alice, &mut bob, 1);
+}
+
+#[test]
+fn the_session_cap_refuses_a_new_caller_and_commits_nothing() {
+    let mut bob = Bob::with_limits(Limits { pending: 16, pending_per_caller: 4, sessions: 2 });
+    let (alice, carol, dave) = (bob.invite(), bob.invite(), bob.invite());
+    establish(&alice, &mut bob, 1);
+    establish(&carol, &mut bob, 2);
+    let (mut call, hello) = bob.call(&dave, POLICY);
+    let welcome = reply(bob.handle(3, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    assert!(matches!(bob.handle(3, &confirm), Err(WireError::Busy)), "nothing sent");
+    assert!(!bob.side.gate().is_honoured(&dave.reference), "the invitation is not used");
+    // A known caller may still replace its own session at the cap.
+    establish(&alice, &mut bob, 4);
+    assert_eq!(bob.side.sessions(), 2);
+    // Once a place is free, Dave gets in on the same invitation.
+    bob.side.remove_contact(carol.key.public());
+    let ack = established(bob.handle(3, &confirm).unwrap(), &dave);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
 }

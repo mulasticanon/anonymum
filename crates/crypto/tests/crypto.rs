@@ -1,3 +1,6 @@
+/// The core simulation's default genesis id.
+const G: [u8; 32] = *b"anonymum-core-simulation-genesis";
+
 use anonymum_core::crypto::InviteProof;
 use anonymum_core::{Chain, Error, Params, Tx, COIN};
 use anonymum_crypto::{ContactIdentity, Ed25519Invites, Identity, InviteSecret, StaticKey};
@@ -23,7 +26,7 @@ fn real_invite_opens_channel_on_chain() {
             Tx::OpenWithInvite {
                 recipient: bob.address(),
                 key: received.public(),
-                proof: received.sign_for(&alice.address(), &bob.address()),
+                proof: received.sign_for(&G, &alice.address(), &bob.address()),
             },
         )
         .unwrap();
@@ -39,7 +42,7 @@ fn copied_or_tampered_invite_proof_fails() {
     chain.mint(bob.address(), COIN); // invite deposit
     let invite = InviteSecret::generate();
     chain.apply(bob.address(), Tx::RegisterInvite { key: invite.public(), expires_at: None }).unwrap();
-    let proof = invite.sign_for(&alice.address(), &bob.address());
+    let proof = invite.sign_for(&G, &alice.address(), &bob.address());
 
     // Mallory front-runs with Alice's proof.
     let stolen = Tx::OpenWithInvite { recipient: bob.address(), key: invite.public(), proof: proof.clone() };
@@ -69,4 +72,45 @@ fn identities_survive_save_and_restore() {
     assert_eq!(restored.inbox_key().public(), bob.inbox_key().public());
     let key = StaticKey::generate();
     assert_eq!(StaticKey::from_bytes(key.to_bytes()).public(), key.public());
+}
+
+#[test]
+fn a_real_binding_is_refused_for_another_account_or_chain() {
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let mut chain = Chain::new(Params::default(), Ed25519Invites);
+    chain.mint(alice.address(), COIN);
+    chain.mint(bob.address(), COIN);
+    // Alice's binding, submitted by Bob: the message names Alice's account.
+    assert_eq!(chain.apply(bob.address(), alice.publish_key_tx(&G)).unwrap_err(), Error::BadKeyBinding);
+    // A binding made for another chain.
+    assert_eq!(chain.apply(alice.address(), alice.publish_key_tx(&[7; 32])).unwrap_err(), Error::BadKeyBinding);
+    chain.apply(alice.address(), alice.publish_key_tx(&G)).unwrap();
+}
+
+#[test]
+fn a_real_invite_proof_for_another_chain_is_refused() {
+    let (alice, bob) = (Identity::generate(), Identity::generate());
+    let mut chain = Chain::new(Params::default(), Ed25519Invites);
+    chain.mint(alice.address(), 10 * COIN);
+    chain.mint(bob.address(), COIN);
+    let invite = InviteSecret::generate();
+    chain.apply(bob.address(), Tx::RegisterInvite { key: invite.public(), expires_at: None }).unwrap();
+    let foreign = Tx::OpenWithInvite {
+        recipient: bob.address(),
+        key: invite.public(),
+        proof: invite.sign_for(&[7; 32], &alice.address(), &bob.address()),
+    };
+    assert_eq!(chain.apply(alice.address(), foreign).unwrap_err(), Error::BadInviteProof);
+}
+
+#[test]
+fn strict_verification_refuses_the_small_order_invite_the_host_function_accepts() {
+    // The pallet test `the_host_ed25519_check_accepts_a_small_order_invite_key`
+    // shows sp-core's ZIP 215 check accepting this key and proof.
+    use anonymum_core::crypto::{InviteKey, InviteScheme};
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let mut proof = vec![0u8; 64];
+    proof[0] = 1; // R = identity, S = 0
+    assert!(!Ed25519Invites.verify(&InviteKey(identity), b"any message", &InviteProof(proof)));
 }

@@ -1,5 +1,8 @@
 use anonymum_core::crypto::mock::{mock_binding, MockInviteSecret, MockScheme};
 use anonymum_core::crypto::invite_message;
+
+/// The simulation's default genesis id, which signed messages carry.
+const G: [u8; 32] = *b"anonymum-core-simulation-genesis";
 use anonymum_core::ratelimit::TokenBucket;
 use anonymum_core::*;
 
@@ -22,7 +25,7 @@ fn setup() -> (Chain<MockScheme>, Address, Address, Address) {
 
 fn publish_key(who: Address) -> Tx {
     let key = MessagingKey(who.0); // any 32 bytes do for the mock
-    Tx::PublishMessagingKey { key, binding: mock_binding(&who, &key) }
+    Tx::PublishMessagingKey { key, binding: mock_binding(&G, &who, &key) }
 }
 
 /// A correctly sized note. The chain cannot read notes, only measure them;
@@ -74,7 +77,7 @@ fn open_tx(secret: &MockInviteSecret, opener: Address, recipient: Address) -> Tx
     Tx::OpenWithInvite {
         recipient,
         key: secret.public(),
-        proof: secret.sign(&invite_message(&opener, &recipient)),
+        proof: secret.sign(&invite_message(&G, &opener, &recipient)),
     }
 }
 
@@ -124,7 +127,7 @@ fn invite_only_works_for_its_owner() {
     let tx = Tx::OpenWithInvite {
         recipient: carol,
         key: secret.public(),
-        proof: secret.sign(&invite_message(&alice, &carol)),
+        proof: secret.sign(&invite_message(&G, &alice, &carol)),
     };
     assert_eq!(chain.apply(alice, tx).unwrap_err(), Error::UnknownInvite);
 }
@@ -595,11 +598,11 @@ fn a_mutual_block_is_cleared_when_an_invite_opens_a_channel() {
 fn messaging_key_needs_a_valid_binding() {
     let (mut chain, alice, bob, _) = setup();
     let key = MessagingKey([9; 32]);
-    let forged = Tx::PublishMessagingKey { key, binding: mock_binding(&bob, &key) };
+    let forged = Tx::PublishMessagingKey { key, binding: mock_binding(&G, &bob, &key) };
     fails_charging_nothing(&mut chain, alice, forged, Error::BadKeyBinding);
     assert_ne!(chain.messaging_key(&alice).unwrap().key, key, "old key kept");
 
-    chain.apply(alice, Tx::PublishMessagingKey { key, binding: mock_binding(&alice, &key) }).unwrap();
+    chain.apply(alice, Tx::PublishMessagingKey { key, binding: mock_binding(&G, &alice, &key) }).unwrap();
     assert_eq!(chain.messaging_key(&alice).unwrap().key, key, "a key can be replaced");
 }
 
@@ -854,7 +857,7 @@ fn storing_anything_without_the_deposit_fails_and_charges_nothing() {
     let txs = [
         Tx::RegisterInvite { key: MockInviteSecret::from_seed(3).public(), expires_at: None },
         Tx::Block { target: bob },
-        Tx::PublishMessagingKey { key, binding: mock_binding(&dave, &key) },
+        Tx::PublishMessagingKey { key, binding: mock_binding(&G, &dave, &key) },
     ];
     for tx in txs {
         let err = chain.apply(dave, tx.clone()).unwrap_err();
@@ -890,7 +893,7 @@ fn a_closer_who_cannot_pay_the_block_deposit_cannot_close() {
     let erin = Address::from_label("erin");
     chain.mint(erin, 2 * DEPOSIT);
     let key = MessagingKey([5; 32]);
-    chain.apply(erin, Tx::PublishMessagingKey { key, binding: mock_binding(&erin, &key) }).unwrap();
+    chain.apply(erin, Tx::PublishMessagingKey { key, binding: mock_binding(&G, &erin, &key) }).unwrap();
     let invite = MockInviteSecret::from_seed(6);
     chain.apply(erin, Tx::RegisterInvite { key: invite.public(), expires_at: None }).unwrap();
     chain.apply(bob, open_tx(&invite, bob, erin)).unwrap(); // invite deposit back to Erin
@@ -927,7 +930,40 @@ fn opening_a_channel_returns_cleared_block_deposits_to_the_blockers() {
 fn replacing_a_messaging_key_keeps_a_single_deposit() {
     let (mut chain, alice, _, _) = setup();
     let key = MessagingKey([9; 32]);
-    chain.apply(alice, Tx::PublishMessagingKey { key, binding: mock_binding(&alice, &key) }).unwrap();
+    chain.apply(alice, Tx::PublishMessagingKey { key, binding: mock_binding(&G, &alice, &key) }).unwrap();
     assert_eq!(chain.ledger().reserved(&alice), DEPOSIT);
     assert_eq!(chain.ledger().balance(&alice), 10 * COIN);
+}
+
+// ---- signed messages carry the chain (2026-11-20 audit HIGH-04) ------------
+
+#[test]
+fn signatures_made_for_another_chain_are_refused() {
+    let (mut chain, alice, bob, _) = setup();
+    let other = [7u8; 32];
+    let key = MessagingKey([8; 32]);
+    let foreign = Tx::PublishMessagingKey { key, binding: mock_binding(&other, &alice, &key) };
+    fails_charging_nothing(&mut chain, alice, foreign, Error::BadKeyBinding);
+
+    let secret = bob_invite(&mut chain, bob, 21);
+    let foreign = Tx::OpenWithInvite {
+        recipient: bob,
+        key: secret.public(),
+        proof: secret.sign(&invite_message(&other, &alice, &bob)),
+    };
+    fails_charging_nothing(&mut chain, alice, foreign, Error::BadInviteProof);
+    chain.apply(alice, open_tx(&secret, alice, bob)).unwrap();
+}
+
+#[test]
+fn the_genesis_id_is_a_chain_parameter() {
+    let params = Params { genesis: [7u8; 32], ..Params::default() };
+    let mut chain = Chain::new(params, MockScheme);
+    let alice = Address([1; 32]);
+    chain.mint(alice, 10 * COIN);
+    let key = MessagingKey([8; 32]);
+    let made_for_default = Tx::PublishMessagingKey { key, binding: mock_binding(&G, &alice, &key) };
+    assert_eq!(chain.apply(alice, made_for_default).unwrap_err(), Error::BadKeyBinding);
+    let made_for_this = Tx::PublishMessagingKey { key, binding: mock_binding(&[7u8; 32], &alice, &key) };
+    chain.apply(alice, made_for_this).unwrap();
 }

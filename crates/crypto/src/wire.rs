@@ -94,8 +94,12 @@ pub const MAX_FRAME: usize = 1 + NONCE_LEN + MAX_NOISE_MESSAGE;
 /// record type).
 pub const MAX_DATA: usize = MAX_PLAINTEXT - 1;
 
-/// Cap on half-finished handshakes a responder keeps.
-const MAX_PENDING: usize = 1_024;
+/// Default cap on answered, unconfirmed handshakes a responder keeps.
+pub const MAX_PENDING: usize = 1_024;
+/// Default cap on answered, unconfirmed handshakes for one caller key.
+pub const MAX_PENDING_PER_CALLER: usize = 4;
+/// Default cap on live sessions (one per caller key).
+pub const MAX_SESSIONS: usize = 1_024;
 
 /// How long an answered handshake waits for its CONFIRM.
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(180);
@@ -428,15 +432,45 @@ impl Initiator {
 
 // ---- responder -------------------------------------------------------------
 
+/// Caps a responder enforces, so no caller can exhaust its tables. The
+/// defaults are the named constants [`MAX_PENDING`],
+/// [`MAX_PENDING_PER_CALLER`] and [`MAX_SESSIONS`].
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Answered, unconfirmed handshakes in total.
+    pub pending: usize,
+    /// Answered, unconfirmed handshakes for one authenticated caller key.
+    pub pending_per_caller: usize,
+    /// Live sessions in total (one per caller key).
+    pub sessions: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { pending: MAX_PENDING, pending_per_caller: MAX_PENDING_PER_CALLER, sessions: MAX_SESSIONS }
+    }
+}
+
 /// The answering side, serving many callers at once. It holds the handshake
 /// key callers reach and the [`Gate`] that decides who is answered; both are
-/// built from one network id.
+/// built from one network id. Live sessions are keyed by the caller's
+/// authenticated key, one per caller; the reply handle a session answers on
+/// is updated when the caller's transport handle changes (2026-11-20 audit
+/// HIGH-02).
 pub struct Responder<T> {
     me: StaticKey,
     gate: Gate,
+    limits: Limits,
     /// Answered but unconfirmed handshakes, one per reply handle and call id.
     pending: HashMap<(T, u32), Pending>,
-    sessions: HashMap<T, Live>,
+    /// Live sessions by caller key.
+    sessions: HashMap<[u8; 32], Live<T>>,
+    /// Reply handle -> the caller key whose session answers on it.
+    routes: HashMap<T, [u8; 32]>,
+    /// A new handle a caller repeated its CONFIRM from. The session moves
+    /// there only when a fresh data frame from it decrypts, so a replayed
+    /// CONFIRM cannot redirect anyone's replies.
+    candidates: HashMap<T, [u8; 32]>,
 }
 
 /// An answered HELLO, with the frame that started it and our WELCOME. A
@@ -453,8 +487,9 @@ struct Pending {
 }
 
 /// An established session, with the CONFIRM that finished it and our ACK,
-/// so a lost ACK can be resent.
-struct Live {
+/// so a lost ACK can be resent, and the reply handle it currently uses.
+struct Live<T> {
+    handle: T,
     at: Attempt,
     last: Vec<u8>,
     ack: Vec<u8>,
@@ -478,7 +513,8 @@ pub enum ResponderEvent {
 pub struct Expired<T> {
     /// Answered handshakes whose CONFIRM never came.
     pub pending: Vec<T>,
-    /// Sessions idle for longer than [`SESSION_IDLE_TIMEOUT`].
+    /// Sessions idle for longer than [`SESSION_IDLE_TIMEOUT`] (by the reply
+    /// handle they last used).
     pub sessions: Vec<T>,
 }
 
@@ -486,12 +522,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     /// A responder for a contact identity: callers reach its handshake key,
     /// and it may record invitations its signing key issued.
     pub fn for_identity(me: &ContactIdentity, network: Network) -> Self {
-        Responder {
-            me: me.handshake_key().clone(),
-            gate: Gate::new(network, Some(me.signing_key())),
-            pending: HashMap::new(),
-            sessions: HashMap::new(),
-        }
+        Self::build(me.handshake_key().clone(), Gate::new(network, Some(me.signing_key())))
     }
 
     /// A stranger's callback listener (reverse rendezvous): answers only
@@ -505,7 +536,25 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     ) -> Result<Self, ContactError> {
         let mut gate = Gate::new(network, None);
         gate.expect_callback(caller, reference, deadline)?;
-        Ok(Responder { me: callback.clone(), gate, pending: HashMap::new(), sessions: HashMap::new() })
+        Ok(Self::build(callback.clone(), gate))
+    }
+
+    fn build(me: StaticKey, gate: Gate) -> Self {
+        Responder {
+            me,
+            gate,
+            limits: Limits::default(),
+            pending: HashMap::new(),
+            sessions: HashMap::new(),
+            routes: HashMap::new(),
+            candidates: HashMap::new(),
+        }
+    }
+
+    /// Replace the default caps.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn network(&self) -> Network {
@@ -547,7 +596,9 @@ impl<T: Hash + Eq + Clone> Responder<T> {
 
     fn drop_peer(&mut self, caller: &[u8; 32]) {
         self.pending.retain(|_, p| &p.session.peer() != caller);
-        self.sessions.retain(|_, live| &live.session.peer() != caller);
+        self.sessions.remove(caller);
+        self.routes.retain(|_, c| c != caller);
+        self.candidates.retain(|_, c| c != caller);
     }
 
     /// Drop answered handshakes past their deadline and sessions idle past
@@ -562,40 +613,75 @@ impl<T: Hash + Eq + Clone> Responder<T> {
             }
             keep
         });
-        self.sessions.retain(|from, live| {
+        let mut gone = Vec::new();
+        self.sessions.retain(|caller, live| {
             let keep = now.mono < live.idle_deadline;
             if !keep {
-                out.sessions.push(from.clone());
+                out.sessions.push(live.handle.clone());
+                gone.push(*caller);
             }
             keep
         });
+        if !gone.is_empty() {
+            self.routes.retain(|_, c| !gone.contains(c));
+            self.candidates.retain(|_, c| !gone.contains(c));
+        }
         out
     }
 
-    /// The live session for `from`, if it is still admitted by the gate;
-    /// one that is not is dropped.
-    fn live(&mut self, from: &T) -> Result<&mut Live, WireError> {
-        let admitted = match self.sessions.get(from) {
+    /// The live session answering on `from`, if it is still admitted by the
+    /// gate; one that is not is dropped.
+    fn live(&mut self, from: &T) -> Result<&mut Live<T>, WireError> {
+        let caller = *self.routes.get(from).ok_or(WireError::NoSession)?;
+        self.admitted(caller)
+    }
+
+    fn admitted(&mut self, caller: [u8; 32]) -> Result<&mut Live<T>, WireError> {
+        let admitted = match self.sessions.get(&caller) {
             None => return Err(WireError::NoSession),
-            Some(live) => self.gate.admits(&live.session.peer(), &live.reference),
+            Some(live) => self.gate.admits(&caller, &live.reference),
         };
         if !admitted {
-            self.sessions.remove(from);
+            self.drop_peer(&caller);
             return Err(WireError::Unauthorised);
         }
-        Ok(self.sessions.get_mut(from).expect("checked above"))
+        Ok(self.sessions.get_mut(&caller).expect("checked above"))
+    }
+
+    /// Point `caller`'s session at reply handle `to`.
+    fn reroute(&mut self, caller: [u8; 32], to: T) {
+        self.candidates.remove(&to);
+        if let Some(live) = self.sessions.get_mut(&caller) {
+            if live.handle != to {
+                self.routes.remove(&live.handle);
+                live.handle = to.clone();
+            }
+            self.routes.insert(to, caller);
+        }
+    }
+
+    /// A data frame: on the session's own handle, or on a candidate handle,
+    /// which then becomes the session's handle once the frame decrypts.
+    fn data(&mut self, from: T, body: &[u8], now: Now) -> Result<ResponderEvent, WireError> {
+        let (caller, moving) = match self.routes.get(&from) {
+            Some(c) => (*c, false),
+            None => (*self.candidates.get(&from).ok_or(WireError::NoSession)?, true),
+        };
+        let live = self.admitted(caller)?;
+        let plaintext = open_data(&mut live.session, body)?;
+        live.idle_deadline = now.mono + SESSION_IDLE_TIMEOUT;
+        let peer = live.session.peer();
+        if moving {
+            self.reroute(caller, from);
+        }
+        Ok(ResponderEvent::Message { peer, plaintext })
     }
 
     /// Handle one frame at `now`. `Err` always means: send nothing.
     pub fn handle(&mut self, from: T, incoming: &[u8], now: Now) -> Result<ResponderEvent, WireError> {
         self.expire(now);
         let (kind, at, body) = match parse(incoming)? {
-            Frame::Data(body) => {
-                let live = self.live(&from)?;
-                let plaintext = open_data(&mut live.session, body)?;
-                live.idle_deadline = now.mono + SESSION_IDLE_TIMEOUT;
-                return Ok(ResponderEvent::Message { peer: live.session.peer(), plaintext });
-            }
+            Frame::Data(body) => return self.data(from, body, now),
             Frame::Handshake { kind, at, body } => (kind, at, body),
         };
         match kind {
@@ -607,11 +693,12 @@ impl<T: Hash + Eq + Clone> Responder<T> {
 
     fn hello(&mut self, from: T, at: Attempt, body: &[u8], incoming: &[u8], now: Now) -> Result<ResponderEvent, WireError> {
         // Attempts of a call we already finished are over.
-        if self.sessions.get(&from).map_or(false, |live| live.at.call == at.call && at.number <= live.at.number) {
+        let finished = self.routes.get(&from).and_then(|c| self.sessions.get(c));
+        if finished.map_or(false, |live| live.at.call == at.call && at.number <= live.at.number) {
             return Err(WireError::Stale);
         }
         let key = (from, at.call);
-        if let Some(pending) = self.pending.get(&key) {
+        let replacing = if let Some(pending) = self.pending.get(&key) {
             if at.number < pending.attempt || (at.number == pending.attempt && pending.first != incoming) {
                 return Err(WireError::Stale);
             }
@@ -624,13 +711,22 @@ impl<T: Hash + Eq + Clone> Responder<T> {
                 }
                 return Ok(ResponderEvent::Reply(pending.reply.clone()));
             }
-        } else if self.pending.len() >= MAX_PENDING {
-            return Err(WireError::Busy);
-        }
+            true
+        } else {
+            if self.pending.len() >= self.limits.pending {
+                return Err(WireError::Busy);
+            }
+            false
+        };
         let hello = Incoming::read(&self.me, &self.gate.network(), &at.label(), body)?;
         let (caller, reference) = (hello.caller(), hello.reference());
         // The decision, before anything is written.
         let grant = self.gate.authorise(&caller, &reference, now).ok_or(WireError::Unauthorised)?;
+        // One caller may not hold more than its share of answered handshakes.
+        let held = self.pending.values().filter(|p| p.session.peer() == caller).count();
+        if !replacing && held >= self.limits.pending_per_caller {
+            return Err(WireError::Busy);
+        }
         let (session, message2) = hello.accept()?;
         let reply = handshake_frame(WELCOME, at, &message2);
         let pending = Pending {
@@ -647,31 +743,53 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     }
 
     fn confirm(&mut self, from: T, at: Attempt, body: &[u8], incoming: &[u8], now: Now) -> Result<ResponderEvent, WireError> {
-        // 1. The exact attempt that is already live: our ACK was lost.
-        if self.sessions.get(&from).map_or(false, |live| live.at == at && live.last == incoming) {
-            let live = self.live(&from)?;
-            return Ok(ResponderEvent::Reply(live.ack.clone()));
+        // 1. The exact attempt that is already live: our ACK was lost. If it
+        //    comes from a new handle, answer there and note the handle as a
+        //    candidate; the session moves only on fresh data from it.
+        let repeat = self.sessions.iter().find(|(_, live)| live.at == at && live.last == incoming).map(|(c, _)| *c);
+        if let Some(caller) = repeat {
+            let live = self.admitted(caller)?;
+            let (ack, handle) = (live.ack.clone(), live.handle.clone());
+            if handle != from {
+                self.candidates.insert(from, caller);
+            }
+            return Ok(ResponderEvent::Reply(ack));
         }
         // 2. The matching pending attempt (possibly newer than a live one).
         let key = (from.clone(), at.call);
-        let pending = self.pending.get_mut(&key).filter(|p| p.attempt == at.number).ok_or(WireError::Stale)?;
+        let peer = self.pending.get(&key).filter(|p| p.attempt == at.number).ok_or(WireError::Stale)?.session.peer();
+        // At the session cap a new caller is refused before its CONFIRM is
+        // opened, so the same CONFIRM still counts once a place is free.
+        if !self.sessions.contains_key(&peer) && self.sessions.len() >= self.limits.sessions {
+            return Err(WireError::Busy); // nothing committed
+        }
+        let pending = self.pending.get_mut(&key).expect("found above");
         // A transport message: a bad one is dropped; the attempt stays.
         let expected = control(CONFIRM, at, CONFIRM_MARKER);
         if pending.session.open_if(body, |p| p == expected).is_err() {
             return Err(WireError::Stale);
         }
         let mut pending = self.pending.remove(&key).expect("found above");
-        let peer = pending.session.peer();
         if !self.gate.commit(&peer, &pending.reference, pending.grant, now) {
             return Err(WireError::Unauthorised); // blocked, used or expired meanwhile
         }
         // This caller is now talking to us: its other half-finished
-        // handshakes on this handle are over, and a session from an older
-        // attempt is replaced.
-        self.pending.retain(|(t, _), _| *t != from);
+        // handshakes (on any handle) are over, and an older session of its
+        // is replaced, on whatever handle it used.
+        self.pending.retain(|(t, _), p| *t != from && p.session.peer() != peer);
+        if let Some(old) = self.sessions.remove(&peer) {
+            self.routes.remove(&old.handle);
+        }
+        self.candidates.retain(|t, c| *c != peer && *t != from);
+        if let Some(other) = self.routes.insert(from.clone(), peer) {
+            if other != peer {
+                self.sessions.remove(&other); // a handle answers one caller
+            }
+        }
         let ack = handshake_frame(ACK, at, &pending.session.seal(&control(ACK, at, ACK_MARKER))?);
         let grant = pending.grant;
         let live = Live {
+            handle: from,
             at,
             last: incoming.to_vec(),
             ack: ack.clone(),
@@ -679,7 +797,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
             reference: pending.reference,
             idle_deadline: now.mono + SESSION_IDLE_TIMEOUT,
         };
-        self.sessions.insert(from, live);
+        self.sessions.insert(peer, live);
         Ok(ResponderEvent::Established { peer, grant, reply: ack })
     }
 
@@ -696,15 +814,25 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         self.pending.len()
     }
 
-    /// Is there a live session on this reply handle?
-    pub fn is_live(&self, from: &T) -> bool {
-        self.sessions.contains_key(from)
+    /// How many live sessions there are (one per caller key).
+    pub fn sessions(&self) -> usize {
+        self.sessions.len()
     }
 
-    /// Drop a caller's reply handle (its sessions and pending handshakes).
+    /// Is there a live session answering on this reply handle?
+    pub fn is_live(&self, from: &T) -> bool {
+        self.routes.get(from).is_some_and(|c| self.sessions.contains_key(c))
+    }
+
+    /// Drop a caller's reply handle: the session answering on it and the
+    /// pending handshakes that arrived on it.
     pub fn forget(&mut self, from: &T) {
         self.pending.retain(|(t, _), _| t != from);
-        self.sessions.remove(from);
+        self.candidates.remove(from);
+        if let Some(caller) = self.routes.remove(from) {
+            self.sessions.remove(&caller);
+            self.candidates.retain(|_, c| *c != caller);
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use anonymum_core::crypto::{
-    invite_message, InviteKey, InviteProof, InviteScheme, KeyBinding, MessagingKey,
+    invite_message, InviteKey, InviteProof, InviteScheme, KeyBinding,
 };
 use anonymum_core::Address;
 use rand_core::OsRng;
@@ -32,11 +32,11 @@ impl InviteSecret {
         InviteKey(self.0.verifying_key().to_bytes())
     }
 
-    /// Proof that `opener` holds this invite and wants to reach `recipient`.
-    /// Useless to any other opener, so copying it from a pending transaction
-    /// gains nothing.
-    pub fn sign_for(&self, opener: &Address, recipient: &Address) -> InviteProof {
-        InviteProof(self.0.sign(&invite_message(opener, recipient)).to_bytes().to_vec())
+    /// Proof that `opener` holds this invite and wants to reach `recipient`
+    /// on the chain with genesis hash `genesis`. Useless to any other opener
+    /// or chain, so copying it from a pending transaction gains nothing.
+    pub fn sign_for(&self, genesis: &[u8; 32], opener: &Address, recipient: &Address) -> InviteProof {
+        InviteProof(self.0.sign(&invite_message(genesis, opener, recipient)).to_bytes().to_vec())
     }
 }
 
@@ -55,7 +55,7 @@ impl InviteScheme for Ed25519Invites {
         key.verify_strict(message, &signature).is_ok()
     }
 
-    fn verify_key_binding(&self, address: &Address, key: &MessagingKey, binding: &KeyBinding) -> bool {
-        crate::identity::verify_binding(address, &key.0, &binding.0)
+    fn verify_key_binding(&self, address: &Address, message: &[u8], binding: &KeyBinding) -> bool {
+        crate::identity::verify_binding(address, message, &binding.0)
     }
 }

@@ -1,3 +1,6 @@
+/// The core simulation's default genesis id.
+const G: [u8; 32] = *b"anonymum-core-simulation-genesis";
+
 use anonymum_core::{Chain, Error, Event, MessagingKey, Params, SealedNote, Tx, COIN, SEALED_NOTE_LEN};
 use anonymum_crypto::note::{INTRO_MAX_BYTES, ROUTE_LEN};
 use anonymum_crypto::{open_note, seal_note, ContactIdentity, Ed25519Invites, Identity, NoteError, StaticKey};
@@ -109,10 +112,10 @@ fn chain_accepts_a_real_binding_and_rejects_someone_elses() {
     let (bob, carol) = (Identity::generate(), Identity::generate());
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
     chain.mint(bob.address(), COIN); // messaging-key deposit
-    let err = chain.apply(carol.address(), bob.publish_key_tx()).unwrap_err();
+    let err = chain.apply(carol.address(), bob.publish_key_tx(&G)).unwrap_err();
     assert_eq!(err, Error::BadKeyBinding);
-    chain.apply(bob.address(), bob.publish_key_tx()).unwrap();
-    let Tx::PublishMessagingKey { key, .. } = bob.publish_key_tx() else { unreachable!() };
+    chain.apply(bob.address(), bob.publish_key_tx(&G)).unwrap();
+    let Tx::PublishMessagingKey { key, .. } = bob.publish_key_tx(&G) else { unreachable!() };
     assert_eq!(chain.messaging_key(&bob.address()).unwrap().key, key);
     let _: MessagingKey = key;
 }
@@ -127,7 +130,7 @@ fn stranger_flow_through_the_transparent_chain() {
     let mut chain = Chain::new(Params::default(), Ed25519Invites);
     chain.mint(bob_wallet.address(), COIN);
     chain.mint(carol_wallet.address(), 10 * COIN);
-    chain.apply(bob_wallet.address(), bob_wallet.publish_key_tx()).unwrap();
+    chain.apply(bob_wallet.address(), bob_wallet.publish_key_tx(&G)).unwrap();
 
     let note = seal(&bob, &carol, &cb, "hi Bob");
     for wallet_key in [bob_wallet.address().0, carol_wallet.address().0] {

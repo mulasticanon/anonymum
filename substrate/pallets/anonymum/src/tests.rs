@@ -13,7 +13,7 @@ use crate::{invite_message, SealedNote, SEALED_NOTE_LEN};
 use codec::Encode;
 use frame::deps::sp_core::{ed25519, Pair};
 use frame::deps::sp_io::hashing::blake2_256;
-use frame::deps::sp_runtime::{AccountId32, MultiSignature};
+use frame::deps::sp_runtime::{AccountId32, ArithmeticError, MultiSignature};
 use frame::testing_prelude::*;
 use frame::traits::fungible::InspectHold;
 use polkadot_sdk::polkadot_sdk_frame as frame;
@@ -83,7 +83,7 @@ fn invite(owner: &str, seed: u8) -> ed25519::Pair {
 }
 
 fn open(opener: &str, recipient: &str, secret: &ed25519::Pair) -> DispatchResult {
-    let message = invite_message(&account(opener).encode(), &account(recipient).encode());
+    let message = invite_message(&genesis(), &account(opener).encode(), &account(recipient).encode());
     Anonymum::open_with_invite(signed(opener), account(recipient), secret.public().0, secret.sign(&message).0)
 }
 
@@ -147,7 +147,7 @@ fn invite_only_works_for_its_owner() {
 fn stolen_proof_cannot_be_reused_by_someone_else() {
     new_test_ext().execute_with(|| {
         let secret = invite("bob", 1);
-        let alices_proof = secret.sign(&invite_message(&account("alice").encode(), &account("bob").encode()));
+        let alices_proof = secret.sign(&invite_message(&genesis(), &account("alice").encode(), &account("bob").encode()));
         assert_noop!(
             Anonymum::open_with_invite(signed("carol"), account("bob"), secret.public().0, alices_proof.0),
             Error::<Test>::BadInviteProof
@@ -592,7 +592,7 @@ fn messaging_key_needs_a_valid_binding() {
         );
         // A new key for Alice, properly signed: replaces the old one.
         let new_key = [9u8; 32];
-        let binding = MultiSignature::Ed25519(keypair("alice").sign(&crate::key_binding_message(&new_key)));
+        let binding = binding_by("alice", "alice", &new_key);
         assert_ok!(Anonymum::publish_messaging_key(signed("alice"), new_key, binding));
         assert_eq!(MessagingKeys::<Test>::get(account("alice")).unwrap().key, new_key);
     });
@@ -816,7 +816,7 @@ fn storing_anything_without_the_deposit_fails_and_charges_nothing() {
         assert_noop!(Anonymum::register_invite(origin(), [3; 32], None), Error::<Test>::InsufficientFunds);
         assert_noop!(Anonymum::block(origin(), account("bob")), Error::<Test>::InsufficientFunds);
         let key = [7u8; 32];
-        let binding = MultiSignature::Ed25519(keypair("erin").sign(&crate::key_binding_message(&key)));
+        let binding = binding_by("erin", "erin", &key);
         assert_noop!(Anonymum::publish_messaging_key(origin(), key, binding), Error::<Test>::InsufficientFunds);
     });
 }
@@ -869,7 +869,7 @@ fn opening_a_channel_returns_cleared_block_deposits_to_the_blockers() {
 fn replacing_a_messaging_key_keeps_a_single_deposit() {
     new_test_ext().execute_with(|| {
         let key = [9u8; 32];
-        let binding = MultiSignature::Ed25519(keypair("alice").sign(&crate::key_binding_message(&key)));
+        let binding = binding_by("alice", "alice", &key);
         assert_ok!(Anonymum::publish_messaging_key(signed("alice"), key, binding));
         assert_eq!(deposits("alice"), DEPOSIT);
         assert_eq!(free("alice"), 10 * COIN);
@@ -898,5 +898,160 @@ fn a_refund_whose_hold_is_gone_still_completes_and_reports_it() {
         assert!(events.iter().any(|e| matches!(e, Event::HoldNotReleased { .. })), "{events:?}");
         assert!(events.iter().any(|e| matches!(e, Event::RequestRefunded { .. })));
         assert!(Requests::<Test>::get(request).is_none(), "the request is still cleaned up");
+    });
+}
+
+
+// ---- 2026-11-20 audit: expiry slots, signed messages, arithmetic -------------
+
+fn funded(name: &str) -> AccountId32 {
+    let who = account(name);
+    assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), who.clone(), 10 * COIN));
+    who
+}
+
+fn queued(at: u64) -> usize {
+    ExpiryQueue::<Test>::get(at).len()
+}
+
+#[test]
+fn early_resolutions_free_their_expiry_slots() {
+    new_test_ext().execute_with(|| {
+        // MaxRequestsPerBlock is 4. Fill block 1's slot (expiring at 28,801).
+        let expiry = 1 + 28_800;
+        let s: Vec<AccountId32> = (0..10).map(|i| funded(&format!("early{i}"))).collect();
+        for who in &s[..4] {
+            assert_ok!(Anonymum::request_contact(RuntimeOrigin::signed(who.clone()), account("bob"), COIN, note()));
+        }
+        assert_eq!(queued(expiry), 4);
+        assert_noop!(
+            Anonymum::request_contact(RuntimeOrigin::signed(s[4].clone()), account("bob"), COIN, note()),
+            Error::<Test>::ExpiryQueueFull
+        );
+        let id = |who: &AccountId32| {
+            let key = if *who <= account("bob") { (who.clone(), account("bob")) } else { (account("bob"), who.clone()) };
+            crate::pallet::RequestByPair::<Test>::get(key).unwrap()
+        };
+        // Accepted, declined, cancelled by the sender, ended by a block.
+        assert_ok!(Anonymum::accept_contact(signed("bob"), id(&s[0])));
+        assert_eq!(queued(expiry), 3);
+        assert_ok!(Anonymum::cancel_request(signed("bob"), id(&s[1])));
+        assert_eq!(queued(expiry), 2);
+        assert_ok!(Anonymum::cancel_request(RuntimeOrigin::signed(s[2].clone()), id(&s[2])));
+        assert_eq!(queued(expiry), 1);
+        assert_ok!(Anonymum::block(signed("bob"), s[3].clone()));
+        assert_eq!(queued(expiry), 0);
+        assert!(!ExpiryQueue::<Test>::contains_key(expiry), "an empty slot is removed");
+        // Superseded by an invite.
+        assert_ok!(Anonymum::request_contact(RuntimeOrigin::signed(s[4].clone()), account("bob"), COIN, note()));
+        assert_eq!(queued(expiry), 1);
+        let secret = invite("bob", 77);
+        let message = invite_message(&genesis(), &s[4].encode(), &account("bob").encode());
+        assert_ok!(Anonymum::open_with_invite(
+            RuntimeOrigin::signed(s[4].clone()),
+            account("bob"),
+            secret.public().0,
+            secret.sign(&message).0
+        ));
+        assert_eq!(queued(expiry), 0);
+        // The same block's slot takes four new requests again, then is full.
+        for who in &s[5..9] {
+            assert_ok!(Anonymum::request_contact(RuntimeOrigin::signed(who.clone()), account("bob"), COIN, note()));
+        }
+        assert_noop!(
+            Anonymum::request_contact(RuntimeOrigin::signed(s[9].clone()), account("bob"), COIN, note()),
+            Error::<Test>::ExpiryQueueFull
+        );
+        // Expiry still refunds what is left, and only that.
+        System::reset_events();
+        Anonymum::on_initialize(expiry);
+        let refunds = new_events().iter().filter(|e| matches!(e, Event::RequestRefunded { .. })).count();
+        assert_eq!(refunds, 4);
+    });
+}
+
+#[test]
+fn a_key_binding_names_the_account_and_the_chain() {
+    new_test_ext().execute_with(|| {
+        let key = [0x42; 32];
+        // Alice's own signature, but over a message naming Bob's account.
+        let for_bob = binding_by("alice", "bob", &key);
+        assert_noop!(Anonymum::publish_messaging_key(signed("alice"), key, for_bob), Error::<Test>::BadKeyBinding);
+        // A binding made for another chain's genesis hash.
+        let other = crate::key_binding_message(&[7u8; 32], &account("alice").encode(), &key);
+        let foreign = MultiSignature::Ed25519(keypair("alice").sign(&other));
+        assert_noop!(Anonymum::publish_messaging_key(signed("alice"), key, foreign), Error::<Test>::BadKeyBinding);
+        assert_ok!(Anonymum::publish_messaging_key(signed("alice"), key, binding_by("alice", "alice", &key)));
+    });
+}
+
+#[test]
+fn an_invite_proof_for_another_chain_is_refused() {
+    new_test_ext().execute_with(|| {
+        let secret = invite("bob", 3);
+        let other = invite_message(&[7u8; 32], &account("alice").encode(), &account("bob").encode());
+        assert_noop!(
+            Anonymum::open_with_invite(signed("alice"), account("bob"), secret.public().0, secret.sign(&other).0),
+            Error::<Test>::BadInviteProof
+        );
+        assert_ok!(open("alice", "bob", &secret));
+    });
+}
+
+#[test]
+fn the_host_ed25519_check_accepts_a_small_order_invite_key() {
+    // Observed, not desired: sp-core 43's native ed25519 verification
+    // follows ZIP 215, so the identity point is a valid key and (R =
+    // identity, S = 0) verifies for every message. `verify_strict` in
+    // anonymum-crypto refuses both (see crates/crypto/tests/crypto.rs).
+    // Only an invite's owner chooses its key, so this makes an invite
+    // anyone can use, at the owner's own choice.
+    new_test_ext().execute_with(|| {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert_ok!(Anonymum::register_invite(signed("bob"), identity, None));
+        let mut proof = [0u8; 64];
+        proof[0] = 1; // R = identity, S = 0
+        assert_ok!(Anonymum::open_with_invite(signed("alice"), account("bob"), identity, proof));
+    });
+}
+
+#[test]
+fn the_fee_split_cannot_overflow() {
+    new_test_ext().execute_with(|| {
+        // FeeBurnPercent is 50 in the mock.
+        assert_eq!(Anonymum::burn_share(u128::MAX), u128::MAX / 2);
+        assert_eq!(Anonymum::burn_share(0), 0);
+        assert_eq!(Anonymum::burn_share(1), 0);
+        assert_eq!(Anonymum::burn_share(3), 1);
+    });
+}
+
+#[test]
+fn an_expiry_height_that_would_overflow_is_refused_charging_nothing() {
+    new_test_ext().execute_with(|| {
+        // The mock's lifetime is 28,800 blocks: the last height that fits is
+        // u64::MAX - 28,800.
+        System::set_block_number(u64::MAX - 28_799);
+        assert_noop!(req("carol", "bob", COIN), DispatchError::Arithmetic(ArithmeticError::Overflow));
+        System::set_block_number(u64::MAX - 28_800);
+        assert_ok!(req("carol", "bob", COIN));
+    });
+}
+
+#[test]
+fn id_and_sequence_counters_refuse_to_wrap_charging_nothing() {
+    new_test_ext().execute_with(|| {
+        crate::pallet::NextId::<Test>::put(u64::MAX);
+        assert_noop!(req("carol", "bob", COIN), DispatchError::Arithmetic(ArithmeticError::Overflow));
+        crate::pallet::NextId::<Test>::put(u64::MAX - 1);
+        assert_ok!(req("carol", "bob", COIN));
+        crate::pallet::NextSeq::<Test>::put(u64::MAX);
+        assert_noop!(
+            Anonymum::register_invite(signed("bob"), [5; 32], None),
+            DispatchError::Arithmetic(ArithmeticError::Overflow)
+        );
+        crate::pallet::NextSeq::<Test>::put(u64::MAX - 1);
+        assert_ok!(Anonymum::register_invite(signed("bob"), [5; 32], None));
     });
 }

@@ -3,6 +3,7 @@
 
 use crate as pallet_anonymum;
 use crate::{key_binding_message, SealedNote, SEALED_NOTE_LEN};
+use codec::Encode;
 use frame::deps::frame_support::PalletId;
 use frame::deps::sp_core::{ed25519, Pair};
 use frame::deps::sp_io::hashing::blake2_256;
@@ -76,11 +77,21 @@ pub fn pool() -> AccountId32 {
     AnonymumPalletId::get().into_account_truncating()
 }
 
+/// The chain's genesis hash as signed messages carry it.
+pub fn genesis() -> Vec<u8> {
+    System::block_hash(0).as_ref().to_vec()
+}
+
+/// `signer`'s binding of `key` to `account` (normally the same name).
+pub fn binding_by(signer: &str, account_name: &str, key: &[u8; 32]) -> MultiSignature {
+    let message = key_binding_message(&genesis(), &account(account_name).encode(), key);
+    MultiSignature::Ed25519(keypair(signer).sign(&message))
+}
+
 /// The messaging key `name` publishes, and its signature binding it.
 pub fn messaging_key(name: &str) -> ([u8; 32], MultiSignature) {
     let key = blake2_256(format!("{name}/messaging").as_bytes());
-    let binding = MultiSignature::Ed25519(keypair(name).sign(&key_binding_message(&key)));
-    (key, binding)
+    (key, binding_by(name, name, &key))
 }
 
 /// A correctly sized note. The chain cannot read notes, only measure them.

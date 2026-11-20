@@ -36,13 +36,18 @@ pub struct KeyBinding(pub [u8; 64]);
 pub trait InviteScheme {
     /// Is `proof` a valid signature by the invite `key` over `message`?
     fn verify(&self, key: &InviteKey, message: &[u8], proof: &InviteProof) -> bool;
-    /// Does `address` vouch for `key` with `binding`?
-    fn verify_key_binding(&self, address: &Address, key: &MessagingKey, binding: &KeyBinding) -> bool;
+    /// Is `binding` `address`'s signature over `message` (a
+    /// [`key_binding_message`])?
+    fn verify_key_binding(&self, address: &Address, message: &[u8], binding: &KeyBinding) -> bool;
 }
 
-/// The exact bytes an address key signs to bind its messaging key.
-pub fn key_binding_message(key: &MessagingKey) -> Vec<u8> {
-    let mut message = b"anonymum/msgkey-binding/v1".to_vec();
+/// The exact bytes an address key signs to bind its messaging key: the
+/// chain's genesis hash, the account and the key (v2, 2026-11-20 audit
+/// HIGH-04), so a binding made for another chain or account is refused.
+pub fn key_binding_message(genesis: &[u8; 32], account: &Address, key: &MessagingKey) -> Vec<u8> {
+    let mut message = b"anonymum/msgkey-binding/v2".to_vec();
+    message.extend_from_slice(genesis);
+    message.extend_from_slice(&account.0);
     message.extend_from_slice(&key.0);
     message
 }
@@ -65,10 +70,12 @@ pub const SEALED_NOTE_LEN: usize = 587;
 pub struct SealedNote(pub Vec<u8>);
 
 /// The exact bytes an opener signs. Binding both addresses stops replay
-/// against a different opener or a different recipient.
-pub fn invite_message(opener: &Address, recipient: &Address) -> Vec<u8> {
-    let mut message = Vec::with_capacity(16 + 64);
-    message.extend_from_slice(b"anonymum/invite/v1");
+/// against a different opener or a different recipient; the genesis hash
+/// (v2) against another chain.
+pub fn invite_message(genesis: &[u8; 32], opener: &Address, recipient: &Address) -> Vec<u8> {
+    let mut message = Vec::with_capacity(18 + 96);
+    message.extend_from_slice(b"anonymum/invite/v2");
+    message.extend_from_slice(genesis);
     message.extend_from_slice(&opener.0);
     message.extend_from_slice(&recipient.0);
     message
@@ -80,14 +87,21 @@ pub fn invite_message(opener: &Address, recipient: &Address) -> Vec<u8> {
 /// exists so the state machine can be exercised without external crates.
 /// Replace with Ed25519 before anything leaves a test network.
 pub mod mock {
-    use super::{InviteKey, InviteProof, InviteScheme, KeyBinding, MessagingKey};
+    use super::{key_binding_message, InviteKey, InviteProof, InviteScheme, KeyBinding, MessagingKey};
     use crate::types::Address;
 
-    /// INSECURE: the "binding" is just the address and key side by side.
-    pub fn mock_binding(address: &Address, key: &MessagingKey) -> KeyBinding {
+    /// INSECURE: the "binding" is the address next to the binding message
+    /// folded into 32 bytes. Anyone can compute it.
+    pub fn mock_binding(genesis: &[u8; 32], address: &Address, key: &MessagingKey) -> KeyBinding {
+        fold(address, &key_binding_message(genesis, address, key))
+    }
+
+    fn fold(address: &Address, message: &[u8]) -> KeyBinding {
         let mut bytes = [0u8; 64];
         bytes[..32].copy_from_slice(&address.0);
-        bytes[32..].copy_from_slice(&key.0);
+        for (i, b) in message.iter().enumerate() {
+            bytes[32 + i % 32] = bytes[32 + i % 32].rotate_left(3) ^ b;
+        }
         KeyBinding(bytes)
     }
 
@@ -130,8 +144,8 @@ pub mod mock {
             MockInviteSecret(bytes).public() == *key && signed == message
         }
 
-        fn verify_key_binding(&self, address: &Address, key: &MessagingKey, binding: &KeyBinding) -> bool {
-            mock_binding(address, key) == *binding
+        fn verify_key_binding(&self, address: &Address, message: &[u8], binding: &KeyBinding) -> bool {
+            fold(address, message) == *binding
         }
     }
 }

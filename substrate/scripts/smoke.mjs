@@ -85,7 +85,9 @@ console.log(`Connected to ${await api.rpc.system.chain()} at block #${header.num
 // ---- B: messaging keys ------------------------------------------------------
 console.log('\n1. Bob publishes his messaging key (signed by his account key).');
 const bobKey = blake2AsU8a('bob/messaging');
-const binding = { Sr25519: bob.sign(u8aConcat(stringToU8a('anonymum/msgkey-binding/v1'), bobKey)) };
+// v2 messages carry the chain's genesis hash (and the binding the account).
+const genesis = api.genesisHash.toU8a();
+const binding = { Sr25519: bob.sign(u8aConcat(stringToU8a('anonymum/msgkey-binding/v2'), genesis, decodeAddress(bob.address), bobKey)) };
 let r = await send(bob, api.tx.anonymum.publishMessagingKey(bobKey, binding));
 check(r.error === null && eventNames(r).includes('MessagingKeyPublished'), `published in block ${r.block}`);
 r = await send(charlie, api.tx.anonymum.publishMessagingKey(bobKey, binding));
@@ -98,7 +100,7 @@ r = await send(bob, api.tx.anonymum.registerInvite(invite.publicKey, null));
 check(r.error === null, 'invite registered');
 let before = await account(alice);
 const proof = ed25519Sign(
-  u8aConcat(stringToU8a('anonymum/invite/v1'), decodeAddress(alice.address), decodeAddress(bob.address)),
+  u8aConcat(stringToU8a('anonymum/invite/v2'), genesis, decodeAddress(alice.address), decodeAddress(bob.address)),
   invite,
 );
 r = await send(alice, api.tx.anonymum.openWithInvite(bob.address, invite.publicKey, proof));
