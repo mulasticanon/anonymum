@@ -5,7 +5,8 @@ Raised while building `crates/shielded-model` against
 resolves all but I8. I13–I14 were raised by v0.5; v0.6 fixes their wording.
 The design review of 2026-11-19 (`design-review-2026-11-19.md`) adds
 findings H1–H7 and M1–M4, tracked below. I15–I26 were raised while
-prototyping v0.7 section 2a in `crates/crypto` (2026-11-20). Each entry says
+prototyping v0.7 section 2a in `crates/crypto` (2026-11-20); I27 is a
+question for the cryptographer about one of those choices. Each entry says
 how it stands and what the model or prototype does.
 
 | # | Issue | Status |
@@ -157,7 +158,7 @@ carried on. Each needs the owner's or the cryptographer's answer.
 | I17 | The note must be bound to "the admission record of the same transaction", but the transparent prototype chain has no admission record. | The note's Noise prologue includes a 32-byte admission commitment. The note field carries `commitment (32) || envelope (555)`, 587 bytes (was 427; core and pallet constants changed). In the shielded design the commitment must be a separate public field, or moving the whole field to another transaction moves the binding with it. The demo uses a random stand-in. |
 | I18 | Rule 6: "both sides mix the accepted request's identifier into the session"; the identifier is not defined. | The reference named inside message 1 is part of the IK transcript, so the session is bound to it. For a callback it is the admission commitment; for an invitation, the invitation id; for a contact, the reference recorded when the relationship began. |
 | I19 | Who generates the invitation's holder key is not said. | The invitee generates a caller key for this relationship and hands its public half to the issuer, who signs an invitation to it (no secret is handed over). |
-| I20 | A contact card names keys, price and validity but no network; invitations name the network. | Card without network; the session prologue and invitations carry it. Cards could be replayed across networks. |
+| I20 | A contact card names keys, price and validity but no network; invitations name the network. | Fixed after 299f429: the card now carries and signs the network id, and `ContactCard::verify` refuses a card for another network (tested). |
 | I21 | Rule 3 asks that a replayed first message not reopen a blocked contact or use an invitation twice, but says nothing of a still-authorised caller. | A recorded message 1 from a caller who is still a contact gets a message 2 (it cannot be confirmed, so no session and no grant). An availability signal: question 11. Repeats of an answered message 1 are re-checked against the gate before the cached reply is resent. |
 | I22 | Rule 4 puts the sender's contact identity inside the note but does not say it is authenticated. | The sender signs (contact signing key) the admission commitment, the recipient's inbox key and the note body, so a note cannot claim another identity or be forwarded to a third person as if written to them. |
 | I23 | Rule 4: a note must not be recognisable from the public card. | Noise N gives that for the ciphertext, but its ephemeral key is a raw X25519 point, distinguishable from random bytes (not linkable to the recipient). Elligator-style encoding would need a vetted library. Question 12. |
@@ -165,3 +166,24 @@ carried on. Each needs the owner's or the cryptographer's answer.
 | I25 | Whether an existing contact may call about anything, or only its relationship. | A contact's calls must name the reference recorded when it was admitted; any other reference gets nothing. |
 | I26 | The transparent chain still requires a wallet-bound messaging key before it accepts a request, and records requests wallet to wallet. | Kept for the prototype chain (a known gap until stage 5). Notes are sealed to the card's inbox key and never use that key. |
 
+**I27. The note's signature is transferable proof of who made contact (for
+the cryptographer).** The prototype has the stranger sign the note with
+their contact signing key (I22), so the recipient can tell a note does not
+claim someone else's identity and has not been forwarded from another
+recipient. But an Ed25519 signature convinces anyone: the recipient can
+show the opened note, with the signature over the admission commitment and
+the recipient's own inbox key, to a third party as proof that this contact
+identity reached out to them, and when. For a messaging system whose
+purpose is anonymity that is a real cost.
+*Question:* should authentication that only the two parties can verify
+replace the signature, so that the recipient is convinced but cannot
+convince anyone else? For example, a Noise pattern that authenticates the
+sender's static key by Diffie-Hellman (Noise X, or the K-family) instead
+of a signature, or a designated-verifier signature. What does each cost
+against the two attacks the signature guards: forwarding a note to a third
+person as if written to them, and claiming another identity? Note that a
+recipient who can verify alone can also forge such a note to themselves,
+which is the point of deniability but means the note proves nothing to an
+arbiter either. Does that interact with the admission record and the
+escrow, where the payment itself is on-chain? *Prototype:* unchanged
+(signature); this needs a decision.

@@ -135,10 +135,11 @@ impl ContactIdentity {
         self.signing.sign(message).to_bytes()
     }
 
-    /// A signed card to hand out or list: keys, price, validity
-    /// `[not_before, not_after)` in seconds.
-    pub fn card(&self, price: Amount, not_before: u64, not_after: u64) -> ContactCard {
+    /// A signed card to hand out or list, for one network: keys, price,
+    /// validity `[not_before, not_after)` in seconds.
+    pub fn card(&self, network: Network, price: Amount, not_before: u64, not_after: u64) -> ContactCard {
         let mut card = ContactCard {
+            network,
             signing_key: self.signing_key(),
             handshake_key: self.handshake.public(),
             inbox_key: self.inbox.public(),
@@ -181,8 +182,10 @@ fn take<const N: usize>(bytes: &[u8], at: &mut usize) -> [u8; N] {
 // ---- contact card ------------------------------------------------------------
 
 /// What a user hands out or lists publicly, signed by the contact signing key.
+/// Valid on one network only (issue I20).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ContactCard {
+    pub network: Network,
     pub signing_key: [u8; 32],
     pub handshake_key: [u8; 32],
     pub inbox_key: [u8; 32],
@@ -194,17 +197,20 @@ pub struct ContactCard {
 
 impl ContactCard {
     /// Serialised length.
-    pub const LEN: usize = 32 * 3 + 16 + 8 + 8 + 64;
+    pub const LEN: usize = 32 + 32 * 3 + 16 + 8 + 8 + 64;
 
     fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = b"anonymum/contact-card/v1".to_vec();
+        let mut out = b"anonymum/contact-card/v2".to_vec();
         out.extend_from_slice(&self.to_bytes()[..Self::LEN - 64]);
         out
     }
 
-    /// Signature and validity at time `now`.
-    pub fn verify(&self, now: u64) -> Result<(), ContactError> {
+    /// Signature, network and validity at time `now`.
+    pub fn verify(&self, network: &Network, now: u64) -> Result<(), ContactError> {
         verify(&self.signing_key, &self.signed_bytes(), &self.signature)?;
+        if &self.network != network {
+            return Err(ContactError::WrongNetwork);
+        }
         if now < self.not_before {
             return Err(ContactError::NotYetValid);
         }
@@ -216,6 +222,7 @@ impl ContactCard {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::LEN);
+        out.extend_from_slice(&self.network);
         out.extend_from_slice(&self.signing_key);
         out.extend_from_slice(&self.handshake_key);
         out.extend_from_slice(&self.inbox_key);
@@ -232,6 +239,7 @@ impl ContactCard {
         }
         let at = &mut 0;
         Ok(ContactCard {
+            network: take(bytes, at),
             signing_key: take(bytes, at),
             handshake_key: take(bytes, at),
             inbox_key: take(bytes, at),

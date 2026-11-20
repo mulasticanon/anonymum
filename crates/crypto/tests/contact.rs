@@ -17,7 +17,7 @@ const POLICY: RetryPolicy = RetryPolicy { attempts: 2, resends: 1, base_wait: Du
 
 fn bob_with_card() -> (ContactIdentity, ContactCard, Responder<u32>) {
     let bob = ContactIdentity::generate();
-    let card = bob.card(1_000_000, 0, NOW + 86_400);
+    let card = bob.card(NET, 1_000_000, 0, NOW + 86_400);
     let side = Responder::new(bob.handshake_key(), NET, Gate::new(NET));
     (bob, card, side)
 }
@@ -55,21 +55,39 @@ fn connect(
 fn a_card_holds_three_contact_keys_and_no_wallet_key() {
     let wallet = Identity::generate();
     let bob = ContactIdentity::generate();
-    let card = bob.card(5, 10, 20);
-    assert_eq!(card.verify(10), Ok(()));
+    let card = bob.card(NET, 5, 10, 20);
+    assert_eq!(card.verify(&NET, 10), Ok(()));
     assert_eq!(ContactCard::from_bytes(&card.to_bytes()).unwrap(), card);
     let keys = [card.signing_key, card.handshake_key, card.inbox_key];
     assert!(keys[0] != keys[1] && keys[1] != keys[2] && keys[0] != keys[2], "three separate keys");
     assert!(!card.to_bytes().windows(32).any(|w| w == wallet.address().0));
-    assert_eq!(card.verify(9), Err(ContactError::NotYetValid));
-    assert_eq!(card.verify(20), Err(ContactError::Expired));
+    assert_eq!(card.verify(&NET, 9), Err(ContactError::NotYetValid));
+    assert_eq!(card.verify(&NET, 20), Err(ContactError::Expired));
     let mut forged = card.clone();
     forged.price = 1;
-    assert_eq!(forged.verify(15), Err(ContactError::BadSignature));
+    assert_eq!(forged.verify(&NET, 15), Err(ContactError::BadSignature));
     let mut swapped = card.clone();
     swapped.inbox_key = ContactIdentity::generate().inbox_key().public();
-    assert_eq!(swapped.verify(15), Err(ContactError::BadSignature));
+    assert_eq!(swapped.verify(&NET, 15), Err(ContactError::BadSignature));
     assert_eq!(ContactCard::from_bytes(&card.to_bytes()[1..]), Err(ContactError::Malformed));
+}
+
+#[test]
+fn a_card_for_another_network_is_refused() {
+    let bob = ContactIdentity::generate();
+    let card = bob.card(NET, 5, 10, 20);
+    assert_eq!(card.network, NET);
+    // Shown on another network, the genuine card is refused.
+    assert_eq!(card.verify(&[1; 32], 15), Err(ContactError::WrongNetwork));
+    // Relabelling it breaks the signature, which covers the network.
+    let mut relabelled = card.clone();
+    relabelled.network = [1; 32];
+    assert_eq!(relabelled.verify(&[1; 32], 15), Err(ContactError::BadSignature));
+    // A card Bob signs for the other network is valid there and only there.
+    let other = bob.card([1; 32], 5, 10, 20);
+    assert_eq!(other.verify(&[1; 32], 15), Ok(()));
+    assert_eq!(other.verify(&NET, 15), Err(ContactError::WrongNetwork));
+    assert_eq!(ContactCard::from_bytes(&other.to_bytes()).unwrap(), other);
 }
 
 #[test]
@@ -100,7 +118,7 @@ fn dave_with_bobs_real_card_and_route_gets_no_reply_of_any_kind() {
     let invitation = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
     bob_side.gate_mut().record_invitation(invitation.clone());
 
-    assert_eq!(card.verify(NOW), Ok(()));
+    assert_eq!(card.verify(&NET, NOW), Ok(()));
     let dave = StaticKey::generate();
     // Dave tries a made-up reference, and even Alice's invitation id (say he
     // saw her invitation): his key is not the holder.
@@ -140,7 +158,7 @@ fn invited_alice_connects_and_is_a_contact_afterwards() {
     let alice = StaticKey::generate();
     let invitation = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
     bob_side.gate_mut().record_invitation(invitation.clone());
-    assert_eq!(card.verify(NOW), Ok(()));
+    assert_eq!(card.verify(&NET, NOW), Ok(()));
     assert_eq!(invitation.verify(&card.signing_key, &NET, NOW), Ok(()));
     assert_eq!(invitation.holder, alice.public());
     // The holder must name the invitation it holds.

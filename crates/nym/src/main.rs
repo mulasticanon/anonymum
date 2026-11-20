@@ -189,7 +189,7 @@ async fn run() -> Result<(), AnyError> {
         carol_wallet.address()
     );
     let bob = ContactIdentity::generate();
-    let card = bob.card(COIN, now_secs(), now_secs() + 86_400);
+    let card = bob.card(NETWORK, COIN, now_secs(), now_secs() + 86_400);
     println!(
         "Bob's contact card (separate from his wallet): signing {}, handshake {}, inbox {}, price {} units",
         short(&card.signing_key),
@@ -234,7 +234,7 @@ async fn run() -> Result<(), AnyError> {
     let alice_key = StaticKey::generate();
     let invitation = bob.invite(NETWORK, alice_key.public(), Purpose::Contact, now_secs() + 3_600);
     bob_side.gate_mut().record_invitation(invitation.clone());
-    card.verify(now_secs())?;
+    card.verify(&NETWORK, now_secs())?;
     invitation.verify(&card.signing_key, &NETWORK, now_secs())?;
     println!("  Alice checked the card and the invitation (issuer, network, expiry, signature).");
 
@@ -553,7 +553,7 @@ fn cmd_wallet(args: &[String]) -> Result<(), AnyError> {
     println!("address={}", to_hex(&wallet.address().0));
     println!("msgkey={}", to_hex(&key));
     println!("binding={}", to_hex(&binding.0));
-    println!("card={}", to_hex(&contact.card(COIN, 0, now_secs() + 86_400).to_bytes()));
+    println!("card={}", to_hex(&contact.card(NETWORK, COIN, 0, now_secs() + 86_400).to_bytes()));
     Ok(())
 }
 
@@ -567,7 +567,7 @@ async fn cmd_throwaway(args: &[String]) -> Result<(), AnyError> {
 
 fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
     let card = ContactCard::from_bytes(&from_hex(flag(args, "--card")?)?)?;
-    card.verify(now_secs())?;
+    card.verify(&NETWORK, now_secs())?;
     let sender = load_contact(flag(args, "--sender")?)?;
     let callback = StaticKey::generate();
     let admission = random_bytes();
@@ -607,7 +607,7 @@ async fn cmd_talk(args: &[String]) -> Result<(), AnyError> {
     let admission = field(keep, "admission")?;
     let dir = PathBuf::from(flag(args, "--dir")?);
     let reply_to = Recipient::try_from_bytes(fixed::<96>(flag(args, "--reply")?)?)?;
-    let card = bob.card(COIN, 0, now_secs() + 86_400);
+    let card = bob.card(NETWORK, COIN, 0, now_secs() + 86_400);
     println!("Connecting Bob's and Carol's long-lived clients...");
     let mut bob_net = Endpoint::connect("bob").await?;
     let carol_net = Endpoint::connect("carol (long-lived)").await?;

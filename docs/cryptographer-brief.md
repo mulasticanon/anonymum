@@ -49,7 +49,7 @@ to write that bounded statement is part of the request.
 | Item | Where | Status |
 |---|---|---|
 | Shielded design specification, v0.7 | `docs/shielded-spec-v0.md` | **The main thing to review.** Rules only; no cryptographic suite chosen |
-| Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I26, questions raised while prototyping section 2a |
+| Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I27, questions raised while prototyping section 2a |
 | Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 51 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
 | Research report | `docs/Shielded_Payments_Technical_Research_2026-11-19.md` | 25,000 words, AI-written. Two claims spot-checked against primary sources (ZIP 257; Polkadot RFC-0163). The rest unchecked |
 | Alternative, heavier protocol | `docs/Shielded_Payments_Protocol_v0.1.md` | AI-written. Kept for comparison; section 8 of the spec lists the differences |
@@ -129,7 +129,7 @@ composition and whether it answers questions 11 and 12:
 
 - `contact.rs`: a contact identity separate from the wallet (Ed25519
   signing key, X25519 handshake key, X25519 inbox key); a signed contact
-  card (keys, price, validity); invitations signed by the contact key, to
+  card (network, keys, price, validity); invitations signed by the contact key, to
   one holder key, naming network, purpose and expiry. No wallet key appears
   in a card, a handshake or a note.
 - `session.rs`: Noise IK (X25519, ChaCha20-Poly1305, BLAKE2s). Message 1
@@ -147,6 +147,12 @@ composition and whether it answers questions 11 and 12:
   prologue bound to the admission commitment; inside, the sender's contact
   key, a fresh callback key, the throwaway route, the intro and the
   sender's Ed25519 signature over all of it plus the recipient's inbox key.
+  **Question (issue I27):** that signature gives the recipient
+  transferable proof of who contacted them. Should authentication only the
+  two parties can verify (e.g. a Diffie-Hellman-authenticated Noise pattern
+  such as X, or a designated-verifier signature) replace it, and what does
+  that cost against forwarding a note to a third person and claiming
+  another identity?
 - `invite.rs`: the transparent chain's one-time invites (Ed25519), kept.
 - Known limits: IK's replayable message 1 (a still-authorised caller's
   recorded message 1 gets a reply: an availability signal, question 11);
@@ -154,7 +160,7 @@ composition and whether it answers questions 11 and 12:
   has no forward secrecy for the inbox key; the ephemeral key in a note is
   a raw X25519 point (question 12); forward secrecy per session only; no
   post-quantum key exchange; nothing audited. Questions raised while
-  building it are I15-I26 in the issues file.
+  building it are I15-I27 in the issues file.
 
 ### D. How the pieces compose at the network layer
 

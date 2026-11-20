@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 51 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 52 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -75,8 +75,13 @@ confirmation (5.4 s). Carol's note (587 bytes) was opened with Bob's inbox
 key alone; Bob called her callback key, her throwaway let in only his key
 (70 s, first attempt), and Eve, calling the same route, got nothing. Dave,
 with Bob's real card and route but no invitation, got nothing and gave up.
-Whole demo passed in 191 s. `e2e.mjs` was updated for the new subcommands
-but not rerun.
+Whole demo passed in 191 s.
+
+Dev chain rerun for the 587-byte note (2026-11-20): runtime rebuilt,
+`smoke.mjs` passed every check, and `e2e.mjs` passed end to end. Carol's
+real note went through the chain byte for byte, Bob opened it from chain
+state with his inbox key alone, and his callback over Nym was confirmed on
+the first attempt.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -251,7 +256,7 @@ I14).
    both sides' consent.
 9. **No mixnet address is ever published.** Each user has a contact identity
    separate from the wallet: a signing key, a handshake key and an inbox key,
-   listed on a signed contact card (with a price and validity). A stranger's
+   listed on a signed contact card (with network, price and validity). A stranger's
    request carries a note sealed to the inbox key (Noise N): the stranger's
    contact key, a fresh callback key, a throwaway route and an intro of at
    most 280 bytes, all signed and padded so every note is 587 bytes. It opens
