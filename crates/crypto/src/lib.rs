@@ -1,25 +1,34 @@
 //! Real cryptography for Anonymum, built only from audited-in-the-wild crates.
 //!
-//! * [`Identity`] — a wallet: Ed25519 key for the address and signatures,
-//!   X25519 key for message encryption, with the second bound to the first.
-//! * [`InviteSecret`] / [`Ed25519Invites`] — one-time invites, replacing the
-//!   insecure mock in `anonymum-core`.
-//! * [`Handshake`] / [`Session`] — end-to-end encryption between two
-//!   addresses using the Noise XX pattern. Nobody without one of the two
-//!   private keys can read the messages: no node, no developer.
-//! * [`seal_note`] / [`open_note`] — the fixed-size note a stranger's
-//!   contact request carries (Noise N), holding a throwaway reply address.
+//! * [`Identity`] — a wallet: Ed25519 key for the chain address and
+//!   signatures, X25519 key bound to it for the transparent prototype chain.
+//!   Never used in a handshake or a note.
+//! * [`ContactIdentity`], [`ContactCard`], [`Invitation`] — a contact
+//!   identity separate from the wallet (spec v0.7 section 2a).
+//! * [`Gate`] — who the answering side lets in, decided before any reply.
+//! * [`Handshake`] / [`Incoming`] / [`Session`] — Noise IK sessions between
+//!   contact keys. Nobody without one of the two private keys can read the
+//!   messages: no node, no developer.
+//! * [`seal_note`] / [`open_note`] — a stranger's fixed-size note, opened
+//!   with the recipient's inbox key alone.
+//! * [`InviteSecret`] / [`Ed25519Invites`] — the transparent chain's
+//!   one-time invites (cheap channel opening), unchanged.
 //!
 //! This crate composes existing primitives; it invents none. It has not been
-//! externally audited.
+//! externally audited, and the handshake and note format (section 2a) have
+//! not been reviewed (spec questions 11 and 12).
 
+pub mod contact;
+pub mod gate;
 mod identity;
 mod invite;
 pub mod note;
 mod session;
 pub mod wire;
 
+pub use contact::{random_bytes, ContactCard, ContactError, ContactIdentity, Invitation, Network, Purpose, StaticKey};
+pub use gate::{Gate, Grant};
 pub use identity::Identity;
 pub use invite::{Ed25519Invites, InviteSecret};
 pub use note::{open_note, seal_note, ContactNote, NoteError};
-pub use session::{Handshake, Session, SessionError, MAX_PLAINTEXT};
+pub use session::{Handshake, Incoming, Session, SessionError, MAX_PLAINTEXT, REFERENCE_LEN};

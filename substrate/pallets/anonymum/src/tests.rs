@@ -9,7 +9,7 @@ use crate::pallet::{
     HoldReason, Blocks, Channels, Error, Event, ExpiryQueue, MessagingKeys, OpenedVia, RefundReason, Requests,
     UnblockReason,
 };
-use crate::{invite_message, SealedNote};
+use crate::{invite_message, SealedNote, SEALED_NOTE_LEN};
 use codec::Encode;
 use frame::deps::sp_core::{ed25519, Pair};
 use frame::deps::sp_io::hashing::blake2_256;
@@ -618,16 +618,16 @@ fn request_carries_the_sealed_note_to_the_recipient() {
 #[test]
 fn notes_of_the_wrong_size_are_refused() {
     new_test_ext().execute_with(|| {
-        for len in [0usize, 1, 426] {
+        for len in [0usize, 1, SEALED_NOTE_LEN as usize - 1] {
             let short: SealedNote = vec![0u8; len].try_into().unwrap();
             assert_noop!(
                 Anonymum::request_contact(signed("carol"), account("bob"), COIN, short),
                 Error::<Test>::BadNoteSize
             );
         }
-        // Longer than 427 cannot even be decoded into a call: the bound
+        // Longer than SEALED_NOTE_LEN cannot even be decoded into a call: the bound
         // on `SealedNote` rejects it.
-        assert!(SealedNote::try_from(vec![0u8; 428]).is_err());
+        assert!(SealedNote::try_from(vec![0u8; SEALED_NOTE_LEN as usize + 1]).is_err());
     });
 }
 

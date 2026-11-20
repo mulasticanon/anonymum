@@ -4,8 +4,9 @@ Raised while building `crates/shielded-model` against
 `docs/shielded-spec-v0.md`. I1–I12 were found in v0.4 (2026-11-19); v0.5
 resolves all but I8. I13–I14 were raised by v0.5; v0.6 fixes their wording.
 The design review of 2026-11-19 (`design-review-2026-11-19.md`) adds
-findings H1–H7 and M1–M4, tracked at the end. Each entry says how it stands
-and what the model does.
+findings H1–H7 and M1–M4, tracked below. I15–I26 were raised while
+prototyping v0.7 section 2a in `crates/crypto` (2026-11-20). Each entry says
+how it stands and what the model or prototype does.
 
 | # | Issue | Status |
 |---|---|---|
@@ -108,8 +109,8 @@ always refundable").
 |---|---|---|
 | H1 | A changed base fee strands old escrows (= I8) | **Open.** `F` fixed for the prototype (v0.6 P4); the max-fee alternative needs the owner's decision |
 | H2 | Restore did not cover the key indices the wallet can use | **Fixed in the model** (and v0.6): the recovery copy records purpose and index for the refund identity and the cancel authority; no search. Tested at `u64::MAX`, sparse indices and 40 escrows |
-| H3 | Noise XX gives a reusable wallet credential to any initiating peer | **Open, needs a design decision** (spec section 2a, question 11). Handshake identity handling deliberately unchanged |
-| H4 | The sealed note's prologue needs the stranger's address before decrypting | **Open, needs a design decision** (spec section 2a, question 12). Sealed-note format deliberately unchanged |
+| H3 | Noise XX gives a reusable wallet credential to any initiating peer | Addressed in the prototype, unreviewed; spec questions 11 and 12 |
+| H4 | The sealed note's prologue needs the stranger's address before decrypting | Addressed in the prototype, unreviewed; spec questions 11 and 12 |
 | H5 | A resolver knows the deterministic refund; spend privacy and recovery need in-circuit guarantees | **Open cryptographic gate.** The model enforces the exact refund fields; it cannot show proof properties |
 | H6 | Wallet-specific fetches, immediate callbacks and a small population can reveal correspondents | **Open deployment gate** |
 | H7 | Circuit completeness, verifier validation, key privacy, setup and mobile proving are unproven | **Open release gate** |
@@ -139,3 +140,28 @@ counts the session as open only after the responder confirms it.
 *For the cryptographer:* the partial rollback is still worth reporting
 upstream, and matters for whichever handshake replaces this one
 (question 11).
+
+## Raised while prototyping section 2a (spec v0.7, 2026-11-20)
+
+H3 and H4 are addressed in `crates/crypto` by a prototype of section 2a:
+contact identities separate from the wallet, Noise IK with the
+authorisation check before any reply, and a note that opens with the
+recipient's inbox key alone. Unreviewed; spec questions 11 and 12. Where
+the spec left something open, the prototype made the choice below and
+carried on. Each needs the owner's or the cryptographer's answer.
+
+| # | Spec gap | What the prototype does |
+|---|---|---|
+| I15 | Rule 3 says a caller is "treated as present only after a fresh session confirmation" but not who confirms or how. | Four frames: IK message 1, IK message 2, a CONFIRM from the caller sealed in the new session, an ACK from the answerer. Grants (invitation used, contact recorded) are committed on CONFIRM, after checking the gate again; the caller counts the session as open on the ACK. |
+| I16 | In reverse rendezvous the stranger answers "only if the caller is the recipient they addressed", but caller keys should be scoped to one request. The stranger knows only the recipient's card. | The recipient calls with the handshake key from its card; the stranger's side accepts exactly that key, naming that request. The recipient's key is therefore not scoped per request (it is public on the card anyway). A fresh per-request key would need a signature from the contact signing key inside message 1. |
+| I17 | The note must be bound to "the admission record of the same transaction", but the transparent prototype chain has no admission record. | The note's Noise prologue includes a 32-byte admission commitment. The note field carries `commitment (32) || envelope (555)`, 587 bytes (was 427; core and pallet constants changed). In the shielded design the commitment must be a separate public field, or moving the whole field to another transaction moves the binding with it. The demo uses a random stand-in. |
+| I18 | Rule 6: "both sides mix the accepted request's identifier into the session"; the identifier is not defined. | The reference named inside message 1 is part of the IK transcript, so the session is bound to it. For a callback it is the admission commitment; for an invitation, the invitation id; for a contact, the reference recorded when the relationship began. |
+| I19 | Who generates the invitation's holder key is not said. | The invitee generates a caller key for this relationship and hands its public half to the issuer, who signs an invitation to it (no secret is handed over). |
+| I20 | A contact card names keys, price and validity but no network; invitations name the network. | Card without network; the session prologue and invitations carry it. Cards could be replayed across networks. |
+| I21 | Rule 3 asks that a replayed first message not reopen a blocked contact or use an invitation twice, but says nothing of a still-authorised caller. | A recorded message 1 from a caller who is still a contact gets a message 2 (it cannot be confirmed, so no session and no grant). An availability signal: question 11. Repeats of an answered message 1 are re-checked against the gate before the cached reply is resent. |
+| I22 | Rule 4 puts the sender's contact identity inside the note but does not say it is authenticated. | The sender signs (contact signing key) the admission commitment, the recipient's inbox key and the note body, so a note cannot claim another identity or be forwarded to a third person as if written to them. |
+| I23 | Rule 4: a note must not be recognisable from the public card. | Noise N gives that for the ciphertext, but its ephemeral key is a raw X25519 point, distinguishable from random bytes (not linkable to the recipient). Elligator-style encoding would need a vetted library. Question 12. |
+| I24 | The shielded design's payload slot size (P10) is open; the note is now 587 bytes. | Recorded; the model's 204-byte slot is a placeholder and cannot hold it. |
+| I25 | Whether an existing contact may call about anything, or only its relationship. | A contact's calls must name the reference recorded when it was admitted; any other reference gets nothing. |
+| I26 | The transparent chain still requires a wallet-bound messaging key before it accepts a request, and records requests wallet to wallet. | Kept for the prototype chain (a known gap until stage 5). Notes are sealed to the card's inbox key and never use that key. |
+

@@ -47,37 +47,22 @@ pub fn key_binding_message(key: &MessagingKey) -> Vec<u8> {
     message
 }
 
-// ---- contact notes (decision B) -------------------------------------------
+// ---- contact notes (decision B; format v2 from spec v0.7 section 2a) ------
 //
 // A stranger's contact request carries a note sealed to the recipient's
-// messaging key: a throwaway mixnet address for this one request, plus a
-// short intro. Every note has the same size, so its length says nothing.
-// The chain can only check that size; the intro limit is enforced by the
-// fixed layout and checked again by the recipient's client when it opens
-// the note. Sealing and opening live in `anonymum-crypto`.
+// contact inbox key: the sender's contact identity, a fresh callback key, a
+// throwaway route and a short intro, preceded by the admission commitment
+// the note is bound to. Every note has the same size, so its length says
+// nothing. The chain checks only that size; the layout, sealing and opening
+// live in `anonymum-crypto::note`.
 
-/// Bytes reserved for the throwaway reply address (sized for a Nym
-/// `Recipient`: identity key, encryption key, gateway key).
-pub const NOTE_REPLY_ADDRESS_LEN: usize = 96;
-/// Longest intro, in bytes of UTF-8. Proposed cap; open question.
-pub const NOTE_INTRO_MAX_BYTES: usize = 280;
-/// Version byte, reply address, intro length (u16), intro padded to the max.
-pub const NOTE_PLAINTEXT_LEN: usize = 1 + NOTE_REPLY_ADDRESS_LEN + 2 + NOTE_INTRO_MAX_BYTES;
-/// Noise N message: ephemeral key (32) + encrypted plaintext + tag (16).
-pub const SEALED_NOTE_LEN: usize = 32 + NOTE_PLAINTEXT_LEN + 16;
+/// Exact length of a note field: admission commitment (32) + Noise N
+/// envelope (555).
+pub const SEALED_NOTE_LEN: usize = 587;
 
 /// An encrypted contact note. Opaque to the chain apart from its length.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SealedNote(pub Vec<u8>);
-
-/// Mixed into the note's encryption, so a note copied into another
-/// sender's request (or aimed at another recipient) fails to open.
-pub fn contact_note_prologue(from: &Address, to: &Address) -> Vec<u8> {
-    let mut prologue = b"anonymum/contact-note/v1".to_vec();
-    prologue.extend_from_slice(&from.0);
-    prologue.extend_from_slice(&to.0);
-    prologue
-}
 
 /// The exact bytes an opener signs. Binding both addresses stops replay
 /// against a different opener or a different recipient.

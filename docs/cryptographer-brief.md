@@ -1,6 +1,6 @@
 # Brief for an external cryptographer
 
-Anonymum project, 2026-11-19. This is the starting point for a specialist
+Anonymum project, 2026-11-19, updated 2026-11-20 for spec v0.7. This is the starting point for a specialist
 engaged to review the design before any real value is at stake.
 
 ## 1. What you should know first
@@ -48,13 +48,13 @@ to write that bounded statement is part of the request.
 
 | Item | Where | Status |
 |---|---|---|
-| Shielded design specification, v0.6 | `docs/shielded-spec-v0.md` | **The main thing to review.** Rules only; no cryptographic suite chosen |
-| Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | 14 issues. Open: I8 (fee changes) and I13 (the derived refund, spec question 8). I14 was wording, since corrected |
-| Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 45 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
+| Shielded design specification, v0.7 | `docs/shielded-spec-v0.md` | **The main thing to review.** Rules only; no cryptographic suite chosen |
+| Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I26, questions raised while prototyping section 2a |
+| Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 51 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
 | Research report | `docs/Shielded_Payments_Technical_Research_2026-11-19.md` | 25,000 words, AI-written. Two claims spot-checked against primary sources (ZIP 257; Polkadot RFC-0163). The rest unchecked |
 | Alternative, heavier protocol | `docs/Shielded_Payments_Protocol_v0.1.md` | AI-written. Kept for comparison; section 8 of the spec lists the differences |
-| Messaging cryptography | `crates/crypto` (about 750 lines) | Working code, 25 tests. Noise XX sessions, Noise N sealed notes, Ed25519 invites |
-| Mixnet demo | `crates/nym` | Ran end to end on the live Nym mixnet |
+| Messaging cryptography | `crates/crypto` (about 1,700 lines) | Working code, tested. Section 2a prototype: contact identities, cards and invitations; Noise IK with the authorisation check before any reply; the stranger's note opened with the inbox key alone. **Unreviewed (questions 11 and 12)** |
+| Mixnet demo | `crates/nym` | Ran end to end on the live Nym mixnet, including with the section 2a handshake |
 | Transparent prototype chain | `crates/core`, `substrate/` | Working. **Publishes the whole contact graph.** To be replaced by the shielded design; not a review priority |
 
 To run the tests: `cargo test` at the repository root (core, crypto and the
@@ -121,21 +121,40 @@ The spec deliberately leaves the cryptographic suite open.
   check subgroup membership on decode, and the RFC notes the underlying
   arkworks libraries are unaudited.
 
-### C. The messaging cryptography (lower priority, already built)
+### C. The messaging cryptography (section 2a prototype; questions 11 and 12)
 
-`crates/crypto`, about 750 lines. A sanity review of how standard pieces
-are composed:
+`crates/crypto`, about 1,700 lines. It prototypes spec section 2a with
+standard Noise patterns through `snow`'s public API. Please check both the
+composition and whether it answers questions 11 and 12:
 
-- `session.rs`: Noise XX (X25519, ChaCha20-Poly1305, BLAKE2s) with each
-  side proving its wallet address inside the encrypted handshake payload,
-  by a signature binding its Noise static key to its Ed25519 address key.
-  Stateless transport with explicit counters and a sliding replay window,
-  because the mixnet reorders packets.
-- `note.rs`: a sealed contact note as one Noise N message, with the
-  sender and recipient addresses in the prologue.
-- `invite.rs`: one-time invites as Ed25519 key pairs.
-- Known limits: forward secrecy per session only (no ratchet); no
-  post-quantum key exchange; nothing audited.
+- `contact.rs`: a contact identity separate from the wallet (Ed25519
+  signing key, X25519 handshake key, X25519 inbox key); a signed contact
+  card (keys, price, validity); invitations signed by the contact key, to
+  one holder key, naming network, purpose and expiry. No wallet key appears
+  in a card, a handshake or a note.
+- `session.rs`: Noise IK (X25519, ChaCha20-Poly1305, BLAKE2s). Message 1
+  carries the caller's static key and a 32-byte reference (invitation id,
+  relationship or accepted request) inside the encrypted payload; the
+  answerer reads both before writing anything.
+- `gate.rs` and `wire.rs`: the answerer replies only to an authorised key
+  (an unused invitation it issued, an existing contact, or the expected
+  callback), never blocked; anyone else gets no frame at all. Grants are
+  committed only when the caller sends a confirmation sealed in the fresh
+  session, so a replayed message 1 cannot use an invitation twice or
+  reopen a blocked contact. Retries, call ids and exact frame lengths
+  around that.
+- `note.rs`: the stranger's note as one Noise N message to the inbox key,
+  prologue bound to the admission commitment; inside, the sender's contact
+  key, a fresh callback key, the throwaway route, the intro and the
+  sender's Ed25519 signature over all of it plus the recipient's inbox key.
+- `invite.rs`: the transparent chain's one-time invites (Ed25519), kept.
+- Known limits: IK's replayable message 1 (a still-authorised caller's
+  recorded message 1 gets a reply: an availability signal, question 11);
+  IK's weaker caller privacy if the answerer's handshake key leaks; Noise N
+  has no forward secrecy for the inbox key; the ephemeral key in a note is
+  a raw X25519 point (question 12); forward secrecy per session only; no
+  post-quantum key exchange; nothing audited. Questions raised while
+  building it are I15-I26 in the issues file.
 
 ### D. How the pieces compose at the network layer
 
@@ -183,3 +202,5 @@ wallet synchronisation, and from the small population at launch.
 - A sender can withdraw a request while the recipient's claim is still
   unconfirmed; the first finalised action wins.
 - No trusted-setup plan exists, should the proof system need one.
+- The section 2a handshake and note format are an unreviewed prototype;
+  the transparent chain still links each request to both wallets.

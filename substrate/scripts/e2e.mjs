@@ -6,16 +6,19 @@
 //   cd substrate/scripts && node e2e.mjs          (Windows or Linux)
 //
 // 1. Two wallets are created by `anonymum-nym wallet` (anonymum-crypto
-//    `Identity`: an Ed25519 account key plus an X25519 messaging key).
+//    `Identity`: an Ed25519 account key plus an X25519 messaging key), each
+//    with a separate contact identity (spec v0.7 section 2a) and its card.
 //    Their chain accounts ARE those Ed25519 keys: clients standardise on
 //    Ed25519 account keys, so the address the crypto crate uses and the
 //    on-chain AccountId are the same 32 bytes.
 // 2. Bob publishes his real messaging key with its real binding signature.
-// 3. Carol creates a persisted throwaway Nym client, reads Bob's key from
-//    chain state, seals a real note to it, and sends a paid request.
-// 4. Bob reads the note back from chain state, opens it, and accepts.
-// 5. Bob calls Carol at the throwaway address over Nym; they swap
-//    long-lived addresses inside the encrypted session.
+//    (The transparent chain still requires it; notes do not use it.)
+// 3. Carol creates a persisted throwaway Nym client, seals a real note to
+//    the inbox key on Bob's contact card, and sends a paid request.
+// 4. Bob reads the note back from chain state, opens it with his inbox key
+//    alone (no sender address), and accepts.
+// 5. Bob calls Carol's callback key at the throwaway route over Nym (Noise
+//    IK); they swap long-lived routes inside the encrypted session.
 //
 // DEV ONLY: wallets are plain files in a temporary folder, deleted at the end.
 
@@ -105,13 +108,14 @@ try {
   check(stored.key.toHex() === '0x' + bob.msgkey, 'the key in chain state is the wallet\'s real key');
 
   // ---- 3. Carol seals a real note and pays to reach Bob ---------------------
-  console.log('\n3. Carol creates a throwaway Nym client, seals a note to the key from chain state, and requests contact.');
+  console.log("\n3. Carol creates a throwaway Nym client, seals a note to the inbox key on Bob's card, and requests contact.");
   const throwaway = rust('throwaway', throwawayDir);
   check(throwaway.address.length === 192, 'throwaway Nym address created (96 bytes) and persisted; client now offline');
-  const keyFromChain = (await api.query.anonymum.messagingKeys(bobAccount.address)).unwrap().key.toHex().slice(2);
-  const { note } = rust('seal', '--key', keyFromChain, '--from', carol.address, '--to', bob.address,
-    '--reply', throwaway.address, '--intro', INTRO);
-  check(note.length === 2 * 427, 'sealed note is 427 bytes (Noise N via snow)');
+  const keepFile = join(work, 'carol.keep');
+  const { note } = rust('seal', '--card', bob.card, '--sender', join(work, 'carol.wallet'),
+    '--reply', throwaway.address, '--intro', INTRO, '--keep', keepFile);
+  check(note.length === 2 * 587, 'sealed note is 587 bytes (admission commitment + Noise N via snow)');
+  check(!note.includes(carol.address) && !note.includes(bob.address), 'no wallet address in the note');
   r = await send(carolAccount, api.tx.anonymum.requestContact(bobAccount.address, COIN, '0x' + note));
   const requested = r.events.find((e) => e.method === 'ContactRequested');
   check(r.error === null && requested, 'paid contact request on chain');
@@ -121,16 +125,16 @@ try {
   console.log('\n4. Bob reads the request from chain state, opens the note, and accepts.');
   const onChain = (await api.query.anonymum.requests(requestId)).unwrap();
   check(onChain.note.toHex() === '0x' + note, 'the note in chain state is byte-for-byte what Carol sealed');
-  const opened = rust('open', '--wallet', join(work, 'bob.wallet'), '--from', onChain.from.toHex().slice(2), '--note', onChain.note.toHex().slice(2));
+  const opened = rust('open', '--wallet', join(work, 'bob.wallet'), '--note', onChain.note.toHex().slice(2));
   check(opened.intro === INTRO, `Bob reads the intro: "${opened.intro}"`);
-  check(opened.reply === throwaway.address, "and Carol's throwaway address");
+  check(opened.reply === throwaway.address, "and Carol's throwaway route, with no sender hint");
   r = await send(bobAccount, api.tx.anonymum.acceptContact(requestId));
   check(r.error === null && r.events.some((e) => e.method === 'ChannelOpened'), 'Bob accepted; channel open on chain');
 
   // ---- 5. They talk over Nym --------------------------------------------------
   console.log('\n5. Bob calls Carol over the live Nym mixnet at the address from the note.\n');
   const talk = spawnSync(BIN, ['talk', '--bob', join(work, 'bob.wallet'), '--carol', join(work, 'carol.wallet'),
-    '--dir', throwawayDir, '--reply', opened.reply], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+    '--keep', keepFile, '--dir', throwawayDir, '--reply', opened.reply], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
   process.stdout.write(talk.stdout.split(/\r?\n/).map((l) => '    ' + l).join('\n') + '\n');
   check(talk.status === 0 && talk.stdout.includes('talk=ok'), 'Bob and Carol completed the handshake and swapped long-lived addresses over Nym');
 

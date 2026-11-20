@@ -1,11 +1,51 @@
+//! The wire layer: retries, confirmation, stale frames and frame limits
+//! (design review M3, af61c8f), adapted to Noise IK and the gate.
+
 use std::time::Duration;
 
 use anonymum_crypto::wire::{
     Initiator, InitiatorEvent, Responder, ResponderEvent, RetryPolicy, WireError, MAX_FRAME, PENDING_TICKS,
 };
-use anonymum_crypto::{Identity, SessionError, MAX_PLAINTEXT};
+use anonymum_crypto::{ContactIdentity, Gate, Grant, Network, Purpose, SessionError, StaticKey, MAX_PLAINTEXT};
 
+const NET: Network = [9; 32];
+const NOW: u64 = 1_000;
 const POLICY: RetryPolicy = RetryPolicy { attempts: 3, resends: 2, base_wait: Duration::from_secs(10) };
+
+/// Bob, who answers, and one invited caller key per invitation he issues.
+struct Bob {
+    me: ContactIdentity,
+    side: Responder<u32>,
+}
+
+struct Caller {
+    key: StaticKey,
+    reference: [u8; 32],
+}
+
+impl Bob {
+    fn new() -> Bob {
+        let me = ContactIdentity::generate();
+        let side = Responder::new(me.handshake_key(), NET, Gate::new(NET));
+        Bob { me, side }
+    }
+
+    fn invite(&mut self) -> Caller {
+        let key = StaticKey::generate();
+        let invitation = self.me.invite(NET, key.public(), Purpose::Contact, NOW + 3_600);
+        let reference = invitation.id;
+        self.side.gate_mut().record_invitation(invitation);
+        Caller { key, reference }
+    }
+
+    fn call(&self, caller: &Caller, policy: RetryPolicy) -> (Initiator, Vec<u8>) {
+        Initiator::start_with(&caller.key, self.me.handshake_key().public(), NET, caller.reference, policy).unwrap()
+    }
+
+    fn handle(&mut self, tag: u32, frame: &[u8]) -> Result<ResponderEvent, WireError> {
+        self.side.handle(tag, frame, NOW)
+    }
+}
 
 fn reply(event: ResponderEvent) -> Vec<u8> {
     match event {
@@ -21,45 +61,44 @@ fn send(event: InitiatorEvent) -> Vec<u8> {
     }
 }
 
-/// The confirmation to send back, after checking who the caller proved to be.
-fn confirmed(event: ResponderEvent, expected: &Identity) -> Vec<u8> {
+/// The ACK to send back, after checking who confirmed.
+fn established(event: ResponderEvent, caller: &Caller) -> Vec<u8> {
     match event {
-        ResponderEvent::Established { peer, reply } => {
-            assert_eq!(peer, expected.address());
+        ResponderEvent::Established { peer, reply, .. } => {
+            assert_eq!(peer, caller.key.public());
             reply
         }
         other => panic!("expected an established session, got {other:?}"),
     }
 }
 
-/// Finish an attempt whose first frame is `f1`.
-fn finish(caller: &mut Initiator, f1: &[u8], alice: &Identity, bob: &Identity, bob_side: &mut Responder<u32>, tag: u32) {
-    let f2 = reply(bob_side.handle(bob, tag, f1).unwrap());
-    let f3 = send(caller.handle(&f2).unwrap());
-    assert!(!caller.is_established(), "not before the responder confirms");
-    assert!(matches!(caller.seal(b"too early"), Err(WireError::NoSession)));
-    let confirm = confirmed(bob_side.handle(bob, tag, &f3).unwrap(), alice);
-    assert_eq!(caller.handle(&confirm).unwrap(), InitiatorEvent::Established);
-    assert!(caller.is_established());
-    assert_eq!(caller.wait(), None);
+/// Finish an attempt whose first frame is `hello`.
+fn finish(call: &mut Initiator, hello: &[u8], caller: &Caller, bob: &mut Bob, tag: u32) {
+    let welcome = reply(bob.handle(tag, hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    assert!(!call.is_established(), "not before the answerer acknowledges");
+    assert!(matches!(call.seal(b"too early"), Err(WireError::NoSession)));
+    let ack = established(bob.handle(tag, &confirm).unwrap(), caller);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    assert!(call.is_established());
+    assert_eq!(call.wait(), None);
 }
 
-/// Drive a full handshake; `tag` plays the role of the transport's reply handle.
-fn establish(alice: &Identity, bob: &Identity, bob_side: &mut Responder<u32>, tag: u32) -> Initiator {
-    let (mut caller, f1) = Initiator::start_with(alice, bob.address(), POLICY).unwrap();
-    finish(&mut caller, &f1, alice, bob, bob_side, tag);
-    caller
+fn establish(caller: &Caller, bob: &mut Bob, tag: u32) -> Initiator {
+    let (mut call, hello) = bob.call(caller, POLICY);
+    finish(&mut call, &hello, caller, bob, tag);
+    call
 }
 
 /// Both directions still carry messages.
-fn talks(caller: &mut Initiator, alice: &Identity, bob: &Identity, bob_side: &mut Responder<u32>, tag: u32) {
-    let frame = caller.seal(b"ping").unwrap();
+fn talks(call: &mut Initiator, caller: &Caller, bob: &mut Bob, tag: u32) {
+    let frame = call.seal(b"ping").unwrap();
     assert_eq!(
-        bob_side.handle(bob, tag, &frame).unwrap(),
-        ResponderEvent::Message { peer: alice.address(), plaintext: b"ping".to_vec() }
+        bob.handle(tag, &frame).unwrap(),
+        ResponderEvent::Message { peer: caller.key.public(), plaintext: b"ping".to_vec() }
     );
-    let frame = bob_side.seal(&tag, b"pong").unwrap();
-    assert_eq!(caller.handle(&frame).unwrap(), InitiatorEvent::Message(b"pong".to_vec()));
+    let frame = bob.side.seal(&tag, b"pong").unwrap();
+    assert_eq!(call.handle(&frame).unwrap(), InitiatorEvent::Message(b"pong".to_vec()));
 }
 
 fn flip(frame: &[u8], at: usize) -> Vec<u8> {
@@ -68,98 +107,92 @@ fn flip(frame: &[u8], at: usize) -> Vec<u8> {
     out
 }
 
-fn people() -> (Identity, Identity, Responder<u32>) {
-    (Identity::generate(), Identity::generate(), Responder::new())
-}
-
 #[test]
 fn full_conversation_over_frames() {
-    let (alice, bob, mut bob_side) = people();
-    let mut caller = establish(&alice, &bob, &mut bob_side, 7);
-    talks(&mut caller, &alice, &bob, &mut bob_side, 7);
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let mut call = establish(&alice, &mut bob, 7);
+    talks(&mut call, &alice, &mut bob, 7);
 }
 
 #[test]
 fn responder_keeps_callers_apart() {
-    let (alice, bob, mut bob_side) = people();
-    let carol = Identity::generate();
-    let mut from_alice = establish(&alice, &bob, &mut bob_side, 1);
-    let mut from_carol = establish(&carol, &bob, &mut bob_side, 2);
-
+    let mut bob = Bob::new();
+    let (alice, carol) = (bob.invite(), bob.invite());
+    let mut from_alice = establish(&alice, &mut bob, 1);
+    let mut from_carol = establish(&carol, &mut bob, 2);
     let a = from_alice.seal(b"from alice").unwrap();
     let c = from_carol.seal(b"from carol").unwrap();
-    // Carol's frame presented under Alice's handle must not decrypt.
-    assert!(matches!(bob_side.handle(&bob, 1, &c), Err(WireError::Session(_))));
-    assert!(matches!(bob_side.handle(&bob, 1, &a), Ok(ResponderEvent::Message { .. })));
-    assert!(matches!(bob_side.handle(&bob, 2, &c), Ok(ResponderEvent::Message { .. })));
+    assert!(matches!(bob.handle(1, &c), Err(WireError::Session(_))));
+    assert!(matches!(bob.handle(1, &a), Ok(ResponderEvent::Message { .. })));
+    assert!(matches!(bob.handle(2, &c), Ok(ResponderEvent::Message { .. })));
 }
 
 #[test]
 fn forgotten_or_unknown_callers_cannot_send_data() {
-    let (alice, bob, mut bob_side) = people();
-    let mut caller = establish(&alice, &bob, &mut bob_side, 1);
-    bob_side.forget(&1);
-    let frame = caller.seal(b"still there?").unwrap();
-    assert!(matches!(bob_side.handle(&bob, 1, &frame), Err(WireError::NoSession)));
-    assert!(matches!(bob_side.handle(&bob, 99, &frame), Err(WireError::NoSession)));
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let mut call = establish(&alice, &mut bob, 1);
+    bob.side.forget(&1);
+    let frame = call.seal(b"still there?").unwrap();
+    assert!(matches!(bob.handle(1, &frame), Err(WireError::NoSession)));
+    assert!(matches!(bob.handle(99, &frame), Err(WireError::NoSession)));
 }
 
 #[test]
 fn nonsense_frames_are_errors_not_panics() {
-    let (alice, bob, mut bob_side) = people();
-    assert!(matches!(bob_side.handle(&bob, 1, &[]), Err(WireError::UnknownFrame)));
-    assert!(matches!(bob_side.handle(&bob, 1, &[200, 1, 2]), Err(WireError::UnknownFrame)));
-    assert!(matches!(bob_side.handle(&bob, 1, &[3, 1, 2]), Err(WireError::Malformed)));
-    assert!(matches!(bob_side.handle(&bob, 1, &[1, 1, 2]), Err(WireError::Malformed)));
-    assert!(matches!(bob_side.handle(&bob, 1, &[4, 1, 2]), Err(WireError::Malformed)));
-    let (mut caller, _) = Initiator::start(&alice, bob.address()).unwrap();
-    assert!(matches!(caller.seal(b"too early"), Err(WireError::NoSession)));
-    assert!(matches!(caller.handle(&[2, 0, 0]), Err(WireError::Malformed)));
-    assert_eq!(bob_side.pending(), 0);
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    assert!(matches!(bob.handle(1, &[]), Err(WireError::UnknownFrame)));
+    assert!(matches!(bob.handle(1, &[200, 1, 2]), Err(WireError::UnknownFrame)));
+    assert!(matches!(bob.handle(1, &[3, 1, 2]), Err(WireError::Malformed)));
+    assert!(matches!(bob.handle(1, &[1, 1, 2]), Err(WireError::Malformed)));
+    assert!(matches!(bob.handle(1, &[4, 1, 2]), Err(WireError::Malformed)));
+    let (mut call, _) = bob.call(&alice, POLICY);
+    assert!(matches!(call.seal(b"too early"), Err(WireError::NoSession)));
+    assert!(matches!(call.handle(&[2, 0, 0]), Err(WireError::Malformed)));
+    assert_eq!(bob.side.pending(), 0);
 }
 
 #[test]
 fn a_repeated_call_delivered_twice_still_makes_one_handshake() {
-    // Carol was offline; Bob sent the same first frame twice and her
-    // gateway delivers both copies when she comes back.
-    let (bob, carol, mut carol_side) = people();
-    let (mut call, f1) = Initiator::start_with(&bob, carol.address(), POLICY).unwrap();
-    let reply_a = reply(carol_side.handle(&carol, 5, &f1).unwrap());
-    let reply_b = reply(carol_side.handle(&carol, 5, &f1).unwrap());
-    assert_eq!(reply_a, reply_b, "the repeat gets the same answer");
-
-    let f3 = send(call.handle(&reply_a).unwrap());
-    // The duplicate answer is stale: ignored, the attempt goes on.
-    assert!(matches!(call.handle(&reply_b), Err(WireError::Stale)));
-    let confirm = confirmed(carol_side.handle(&carol, 5, &f3).unwrap(), &bob);
-    assert_eq!(call.handle(&confirm).unwrap(), InitiatorEvent::Established);
-    talks(&mut call, &bob, &carol, &mut carol_side, 5);
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome_a = reply(bob.handle(5, &hello).unwrap());
+    let welcome_b = reply(bob.handle(5, &hello).unwrap());
+    assert_eq!(welcome_a, welcome_b, "the repeat gets the same answer");
+    let confirm = send(call.handle(&welcome_a).unwrap());
+    assert!(matches!(call.handle(&welcome_b), Err(WireError::Stale)));
+    let ack = established(bob.handle(5, &confirm).unwrap(), &alice);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    talks(&mut call, &alice, &mut bob, 5);
 }
 
 #[test]
-fn of_two_calls_from_the_same_caller_the_first_to_finish_wins() {
-    let (bob, carol, mut carol_side) = people();
-    let (mut old_call, old_f1) = Initiator::start_with(&bob, carol.address(), POLICY).unwrap();
-    let (mut new_call, new_f1) = Initiator::start_with(&bob, carol.address(), POLICY).unwrap();
-    let old_f2 = reply(carol_side.handle(&carol, 5, &old_f1).unwrap());
-    let new_f2 = reply(carol_side.handle(&carol, 5, &new_f1).unwrap());
-    assert_eq!(carol_side.pending(), 2, "a second call does not displace the first");
-    let old_f3 = send(old_call.handle(&old_f2).unwrap());
-    let new_f3 = send(new_call.handle(&new_f2).unwrap());
-
-    let confirm = confirmed(carol_side.handle(&carol, 5, &new_f3).unwrap(), &bob);
-    assert_eq!(new_call.handle(&confirm).unwrap(), InitiatorEvent::Established);
-    assert!(matches!(carol_side.handle(&carol, 5, &old_f3), Err(WireError::Stale)), "the other call is over");
-    assert_eq!(carol_side.pending(), 0);
-    talks(&mut new_call, &bob, &carol, &mut carol_side, 5);
+fn of_two_calls_from_the_same_caller_the_first_to_confirm_wins() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut old_call, old_hello) = bob.call(&alice, POLICY);
+    let (mut new_call, new_hello) = bob.call(&alice, POLICY);
+    let old_welcome = reply(bob.handle(5, &old_hello).unwrap());
+    let new_welcome = reply(bob.handle(5, &new_hello).unwrap());
+    assert_eq!(bob.side.pending(), 2, "a second call does not displace the first");
+    let old_confirm = send(old_call.handle(&old_welcome).unwrap());
+    let new_confirm = send(new_call.handle(&new_welcome).unwrap());
+    let ack = established(bob.handle(5, &new_confirm).unwrap(), &alice);
+    assert_eq!(new_call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    assert!(matches!(bob.handle(5, &old_confirm), Err(WireError::Stale)), "the other call is over");
+    assert_eq!(bob.side.pending(), 0);
+    talks(&mut new_call, &alice, &mut bob, 5);
 }
 
-// ---- review finding M3 --------------------------------------------------------
+// ---- review finding M3 ----------------------------------------------------------
 
 /// Frames the outer framing rejects: empty, unknown type, one byte short,
 /// one byte long, and relabelled as another frame type.
 fn bad_framings(good: &[u8]) -> Vec<Vec<u8>> {
-    let relabelled = if good[0] == 2 { 3 } else { 2 };
+    let relabelled = if good[0] == 2 { 1 } else { 2 };
     vec![
         vec![],
         [&[99u8], &good[1..]].concat(),
@@ -171,271 +204,273 @@ fn bad_framings(good: &[u8]) -> Vec<Vec<u8>> {
 
 #[test]
 fn bad_framing_is_ignored_and_the_handshake_completes() {
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    for bad in bad_framings(&f1) {
-        assert!(bob_side.handle(&bob, 1, &bad).is_err());
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    for bad in bad_framings(&hello) {
+        assert!(bob.handle(1, &bad).is_err());
     }
-    assert_eq!(bob_side.pending(), 0, "a rejected frame starts nothing");
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    for bad in bad_framings(&f2) {
-        assert!(caller.handle(&bad).is_err());
-        assert!(bob_side.handle(&bob, 1, &bad).is_err(), "nor disturbs the responder's pending handshake");
+    assert_eq!(bob.side.pending(), 0, "a rejected frame starts nothing");
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    for bad in bad_framings(&welcome) {
+        assert!(call.handle(&bad).is_err());
+        assert!(bob.handle(1, &bad).is_err());
     }
-    let f3 = send(caller.handle(&f2).unwrap());
-    for bad in bad_framings(&f3) {
-        assert!(bob_side.handle(&bob, 1, &bad).is_err());
-        assert!(caller.handle(&bad).is_err());
-    }
-    let confirm = confirmed(bob_side.handle(&bob, 1, &f3).unwrap(), &alice);
+    let confirm = send(call.handle(&welcome).unwrap());
     for bad in bad_framings(&confirm) {
-        assert!(caller.handle(&bad).is_err());
+        assert!(bob.handle(1, &bad).is_err());
+        assert!(call.handle(&bad).is_err());
     }
-    assert_eq!(caller.handle(&confirm).unwrap(), InitiatorEvent::Established);
-    assert_eq!(caller.attempt(), 1, "no fresh handshake was needed");
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
-}
-
-#[test]
-fn a_tampered_message_2_ends_the_attempt_and_a_fresh_handshake_connects() {
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    let last = f2.len() - 1;
-    assert!(matches!(caller.handle(&flip(&f2, last)), Err(WireError::AttemptFailed(SessionError::Noise(_)))));
-    // The attempt is over: even the genuine message 2 is now stale.
-    assert!(matches!(caller.handle(&f2), Err(WireError::Stale)));
-    assert_eq!(caller.wait(), Some(POLICY.base_wait));
-    let fresh = caller.on_timeout(&alice).unwrap().expect("a fresh first frame");
-    assert_ne!(fresh[9..], f1[9..], "a fresh ephemeral key");
-    assert_eq!(caller.attempt(), 2);
-    finish(&mut caller, &fresh, &alice, &bob, &mut bob_side, 1);
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
-}
-
-#[test]
-fn a_tampered_message_3_ends_the_responders_attempt_and_the_caller_reconnects() {
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    let f3 = send(caller.handle(&f2).unwrap());
-    let last = f3.len() - 1;
-    assert!(matches!(bob_side.handle(&bob, 1, &flip(&f3, last)), Err(WireError::AttemptFailed(_))));
-    assert_eq!(bob_side.pending(), 0, "the responder's attempt ended");
-    assert!(matches!(bob_side.handle(&bob, 1, &f3), Err(WireError::Stale)));
-    // The caller hears nothing: it resends message 3, then starts afresh.
-    for _ in 0..POLICY.resends {
-        let again = caller.on_timeout(&alice).unwrap().unwrap();
-        assert_eq!(again, f3, "a timeout resends the exact bytes");
-        assert!(matches!(bob_side.handle(&bob, 1, &again), Err(WireError::Stale)));
+    let ack = established(bob.handle(1, &confirm).unwrap(), &alice);
+    for bad in bad_framings(&ack) {
+        assert!(call.handle(&bad).is_err());
     }
-    let fresh = caller.on_timeout(&alice).unwrap().unwrap();
-    assert_eq!(caller.attempt(), 2);
-    finish(&mut caller, &fresh, &alice, &bob, &mut bob_side, 1);
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    assert_eq!(call.attempt(), 1, "no fresh handshake was needed");
+    talks(&mut call, &alice, &mut bob, 1);
 }
 
 #[test]
-fn an_impostor_ends_the_attempt_and_a_fresh_handshake_reaches_the_real_peer() {
-    // Mallory answers Alice's first frame with a message 2 that decrypts
-    // but proves Mallory, not Bob.
-    let (alice, bob, mut bob_side) = people();
-    let mallory = Identity::generate();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let forged = reply(Responder::new().handle(&mallory, 1u32, &f1).unwrap());
-    assert!(matches!(
-        caller.handle(&forged),
-        Err(WireError::AttemptFailed(SessionError::UnexpectedPeer { got })) if got == mallory.address()
-    ));
-    let genuine = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    assert!(matches!(caller.handle(&genuine), Err(WireError::Stale)), "attempt 1 is over");
-    let fresh = caller.on_timeout(&alice).unwrap().unwrap();
-    finish(&mut caller, &fresh, &alice, &bob, &mut bob_side, 1);
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
+fn a_tampered_welcome_ends_the_attempt_and_a_fresh_handshake_connects() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let last = welcome.len() - 1;
+    assert!(matches!(call.handle(&flip(&welcome, last)), Err(WireError::AttemptFailed(SessionError::Noise(_)))));
+    assert!(matches!(call.handle(&welcome), Err(WireError::Stale)), "the attempt is over");
+    assert_eq!(call.wait(), Some(POLICY.base_wait));
+    let fresh = call.on_timeout().unwrap().expect("a fresh first frame");
+    assert_ne!(fresh[9..], hello[9..], "a fresh ephemeral key");
+    assert_eq!(call.attempt(), 2);
+    finish(&mut call, &fresh, &alice, &mut bob, 1);
+    talks(&mut call, &alice, &mut bob, 1);
+}
+
+#[test]
+fn a_welcome_from_a_different_handshake_ends_the_attempt() {
+    // A genuine WELCOME from another of Bob's handshakes, relabelled with
+    // Alice's call id and attempt: it does not decrypt for her.
+    let mut bob = Bob::new();
+    let (alice, carol) = (bob.invite(), bob.invite());
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let (_other, carol_hello) = bob.call(&carol, POLICY);
+    let theirs = reply(bob.handle(2, &carol_hello).unwrap());
+    let relabelled = [&hello[..9], &theirs[9..]].concat();
+    assert!(matches!(call.handle(&[&[2u8], &relabelled[1..]].concat()), Err(WireError::AttemptFailed(_))));
+    let fresh = call.on_timeout().unwrap().unwrap();
+    finish(&mut call, &fresh, &alice, &mut bob, 1);
+}
+
+#[test]
+fn a_forged_confirm_is_dropped_and_the_real_one_still_works() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    let last = confirm.len() - 1;
+    assert!(matches!(bob.handle(1, &flip(&confirm, last)), Err(WireError::Stale)));
+    assert_eq!(bob.side.pending(), 1, "the answered handshake is still waiting");
+    let ack = established(bob.handle(1, &confirm).unwrap(), &alice);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
 }
 
 #[test]
 fn late_frames_from_an_old_attempt_do_not_disturb_a_new_one() {
     let no_resends = RetryPolicy { resends: 0, ..POLICY };
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1_old) = Initiator::start_with(&alice, bob.address(), no_resends).unwrap();
-    let f2_old = reply(bob_side.handle(&bob, 1, &f1_old).unwrap());
-    let f3_old = send(caller.handle(&f2_old).unwrap());
-    // Message 3 is slow; the caller gives up on attempt 1 and starts attempt 2.
-    let f1_new = caller.on_timeout(&alice).unwrap().unwrap();
-    assert_eq!(caller.attempt(), 2);
-    let f2_new = reply(bob_side.handle(&bob, 1, &f1_new).unwrap());
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello_old) = bob.call(&alice, no_resends);
+    let welcome_old = reply(bob.handle(1, &hello_old).unwrap());
+    let confirm_old = send(call.handle(&welcome_old).unwrap());
+    // The CONFIRM is slow; the caller gives up on attempt 1 and starts 2.
+    let hello_new = call.on_timeout().unwrap().unwrap();
+    assert_eq!(call.attempt(), 2);
+    let welcome_new = reply(bob.handle(1, &hello_new).unwrap());
 
-    // Old frames now arrive at both ends.
-    assert!(matches!(bob_side.handle(&bob, 1, &f1_old), Err(WireError::Stale)));
-    assert!(matches!(bob_side.handle(&bob, 1, &f3_old), Err(WireError::Stale)));
-    assert!(matches!(caller.handle(&f2_old), Err(WireError::Stale)));
-    assert_eq!(bob_side.pending(), 1);
+    assert!(matches!(bob.handle(1, &hello_old), Err(WireError::Stale)));
+    assert!(matches!(bob.handle(1, &confirm_old), Err(WireError::Stale)));
+    assert!(matches!(call.handle(&welcome_old), Err(WireError::Stale)));
+    assert_eq!(bob.side.pending(), 1);
 
-    let f3_new = send(caller.handle(&f2_new).unwrap());
-    // And again after the new attempt has finished on the responder.
-    let confirm = confirmed(bob_side.handle(&bob, 1, &f3_new).unwrap(), &alice);
-    for old in [&f1_old, &f3_old, &f1_new] {
-        assert!(matches!(bob_side.handle(&bob, 1, old), Err(WireError::Stale)));
+    let confirm_new = send(call.handle(&welcome_new).unwrap());
+    let ack = established(bob.handle(1, &confirm_new).unwrap(), &alice);
+    for old in [&hello_old, &confirm_old, &hello_new] {
+        assert!(matches!(bob.handle(1, old), Err(WireError::Stale)));
     }
-    assert!(matches!(caller.handle(&f2_old), Err(WireError::Stale)));
-    assert_eq!(caller.handle(&confirm).unwrap(), InitiatorEvent::Established);
-    assert_eq!(bob_side.pending(), 0);
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
+    assert!(matches!(call.handle(&welcome_old), Err(WireError::Stale)));
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    talks(&mut call, &alice, &mut bob, 1);
 }
 
 #[test]
 fn retry_limits_are_enforced() {
     let policy = RetryPolicy { attempts: 2, resends: 1, base_wait: Duration::from_secs(10) };
-    let (alice, bob, _) = people();
-    let (mut caller, first) = Initiator::start_with(&alice, bob.address(), policy).unwrap();
-    // Nobody answers: resend, fresh attempt, resend, give up.
-    assert_eq!(caller.on_timeout(&alice).unwrap().unwrap(), first);
-    let second = caller.on_timeout(&alice).unwrap().unwrap();
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, first) = bob.call(&alice, policy);
+    assert_eq!(call.on_timeout().unwrap().unwrap(), first);
+    let second = call.on_timeout().unwrap().unwrap();
     assert_ne!(second, first);
-    assert_eq!(caller.on_timeout(&alice).unwrap().unwrap(), second);
-    assert!(matches!(caller.on_timeout(&alice), Err(WireError::GaveUp)));
-    assert_eq!(caller.wait(), None);
-    assert!(matches!(caller.on_timeout(&alice), Err(WireError::GaveUp)));
-    assert_eq!(caller.attempt(), 2);
+    assert_eq!(call.on_timeout().unwrap().unwrap(), second);
+    assert!(matches!(call.on_timeout(), Err(WireError::GaveUp)));
+    assert_eq!(call.wait(), None);
+    assert!(matches!(call.on_timeout(), Err(WireError::GaveUp)));
+    assert_eq!(call.attempt(), 2);
 }
 
 #[test]
 fn failed_attempts_back_off_and_stop_at_the_limit() {
     let policy = RetryPolicy { attempts: 4, resends: 2, base_wait: Duration::from_secs(10) };
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, mut f1) = Initiator::start_with(&alice, bob.address(), policy).unwrap();
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, mut hello) = bob.call(&alice, policy);
     for (attempt, backoff) in [(1, 10), (2, 20), (3, 40), (4, 80)] {
-        assert_eq!(caller.attempt(), attempt);
-        let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-        let last = f2.len() - 1;
-        assert!(matches!(caller.handle(&flip(&f2, last)), Err(WireError::AttemptFailed(_))));
-        assert_eq!(caller.wait(), Some(Duration::from_secs(backoff)));
-        match caller.on_timeout(&alice) {
-            Ok(Some(next)) => f1 = next,
+        assert_eq!(call.attempt(), attempt);
+        let welcome = reply(bob.handle(1, &hello).unwrap());
+        let last = welcome.len() - 1;
+        assert!(matches!(call.handle(&flip(&welcome, last)), Err(WireError::AttemptFailed(_))));
+        assert_eq!(call.wait(), Some(Duration::from_secs(backoff)));
+        match call.on_timeout() {
+            Ok(Some(next)) => hello = next,
             Err(WireError::GaveUp) => assert_eq!(attempt, 4),
             other => panic!("{other:?}"),
         }
     }
-    assert_eq!(caller.wait(), None);
+    assert_eq!(call.wait(), None);
 }
 
 #[test]
-fn a_lost_message_3_is_resent_and_the_session_is_confirmed() {
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    let f3 = send(caller.handle(&f2).unwrap()); // lost on the way
-    assert!(!caller.is_established());
-    let again = caller.on_timeout(&alice).unwrap().unwrap();
-    assert_eq!(again, f3);
-    let confirm = confirmed(bob_side.handle(&bob, 1, &again).unwrap(), &alice);
-    assert_eq!(caller.handle(&confirm).unwrap(), InitiatorEvent::Established);
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
+fn a_lost_confirm_is_resent_and_the_session_is_acknowledged() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap()); // lost
+    let again = call.on_timeout().unwrap().unwrap();
+    assert_eq!(again, confirm);
+    let ack = established(bob.handle(1, &again).unwrap(), &alice);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    talks(&mut call, &alice, &mut bob, 1);
 }
 
 #[test]
-fn a_lost_confirmation_is_sent_again_and_forgeries_are_ignored() {
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    let f3 = send(caller.handle(&f2).unwrap());
-    let confirm = confirmed(bob_side.handle(&bob, 1, &f3).unwrap(), &alice); // lost
-    let again = caller.on_timeout(&alice).unwrap().unwrap();
-    let resent = reply(bob_side.handle(&bob, 1, &again).unwrap());
-    assert_eq!(resent, confirm, "the same confirmation, not a second session");
-    // A tampered confirmation is dropped; the attempt stays valid.
+fn a_lost_ack_is_sent_again_and_forgeries_are_ignored() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    let ack = established(bob.handle(1, &confirm).unwrap(), &alice); // lost
+    let again = call.on_timeout().unwrap().unwrap();
+    let resent = reply(bob.handle(1, &again).unwrap());
+    assert_eq!(resent, ack, "the same ACK, not a second session");
     let last = resent.len() - 1;
-    assert!(matches!(caller.handle(&flip(&resent, last)), Err(WireError::Stale)));
-    // So is the genuine one relabelled with another attempt number.
-    assert!(matches!(caller.handle(&flip(&resent, 8)), Err(WireError::Stale)));
-    assert!(!caller.is_established());
-    assert_eq!(caller.handle(&resent).unwrap(), InitiatorEvent::Established);
-    assert!(matches!(caller.handle(&resent), Err(WireError::Stale)), "a duplicate later is ignored");
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
+    assert!(matches!(call.handle(&flip(&resent, last)), Err(WireError::Stale)));
+    assert!(matches!(call.handle(&flip(&resent, 8)), Err(WireError::Stale)), "relabelled attempt");
+    assert!(!call.is_established());
+    assert_eq!(call.handle(&resent).unwrap(), InitiatorEvent::Established);
+    assert!(matches!(call.handle(&resent), Err(WireError::Stale)), "a duplicate later is ignored");
+    talks(&mut call, &alice, &mut bob, 1);
 }
 
 #[test]
-fn a_message_from_the_responder_also_confirms_the_session() {
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
-    let f3 = send(caller.handle(&f2).unwrap());
-    let _lost = confirmed(bob_side.handle(&bob, 1, &f3).unwrap(), &alice);
-    let hello = bob_side.seal(&1, b"hello").unwrap();
-    assert_eq!(caller.handle(&hello).unwrap(), InitiatorEvent::Message(b"hello".to_vec()));
-    assert!(caller.is_established());
+fn a_message_from_the_answerer_also_establishes_the_session() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    let _lost = established(bob.handle(1, &confirm).unwrap(), &alice);
+    let hello_msg = bob.side.seal(&1, b"hello").unwrap();
+    assert_eq!(call.handle(&hello_msg).unwrap(), InitiatorEvent::Message(b"hello".to_vec()));
+    assert!(call.is_established());
 }
 
 #[test]
 fn both_ends_recover_or_fail_within_a_bounded_time() {
-    // Bob's side drops a handshake whose message 3 never comes.
-    let (alice, bob, mut bob_side) = people();
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    let f2 = reply(bob_side.handle(&bob, 1, &f1).unwrap());
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
     for _ in 1..PENDING_TICKS {
-        assert!(bob_side.tick().is_empty());
+        assert!(bob.side.tick().is_empty());
     }
-    assert_eq!(bob_side.tick(), vec![1]);
-    assert_eq!(bob_side.pending(), 0);
-    // Alice's message 3 arrives too late; she recovers with a fresh attempt.
-    let f3 = send(caller.handle(&f2).unwrap());
-    assert!(matches!(bob_side.handle(&bob, 1, &f3), Err(WireError::Stale)));
+    assert_eq!(bob.side.tick(), vec![1]);
+    assert_eq!(bob.side.pending(), 0);
+    let confirm = send(call.handle(&welcome).unwrap());
+    assert!(matches!(bob.handle(1, &confirm), Err(WireError::Stale)));
     let mut timeouts = 0;
     let fresh = loop {
         timeouts += 1;
-        let frame = caller.on_timeout(&alice).unwrap().unwrap();
-        if frame != f3 {
+        let frame = call.on_timeout().unwrap().unwrap();
+        if frame != confirm {
             break frame;
         }
     };
     assert_eq!(timeouts, POLICY.resends + 1);
-    finish(&mut caller, &fresh, &alice, &bob, &mut bob_side, 1);
+    finish(&mut call, &fresh, &alice, &mut bob, 1);
 
-    // A caller whose peer never answers gives up after a bounded number of
-    // timeouts: attempts * (resends + 1).
-    let (mut lonely, _) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
+    let lonely_bob = Bob::new();
+    let (mut lonely, _) = lonely_bob.call(&alice, POLICY);
     let mut timeouts = 0;
-    while lonely.on_timeout(&alice).is_ok() {
+    while lonely.on_timeout().is_ok() {
         timeouts += 1;
         assert!(timeouts < 100);
     }
     assert_eq!(timeouts + 1, POLICY.attempts * (POLICY.resends + 1));
 }
 
+#[test]
+fn the_grant_is_reported_and_committed_only_on_confirm() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    assert!(!bob.side.gate().is_honoured(&alice.reference), "answering is not using");
+    assert!(!bob.side.gate().is_contact(&alice.key.public()));
+    let confirm = send(call.handle(&welcome).unwrap());
+    match bob.handle(1, &confirm).unwrap() {
+        ResponderEvent::Established { grant, .. } => assert_eq!(grant, Grant::Invitation { id: alice.reference }),
+        other => panic!("{other:?}"),
+    }
+    assert!(bob.side.gate().is_honoured(&alice.reference));
+    assert!(bob.side.gate().is_contact(&alice.key.public()));
+}
+
 // ---- frame limits ---------------------------------------------------------------
 
 #[test]
 fn the_largest_plaintext_round_trips_both_ways() {
-    let (alice, bob, mut bob_side) = people();
-    let mut caller = establish(&alice, &bob, &mut bob_side, 1);
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let mut call = establish(&alice, &mut bob, 1);
     let largest: Vec<u8> = (0..MAX_PLAINTEXT).map(|i| i as u8).collect();
-
-    let frame = caller.seal(&largest).unwrap();
+    let frame = call.seal(&largest).unwrap();
     assert_eq!(frame.len(), MAX_FRAME, "the largest data frame is exactly the limit");
     assert_eq!(
-        bob_side.handle(&bob, 1, &frame).unwrap(),
-        ResponderEvent::Message { peer: alice.address(), plaintext: largest.clone() }
+        bob.handle(1, &frame).unwrap(),
+        ResponderEvent::Message { peer: alice.key.public(), plaintext: largest.clone() }
     );
-    let frame = bob_side.seal(&1, &largest).unwrap();
+    let frame = bob.side.seal(&1, &largest).unwrap();
     assert_eq!(frame.len(), MAX_FRAME);
-    assert_eq!(caller.handle(&frame).unwrap(), InitiatorEvent::Message(largest.clone()));
-
+    assert_eq!(call.handle(&frame).unwrap(), InitiatorEvent::Message(largest.clone()));
     let too_long = [&largest[..], b"!"].concat();
-    assert!(matches!(caller.seal(&too_long), Err(WireError::Session(SessionError::TooLarge))));
-    assert!(matches!(bob_side.seal(&1, &too_long), Err(WireError::Session(SessionError::TooLarge))));
+    assert!(matches!(call.seal(&too_long), Err(WireError::Session(SessionError::TooLarge))));
+    assert!(matches!(bob.side.seal(&1, &too_long), Err(WireError::Session(SessionError::TooLarge))));
 }
 
 #[test]
 fn oversized_frames_are_refused_on_both_sides_and_in_a_session() {
-    let (alice, bob, mut bob_side) = people();
+    let mut bob = Bob::new();
+    let alice = bob.invite();
     let huge = vec![4u8; MAX_FRAME + 1];
-    assert!(matches!(bob_side.handle(&bob, 1, &huge), Err(WireError::Oversized)));
-    let (mut caller, f1) = Initiator::start_with(&alice, bob.address(), POLICY).unwrap();
-    assert!(matches!(caller.handle(&[&[2u8], &huge[1..]].concat()), Err(WireError::Oversized)));
-    // The pending handshakes survive and complete.
-    finish(&mut caller, &f1, &alice, &bob, &mut bob_side, 1);
-    assert!(matches!(bob_side.handle(&bob, 1, &huge), Err(WireError::Oversized)));
-    assert!(matches!(caller.handle(&huge), Err(WireError::Oversized)));
-    talks(&mut caller, &alice, &bob, &mut bob_side, 1);
+    assert!(matches!(bob.handle(1, &huge), Err(WireError::Oversized)));
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    assert!(matches!(call.handle(&[&[2u8], &huge[1..]].concat()), Err(WireError::Oversized)));
+    finish(&mut call, &hello, &alice, &mut bob, 1);
+    assert!(matches!(bob.handle(1, &huge), Err(WireError::Oversized)));
+    assert!(matches!(call.handle(&huge), Err(WireError::Oversized)));
+    talks(&mut call, &alice, &mut bob, 1);
 }

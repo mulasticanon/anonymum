@@ -4,7 +4,8 @@ use anonymum_core::{Address, Tx};
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// A wallet's private keys. Never leaves the device.
+/// A wallet's private keys. Never leaves the device, and never appears in a
+/// contact card, a handshake or a note (spec v0.7 section 2a).
 ///
 /// The address is the Ed25519 public key. The X25519 key encrypts messages.
 /// The address key signs the encryption key (the "binding"), so a peer who
@@ -38,10 +39,6 @@ impl Identity {
 
     pub fn address(&self) -> Address {
         Address(self.signing.verifying_key().to_bytes())
-    }
-
-    pub(crate) fn messaging_secret(&self) -> [u8; 32] {
-        self.messaging.to_bytes()
     }
 
     pub(crate) fn messaging_public(&self) -> [u8; 32] {

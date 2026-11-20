@@ -46,7 +46,7 @@ Windows machine (see the update below).
 | Crate | Contents | Verified |
 |---|---|---|
 | `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 48 h expiry, client-side inbox admission, token-bucket rate limit, storage deposits. Zero dependencies. | 61 tests, run by CI on Linux and Windows |
-| `crates/crypto` (`anonymum-crypto`) | `Identity` (Ed25519 address + X25519 messaging key, bound by signature), `InviteSecret` / `Ed25519Invites`, Noise XX `Handshake` / `Session`, `note` (`seal_note` / `open_note`, Noise N), `wire` framing (`Initiator`, `Responder<T>`; handshake frames carry a call id and attempt number; framing rejects are ignored, a cryptographic failure ends the attempt and the caller retries with a fresh handshake (bounded, with backoff); timeouts resend the same bytes; late frames from older attempts are ignored; the session counts as open only after the responder's confirmation; per-type frame lengths, the largest plaintext fits). | 38 tests, run by CI on Linux and Windows |
+| `crates/crypto` (`anonymum-crypto`) | `Identity` (wallet: Ed25519 address + X25519 key bound to it, for the transparent chain only), `InviteSecret` / `Ed25519Invites` (chain invites); spec v0.7 section 2a prototype: `contact` (`ContactIdentity` with signing, handshake and inbox keys; `ContactCard`; `Invitation` to a holder key; `StaticKey` caller keys), `gate` (`Gate`: authorise before replying, commit on confirmation), Noise IK `Handshake` / `Incoming` / `Session`, `note` (stranger's note opened with the inbox key alone, bound to an admission commitment), `wire` (HELLO / WELCOME / CONFIRM / ACK; unauthorised callers get nothing; call id, attempts, retries, exact frame lengths from af61c8f). Unreviewed. | 51 tests, run by CI on Linux and Windows |
 | `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 57 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
 | `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce and the key paths of the refund and cancel keys; refunds found via the consuming transaction). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 51 tests (section 5 properties, randomised conservation, 5b acceptance); every rule mutation-checked |
@@ -125,8 +125,10 @@ The `.bat` helper scripts that once did steps 1 and 2 were deleted on
    paying it to the recipient or the node pool would reward declining).
    Superseded by an invite: full refund. The network fee is never refunded.
 5. Network fees split between burn and a node reward pool.
-6. Sessions use Noise XX. Each side sends address + binding signature inside
-   the encrypted handshake payload; observers learn neither address.
+6. Sessions use Noise IK between contact keys (since 2026-11-20, spec v0.7
+   section 2a; was Noise XX with wallet addresses). The answering side reads
+   the caller's key and reference from message 1 and replies only if its
+   gate authorises them. No wallet key in a card, handshake or note.
 7. Transport messages carry an explicit counter so they survive mixnet
    reordering; a sliding window rejects replays.
 8. The responder replies through Nym reply blocks (SURBs) and never learns
@@ -163,11 +165,13 @@ tests for every rule and failure path (failed transactions change nothing;
   `mock_binding` in core tests). A key may be replaced; notes sealed to the
   old key can no longer be opened.
 - `Tx::RequestContact` carries `note: SealedNote`. The chain checks only its
-  length (`SEALED_NOTE_LEN` = 427). Noise N (`snow`), prologue
-  `"anonymum/contact-note/v1" || from || to`, plaintext = version, 96-byte
-  reply address (a Nym `Recipient`), u16 intro length, intro padded to 280.
-  The intro cap is enforced by the fixed layout plus the client on seal and
-  open; the chain cannot see it.
+  length (`SEALED_NOTE_LEN` = 587 since 2026-11-20, was 427; core and pallet).
+  Format v2 (`anonymum-crypto::note`): admission commitment (32) || Noise N
+  to the recipient's contact inbox key, prologue
+  `"anonymum/contact-note/v2" || admission`; plaintext = version, sender
+  contact key, callback handshake key, 96-byte route, u16 intro length,
+  intro padded to 280, Ed25519 signature by the sender's contact key. Opens
+  with the inbox key alone.
 - `Tx::SetAcceptStrangers { accept }`: invite-only wallets refuse requests
   with `StrangersNotAccepted` before any fee. My choice, easy to change:
   switching to invite-only leaves already-pending requests answerable.
@@ -271,6 +275,17 @@ eight items. All are fixed in `crates/core` and `substrate/pallets/anonymum`
 
 Tests after the fixes: core 61, crypto 25, pallet 57.
 
+## Section 2a prototype (spec v0.7, done 2026-11-20)
+
+`crates/crypto` and the Nym demo implement section 2a with standard Noise
+patterns through `snow`'s public API. Unreviewed (spec questions 11, 12);
+the README says so. Choices made where the spec was silent are I15-I26 in
+`docs/shielded-spec-v0-issues.md` (four-frame confirm, callback with the
+card's handshake key, admission commitment carried in the note field on the
+transparent chain, invitee-generated holder keys, ...). `substrate/scripts/
+e2e.mjs` and the demo's subcommands were moved to contact identities but
+e2e has not been rerun (needs the runtime rebuilt for the 587-byte note).
+
 ## Decided 2026-11-18 (late), not yet implemented
 
 **D1. A block created by closing a channel takes no deposit.** Today
@@ -333,7 +348,7 @@ hiding amounts and activity:
 ## Shielded design: current source and owner decisions (2026-11-19)
 
 The current source for the shielded design is
-**`docs/shielded-spec-v0.md` (version 0.5)**. Where
+**`docs/shielded-spec-v0.md` (version 0.7)**. Where
 `docs/Shielded_Payments_Protocol_v0.1.md` (the alternative protocol, kept
 for reference) differs from it, the spec wins. The research report gives
 background; section 15.1 gate 1 is what the spec's decisions answer.
@@ -371,6 +386,8 @@ until the cryptographer has reviewed the spec.
 - The channel table is public: the chain shows who opened a channel with
   whom. Needs shielded payments (Zcash-style proofs or stealth addresses).
 - Forward secrecy is per session, not per message. No double ratchet yet.
+- Noise IK's first message is replayable: a still-authorised caller's
+  recorded first message gets a reply (availability signal, question 11).
 - No post-quantum key exchange.
 - The chain runs only as a single-node dev chain (manual seal). No real
   network, consensus, validators or benchmarked weights yet.

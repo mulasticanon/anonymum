@@ -6,13 +6,18 @@ A messaging coin where reaching someone costs money unless they invited you.
 - **Stranger**: pays a larger network fee plus a price the recipient sets.
 - **After that**: messages are free, rate limited, and travel over the Nym mixnet.
 
+> **Not reviewed.** The messaging handshake (Noise IK with an authorisation
+> check before any reply) and the stranger's note format are a prototype of
+> spec v0.7 section 2a. No cryptographer has reviewed them (spec questions
+> 11 and 12), and nothing here is audited.
+
 Four crates, plus a Substrate port in `substrate/`:
 
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 61 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and invites, Noise XX end-to-end sessions, sealed contact notes (Noise N), message framing with handshake retries (a failed attempt ends and a fresh one follows; the caller waits for the callee's confirmation). | 38 tests |
-| `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 and 2026-11-19 (see below). Not an automated test. |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 51 tests |
+| `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 57 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
@@ -62,6 +67,16 @@ Carol's session confirmed after 71 s on the first attempt, Dave (no channel,
 no confirmation) gave up after his single 30 s attempt; whole demo passed in
 175 s. Loss cases (lost message 3, lost confirmation, late frames) are
 covered by unit tests, not by live runs.
+
+With contact identities and Noise IK (2026-11-20, spec v0.7 section 2a):
+live run, offline 60 s. Alice called with a caller key Bob's invitation
+named; Bob let her in and counted the invitation used only after her
+confirmation (5.4 s). Carol's note (587 bytes) was opened with Bob's inbox
+key alone; Bob called her callback key, her throwaway let in only his key
+(70 s, first attempt), and Eve, calling the same route, got nothing. Dave,
+with Bob's real card and route but no invitation, got nothing and gave up.
+Whole demo passed in 191 s. `e2e.mjs` was updated for the new subcommands
+but not rerun.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -190,7 +205,7 @@ I14).
 | Fee and channel rules, blocks, invite-only | Built, tested |
 | Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live, including once end to end through the dev chain (`e2e.mjs`). Retry rules live in `anonymum_crypto::wire`; the demo binary drives them |
 | Invites | Real Ed25519 signatures, bound to opener and recipient |
-| End-to-end encryption | Noise XX (X25519, ChaCha20-Poly1305, BLAKE2s). Addresses are proven inside the encrypted handshake, so observers learn neither party |
+| End-to-end encryption | Noise IK (X25519, ChaCha20-Poly1305, BLAKE2s) between contact keys, never wallet keys. The answering side reads the caller's key inside message 1 and replies only to a caller it authorised (invitation, contact, expected callback); anyone else gets nothing. **Unreviewed prototype** (spec questions 11 and 12) |
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |
 | Mixnet transport | Nym SDK; replies go through single-use reply blocks, so the recipient never learns the caller's network location. Ran once live; no automated test |
 | The chain itself | Rules run as a Substrate pallet on a local single-node dev chain (manual seal, 6 s blocks). No real network, consensus or validators yet |
@@ -234,14 +249,19 @@ I14).
    fee burned), and an open channel with it is closed. Any new channel
    between two addresses clears blocks both ways, since it only opens with
    both sides' consent.
-9. **No mixnet address is ever published.** Wallets publish a messaging key
-   (a key, not a location) with a signature tying it to the address. A
-   stranger's request carries a note sealed to that key (Noise N): a throwaway
-   mixnet address and an intro of at most 280 bytes, padded so every note is
-   427 bytes. The note is bound to sender and recipient, so it cannot be
-   reused in someone else's request. On accept, the recipient's app calls the
-   stranger there, and the two swap real addresses inside the encrypted
-   session. Wallets can be invite-only; requests to them fail before any fee.
+9. **No mixnet address is ever published.** Each user has a contact identity
+   separate from the wallet: a signing key, a handshake key and an inbox key,
+   listed on a signed contact card (with a price and validity). A stranger's
+   request carries a note sealed to the inbox key (Noise N): the stranger's
+   contact key, a fresh callback key, a throwaway route and an intro of at
+   most 280 bytes, all signed and padded so every note is 587 bytes. It opens
+   with the inbox key alone (no sender hint) and is bound to the request's
+   admission commitment. On accept, the recipient calls the callback key at
+   the throwaway route; the stranger's side answers only that caller, and the
+   two swap real routes inside the session. Invited contacts call with a
+   caller key the invitation names. Wallets can be invite-only; requests to
+   them fail before any fee. (The transparent chain still records requests
+   wallet to wallet, and still needs a wallet-bound key published.)
 10. **Requests expire after 48 hours**, defined as a duration and converted to
     blocks from the block time (6 s blocks: 28,800).
 
@@ -257,12 +277,18 @@ I14).
 - The channel table is public: the chain shows that A and B are connected.
   This contradicts the mixnet's purpose until shielded payments exist. The
   same goes for contact requests (Y requested X) and blocks (who blocked whom).
-- Contact notes have no forward secrecy: if a recipient's messaging key leaks
+- Contact notes have no forward secrecy: if a recipient's inbox key leaks
   later, old notes sealed to it can be read. Rotating the key limits this.
+- Noise IK's first message can be replayed. A replay cannot use an
+  invitation twice or reopen a blocked contact (tested), but a still-
+  authorised caller's recorded first message gets a reply: an availability
+  signal (spec question 11). If an answerer's handshake key leaks, recorded
+  first messages reveal the callers' keys.
 - Forward secrecy is per session, not per message. Sessions should be
   renewed often; a double ratchet would do this automatically.
-- A handshake costs the responder CPU before it knows who is calling.
-  Pending handshakes are capped, but this needs a proper cost for strangers.
+- Reading an IK first message costs the answerer two key agreements before
+  it can refuse. Answered handshakes are capped, but strangers' calls need a
+  proper cost.
 - A flood of dropped messages still costs the recipient bandwidth. Nym's paid
   bandwidth credentials are the network-level answer and need integrating.
 

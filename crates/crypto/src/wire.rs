@@ -5,66 +5,74 @@
 //! reply handle `T` (on Nym: an anonymous sender tag backed by single-use
 //! reply blocks), so it can answer without learning where the caller is.
 //!
-//! # Handshake attempts (design review M3)
+//! # Handshake (Noise IK, spec v0.7 section 2a)
 //!
-//! This is a prototype; the handshake will be replaced (spec question 11).
-//! The rules, using `snow`'s public API only:
+//! Four frames: HELLO (IK message 1), WELCOME (IK message 2), the caller's
+//! CONFIRM sealed in the new session, and the answerer's ACK. This is an
+//! unreviewed prototype (spec question 11). The rules, using `snow`'s public
+//! API only:
 //!
+//! * **Authorise before replying.** The responder reads the caller's key and
+//!   reference from HELLO and asks its [`Gate`]. An unauthorised caller gets
+//!   nothing: no WELCOME, no error, no frame of any kind. Every `Err` from
+//!   [`Responder::handle`] means "send nothing".
+//! * **Grants are committed only after a fresh confirmation.** HELLO can be
+//!   replayed; CONFIRM cannot, because it is sealed under keys that depend on
+//!   the responder's fresh ephemeral key. The responder counts an invitation
+//!   as used, or a caller as present, only when CONFIRM arrives, and checks
+//!   the gate again then.
 //! * **Framing rejects are ignored.** An empty frame, an unknown type or a
 //!   wrong length for its type is refused before any cryptography and
 //!   changes nothing.
-//! * **A cryptographic failure ends the attempt** (the Noise rule): a
-//!   handshake message that does not decrypt, or a peer that proves the
-//!   wrong identity, ends that handshake. The initiator then starts a new
-//!   attempt with a fresh ephemeral key, after a backoff, up to
-//!   [`RetryPolicy::attempts`] times.
+//! * **A cryptographic failure ends the attempt** (the Noise rule): a WELCOME
+//!   that does not decrypt ends the caller's handshake, which then starts a
+//!   new attempt with a fresh ephemeral key, after a backoff, up to
+//!   [`RetryPolicy::attempts`] times. A sealed CONFIRM or ACK that fails to
+//!   open is a transport message and is dropped, as Noise does for those.
 //! * **Timeouts resend the exact bytes** already sent for a still-valid
-//!   attempt, up to [`RetryPolicy::resends`] times; then the attempt is
-//!   abandoned and a fresh one starts. The responder answers an identical
-//!   repeat with its cached reply.
+//!   attempt, up to [`RetryPolicy::resends`] times; then a fresh attempt
+//!   starts. The responder answers an identical repeat with its cached
+//!   reply.
 //! * **Stale frames are ignored.** Every handshake frame carries a random
-//!   *call id* (one per [`Initiator`]) and an attempt number. The responder
-//!   keeps one pending handshake per caller and call id, never goes back to
-//!   a lower attempt, and ignores frames for attempts it has moved past or
-//!   already finished; the initiator ignores frames for any attempt but its
-//!   current one. A frame from an older attempt therefore cannot displace
-//!   or corrupt a newer one.
-//! * **The session is not established until the responder confirms.** After
-//!   message 3 the responder sends a confirmation sealed in the new session
-//!   (a valid data frame counts too). Until it arrives the initiator resends
-//!   message 3, and gives up within a bounded time. A responder whose
-//!   caller never sends message 3 drops the half-finished handshake after
-//!   [`Responder::tick`] has been called [`PENDING_TICKS`] times.
+//!   *call id* (one per [`Initiator`]) and an attempt number in clear. The
+//!   reference to an invitation or request travels only inside the encrypted
+//!   HELLO. The responder keeps one pending handshake per caller and call id,
+//!   never goes back to a lower attempt, and ignores frames for attempts it
+//!   has moved past or finished.
+//! * **Both sides confirm.** The caller is established only after the ACK
+//!   (or a valid data frame); it resends CONFIRM until then. The responder
+//!   drops a handshake whose CONFIRM never comes after [`PENDING_TICKS`]
+//!   calls to [`Responder::tick`].
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
 
-use anonymum_core::Address;
 use rand_core::{OsRng, RngCore};
 
-use crate::identity::Identity;
+use crate::contact::{Network, StaticKey};
+use crate::gate::{Gate, Grant};
 use crate::session::{
-    Handshake, Session, SessionError, MAX_NOISE_MESSAGE, MESSAGE1_LEN, MESSAGE2_LEN, MESSAGE3_LEN,
-    MIN_SEALED, NONCE_LEN,
+    Handshake, Incoming, Session, SessionError, MAX_NOISE_MESSAGE, MESSAGE1_LEN, MESSAGE2_LEN, MIN_SEALED,
+    NONCE_LEN, REFERENCE_LEN,
 };
 
-const HANDSHAKE_1: u8 = 1;
-const HANDSHAKE_2: u8 = 2;
-const HANDSHAKE_3: u8 = 3;
+const HELLO: u8 = 1;
+const WELCOME: u8 = 2;
+const CONFIRM: u8 = 3;
 const DATA: u8 = 4;
-const CONFIRM: u8 = 5;
+const ACK: u8 = 5;
 
 /// Type byte, call id (4 bytes), attempt number (4 bytes, big-endian).
 const HEADER_LEN: usize = 1 + 4 + 4;
-/// What a confirmation decrypts to.
-const CONFIRM_MARKER: &[u8] = b"anonymum/confirm/v1";
+/// What the caller's confirmation and the answerer's ack decrypt to.
+const CONFIRM_MARKER: &[u8] = b"anonymum/confirm/v2";
+const ACK_MARKER: &[u8] = b"anonymum/acknowledge/v2";
 
 /// The longest valid frame: a data frame carrying [`crate::MAX_PLAINTEXT`].
 pub const MAX_FRAME: usize = 1 + NONCE_LEN + MAX_NOISE_MESSAGE;
 
-/// Cap on half-finished handshakes a responder keeps, so strangers cannot
-/// exhaust memory by starting handshakes and never finishing.
+/// Cap on half-finished handshakes a responder keeps.
 const MAX_PENDING: usize = 1_024;
 
 /// How many [`Responder::tick`] calls a half-finished handshake survives.
@@ -82,6 +90,8 @@ pub enum WireError {
     /// For an attempt or call that is not the current one, or a type that
     /// makes no sense at this point. Ignored; nothing changed.
     Stale,
+    /// The caller is not authorised. Nothing is sent and nothing stored.
+    Unauthorised,
     /// Data arrived (or was to be sent) without an established session.
     NoSession,
     Busy,
@@ -114,10 +124,7 @@ struct Attempt {
 }
 
 fn data_frame(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + body.len());
-    out.push(DATA);
-    out.extend_from_slice(body);
-    out
+    [&[DATA], body].concat()
 }
 
 fn handshake_frame(kind: u8, at: Attempt, body: &[u8]) -> Vec<u8> {
@@ -134,8 +141,7 @@ enum Frame<'a> {
     Data(&'a [u8]),
 }
 
-/// Outer framing only: type and exact length per type. Nothing here
-/// touches any state.
+/// Outer framing only: type and exact length per type. Touches no state.
 fn parse(frame: &[u8]) -> Result<Frame<'_>, WireError> {
     if frame.len() > MAX_FRAME {
         return Err(WireError::Oversized);
@@ -145,10 +151,10 @@ fn parse(frame: &[u8]) -> Result<Frame<'_>, WireError> {
         DATA => {
             return if body.len() < MIN_SEALED { Err(WireError::Malformed) } else { Ok(Frame::Data(body)) };
         }
-        HANDSHAKE_1 => MESSAGE1_LEN,
-        HANDSHAKE_2 => MESSAGE2_LEN,
-        HANDSHAKE_3 => MESSAGE3_LEN,
+        HELLO => MESSAGE1_LEN,
+        WELCOME => MESSAGE2_LEN,
         CONFIRM => MIN_SEALED + CONFIRM_MARKER.len(),
+        ACK => MIN_SEALED + ACK_MARKER.len(),
         _ => return Err(WireError::UnknownFrame),
     };
     if frame.len() != HEADER_LEN + body_len {
@@ -180,7 +186,10 @@ impl Default for RetryPolicy {
 
 /// The calling side of one conversation.
 pub struct Initiator {
-    peer: Address,
+    me: StaticKey,
+    peer: [u8; 32],
+    network: Network,
+    reference: [u8; REFERENCE_LEN],
     call: u32,
     policy: RetryPolicy,
     attempt: u32,
@@ -188,9 +197,9 @@ pub struct Initiator {
 }
 
 enum State {
-    /// Message 1 sent; waiting for message 2.
+    /// HELLO sent; waiting for WELCOME.
     Handshaking { handshake: Handshake, sent: Vec<u8>, resends: u32 },
-    /// Message 3 sent; waiting for the responder's confirmation.
+    /// CONFIRM sent; waiting for the answerer's ACK.
     Confirming { session: Session, sent: Vec<u8>, resends: u32 },
     Established(Session),
     /// The last attempt failed; the next starts after [`Initiator::wait`].
@@ -200,37 +209,57 @@ enum State {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InitiatorEvent {
-    /// Send this frame to the peer (message 3).
+    /// Send this frame to the peer (the CONFIRM).
     Send(Vec<u8>),
-    /// The responder confirmed; [`Initiator::seal`] is usable.
+    /// The answerer acknowledged; [`Initiator::seal`] is usable.
     Established,
-    /// A message. If it arrived before the confirmation, it confirmed the
-    /// session too.
+    /// A message. If it arrived before the ACK, it established the session.
     Message(Vec<u8>),
 }
 
 impl Initiator {
-    /// Begin talking to `peer` with the default [`RetryPolicy`]. Returns the
-    /// first frame to send.
-    pub fn start(me: &Identity, peer: Address) -> Result<(Initiator, Vec<u8>), WireError> {
-        Self::start_with(me, peer, RetryPolicy::default())
+    /// Call the holder of handshake key `peer` as `me` (a caller key scoped
+    /// to this relationship or request), naming `reference` inside the
+    /// encrypted first message. Returns the first frame to send.
+    pub fn start(
+        me: &StaticKey,
+        peer: [u8; 32],
+        network: Network,
+        reference: [u8; REFERENCE_LEN],
+    ) -> Result<(Initiator, Vec<u8>), WireError> {
+        Self::start_with(me, peer, network, reference, RetryPolicy::default())
     }
 
-    pub fn start_with(me: &Identity, peer: Address, policy: RetryPolicy) -> Result<(Initiator, Vec<u8>), WireError> {
-        let mut initiator = Initiator { peer, call: OsRng.next_u32(), policy, attempt: 0, state: State::Waiting };
-        let first = initiator.new_attempt(me)?;
+    pub fn start_with(
+        me: &StaticKey,
+        peer: [u8; 32],
+        network: Network,
+        reference: [u8; REFERENCE_LEN],
+        policy: RetryPolicy,
+    ) -> Result<(Initiator, Vec<u8>), WireError> {
+        let mut initiator = Initiator {
+            me: me.clone(),
+            peer,
+            network,
+            reference,
+            call: OsRng.next_u32(),
+            policy,
+            attempt: 0,
+            state: State::Waiting,
+        };
+        let first = initiator.new_attempt()?;
         Ok((initiator, first))
     }
 
     /// A fresh handshake (fresh ephemeral key), if attempts remain.
-    fn new_attempt(&mut self, me: &Identity) -> Result<Vec<u8>, WireError> {
+    fn new_attempt(&mut self) -> Result<Vec<u8>, WireError> {
         if self.attempt >= self.policy.attempts {
             self.state = State::Failed;
             return Err(WireError::GaveUp);
         }
         self.attempt += 1;
-        let (handshake, message1) = Handshake::initiate(me, self.peer)?;
-        let sent = handshake_frame(HANDSHAKE_1, self.current(), &message1);
+        let (handshake, message1) = Handshake::initiate(&self.me, &self.peer, &self.network, &self.reference)?;
+        let sent = handshake_frame(HELLO, self.current(), &message1);
         self.state = State::Handshaking { handshake, sent: sent.clone(), resends: 0 };
         Ok(sent)
     }
@@ -262,7 +291,7 @@ impl Initiator {
     /// to send: the same bytes again while the attempt has resends left,
     /// otherwise the first frame of a fresh attempt. `Ok(None)` once
     /// established; [`WireError::GaveUp`] when no attempts remain.
-    pub fn on_timeout(&mut self, me: &Identity) -> Result<Option<Vec<u8>>, WireError> {
+    pub fn on_timeout(&mut self) -> Result<Option<Vec<u8>>, WireError> {
         let max = self.policy.resends;
         match &mut self.state {
             State::Handshaking { sent, resends, .. } | State::Confirming { sent, resends, .. } if *resends < max => {
@@ -271,7 +300,7 @@ impl Initiator {
             }
             State::Established(_) => Ok(None),
             State::Failed => Err(WireError::GaveUp),
-            _ => self.new_attempt(me).map(Some),
+            _ => self.new_attempt().map(Some),
         }
     }
 
@@ -279,14 +308,14 @@ impl Initiator {
         let frame = parse(incoming)?;
         let current = self.current();
         match (frame, std::mem::replace(&mut self.state, State::Failed)) {
-            (Frame::Handshake { kind: HANDSHAKE_2, at, body }, State::Handshaking { handshake, sent, resends }) => {
+            (Frame::Handshake { kind: WELCOME, at, body }, State::Handshaking { handshake, sent, resends }) => {
                 if at != current {
                     self.state = State::Handshaking { handshake, sent, resends };
                     return Err(WireError::Stale);
                 }
-                match handshake.initiator_finish(body) {
-                    Ok((session, message3)) => {
-                        let sent = handshake_frame(HANDSHAKE_3, current, &message3);
+                match handshake.finish(body) {
+                    Ok(mut session) => {
+                        let sent = handshake_frame(CONFIRM, current, &session.seal(CONFIRM_MARKER)?);
                         self.state = State::Confirming { session, sent: sent.clone(), resends: 0 };
                         Ok(InitiatorEvent::Send(sent))
                     }
@@ -296,11 +325,9 @@ impl Initiator {
                     }
                 }
             }
-            (Frame::Handshake { kind: CONFIRM, at, body }, State::Confirming { mut session, sent, resends }) => {
-                // A transport message: a bad one is dropped, as Noise does
-                // for transport messages, and the attempt stays valid.
-                let confirmed = at == current && session.open(body).map_or(false, |p| p == CONFIRM_MARKER);
-                if confirmed {
+            (Frame::Handshake { kind: ACK, at, body }, State::Confirming { mut session, sent, resends }) => {
+                let acknowledged = at == current && session.open(body).map_or(false, |p| p == ACK_MARKER);
+                if acknowledged {
                     self.state = State::Established(session);
                     Ok(InitiatorEvent::Established)
                 } else {
@@ -342,31 +369,36 @@ impl Initiator {
 
 // ---- responder -------------------------------------------------------------
 
-/// The answering side, serving many callers at once.
+/// The answering side, serving many callers at once. It holds the handshake
+/// key callers reach and the [`Gate`] that decides who is answered.
 pub struct Responder<T> {
-    /// Half-finished handshakes, one per caller and call id.
+    me: StaticKey,
+    network: Network,
+    gate: Gate,
+    /// Answered but unconfirmed handshakes, one per reply handle and call id.
     pending: HashMap<(T, u32), Pending>,
     sessions: HashMap<T, Live>,
 }
 
-/// A half-finished handshake, with the frame that started it and our reply.
-/// A caller who is not answered (e.g. we were offline) sends the same first
-/// frame again; when both copies arrive, we answer the repeat with the same
-/// reply, so there is still exactly one handshake to finish.
+/// An answered HELLO, with the frame that started it and our WELCOME. A
+/// repeat of the same HELLO gets the same WELCOME, so there is still exactly
+/// one handshake to finish.
 struct Pending {
     attempt: u32,
     first: Vec<u8>,
     reply: Vec<u8>,
-    handshake: Handshake,
+    session: Session,
+    reference: [u8; REFERENCE_LEN],
+    grant: Grant,
     age: u32,
 }
 
-/// An established session, with the message 3 that finished it and our
-/// confirmation, so a lost confirmation can be resent.
+/// An established session, with the CONFIRM that finished it and our ACK,
+/// so a lost ACK can be resent.
 struct Live {
     at: Attempt,
     last: Vec<u8>,
-    confirm: Vec<u8>,
+    ack: Vec<u8>,
     session: Session,
 }
 
@@ -374,25 +406,28 @@ struct Live {
 pub enum ResponderEvent {
     /// Send this frame back to the caller.
     Reply(Vec<u8>),
-    /// A caller proved it is `peer`. Decide now whether to keep talking
-    /// (check the chain for an open channel): if so, send `reply` (the
-    /// confirmation); if not, call [`Responder::forget`] and send nothing.
-    Established { peer: Address, reply: Vec<u8> },
-    Message { peer: Address, plaintext: Vec<u8> },
-}
-
-impl<T: Hash + Eq + Clone> Default for Responder<T> {
-    fn default() -> Self {
-        Responder { pending: HashMap::new(), sessions: HashMap::new() }
-    }
+    /// The caller with key `peer` confirmed a fresh session and the grant is
+    /// committed. Send `reply` (the ACK).
+    Established { peer: [u8; 32], grant: Grant, reply: Vec<u8> },
+    Message { peer: [u8; 32], plaintext: Vec<u8> },
 }
 
 impl<T: Hash + Eq + Clone> Responder<T> {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(me: &StaticKey, network: Network, gate: Gate) -> Self {
+        Responder { me: me.clone(), network, gate, pending: HashMap::new(), sessions: HashMap::new() }
     }
 
-    pub fn handle(&mut self, me: &Identity, from: T, incoming: &[u8]) -> Result<ResponderEvent, WireError> {
+    pub fn gate(&self) -> &Gate {
+        &self.gate
+    }
+
+    pub fn gate_mut(&mut self) -> &mut Gate {
+        &mut self.gate
+    }
+
+    /// Handle one frame at time `now` (seconds, for invitation expiry).
+    /// `Err` always means: send nothing.
+    pub fn handle(&mut self, from: T, incoming: &[u8], now: u64) -> Result<ResponderEvent, WireError> {
         let (kind, at, body) = match parse(incoming)? {
             Frame::Data(body) => {
                 let live = self.sessions.get_mut(&from).ok_or(WireError::NoSession)?;
@@ -404,7 +439,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         // Attempts of a call we already finished are over.
         let finished = self.sessions.get(&from).filter(|live| live.at.call == at.call);
         match kind {
-            HANDSHAKE_1 => {
+            HELLO => {
                 if finished.map_or(false, |live| at.number <= live.at.number) {
                     return Err(WireError::Stale);
                 }
@@ -414,39 +449,64 @@ impl<T: Hash + Eq + Clone> Responder<T> {
                         return Err(WireError::Stale);
                     }
                     if at.number == pending.attempt {
+                        // A repeat gets the cached answer, but only while the
+                        // caller is still authorised (not blocked, invitation
+                        // not used up meanwhile).
+                        if self.gate.authorise(&pending.session.peer(), &pending.reference, now) != Some(pending.grant) {
+                            self.pending.remove(&key);
+                            return Err(WireError::Unauthorised);
+                        }
                         return Ok(ResponderEvent::Reply(pending.reply.clone()));
                     }
                 } else if self.pending.len() >= MAX_PENDING {
                     return Err(WireError::Busy);
                 }
-                let (handshake, message2) = Handshake::respond(me, body)?;
-                let reply = handshake_frame(HANDSHAKE_2, at, &message2);
-                let pending = Pending { attempt: at.number, first: incoming.to_vec(), reply: reply.clone(), handshake, age: 0 };
+                let incoming_hello = Incoming::read(&self.me, &self.network, body)?;
+                let (caller, reference) = (incoming_hello.caller(), incoming_hello.reference());
+                // The decision, before anything is written.
+                let grant = self.gate.authorise(&caller, &reference, now).ok_or(WireError::Unauthorised)?;
+                let (session, message2) = incoming_hello.accept()?;
+                let reply = handshake_frame(WELCOME, at, &message2);
+                let pending = Pending {
+                    attempt: at.number,
+                    first: incoming.to_vec(),
+                    reply: reply.clone(),
+                    session,
+                    reference,
+                    grant,
+                    age: 0,
+                };
                 self.pending.insert(key, pending);
                 Ok(ResponderEvent::Reply(reply))
             }
-            HANDSHAKE_3 => {
+            CONFIRM => {
                 if let Some(live) = finished {
-                    // Our confirmation was lost: send it again.
+                    // Our ACK was lost: send it again.
                     return if live.at == at && live.last == incoming {
-                        Ok(ResponderEvent::Reply(live.confirm.clone()))
+                        Ok(ResponderEvent::Reply(live.ack.clone()))
                     } else {
                         Err(WireError::Stale)
                     };
                 }
                 let key = (from.clone(), at.call);
-                if self.pending.get(&key).map_or(true, |p| p.attempt != at.number) {
+                let pending = self.pending.get_mut(&key).filter(|p| p.attempt == at.number).ok_or(WireError::Stale)?;
+                // A transport message: a bad one is dropped; the attempt stays.
+                if pending.session.open(body).ok().as_deref() != Some(CONFIRM_MARKER) {
                     return Err(WireError::Stale);
                 }
-                let pending = self.pending.remove(&key).expect("checked above");
-                let mut session = pending.handshake.responder_finish(body).map_err(WireError::AttemptFailed)?;
+                let mut pending = self.pending.remove(&key).expect("found above");
+                let peer = pending.session.peer();
+                if !self.gate.commit(&peer, &pending.reference, pending.grant, now) {
+                    return Err(WireError::Unauthorised); // blocked or used meanwhile
+                }
                 // This caller is now talking to us: its other half-finished
                 // handshakes, if any, are over.
                 self.pending.retain(|(t, _), _| *t != from);
-                let confirm = handshake_frame(CONFIRM, at, &session.seal(CONFIRM_MARKER)?);
-                let peer = session.peer();
-                self.sessions.insert(from, Live { at, last: incoming.to_vec(), confirm: confirm.clone(), session });
-                Ok(ResponderEvent::Established { peer, reply: confirm })
+                let ack = handshake_frame(ACK, at, &pending.session.seal(ACK_MARKER)?);
+                let grant = pending.grant;
+                let live = Live { at, last: incoming.to_vec(), ack: ack.clone(), session: pending.session };
+                self.sessions.insert(from, live);
+                Ok(ResponderEvent::Established { peer, grant, reply: ack })
             }
             _ => Err(WireError::Stale),
         }
@@ -457,10 +517,25 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         Ok(data_frame(&live.session.seal(plaintext)?))
     }
 
-    /// Age half-finished handshakes; drop those that have seen
-    /// [`PENDING_TICKS`] ticks without a message 3. Returns the callers whose
-    /// handshake was dropped. Call it at a steady pace (e.g. once per
-    /// initiator wait).
+    /// Block a caller key: refused from now on, and any session or pending
+    /// handshake with it is dropped.
+    pub fn block(&mut self, caller: [u8; 32]) {
+        self.gate.block(caller);
+        self.pending.retain(|_, p| p.session.peer() != caller);
+        self.sessions.retain(|_, live| live.session.peer() != caller);
+    }
+
+    /// End a relationship without blocking: the caller key is no longer a
+    /// contact, and any session or pending handshake with it is dropped.
+    pub fn remove_contact(&mut self, caller: [u8; 32]) {
+        self.gate.remove_contact(&caller);
+        self.pending.retain(|_, p| p.session.peer() != caller);
+        self.sessions.retain(|_, live| live.session.peer() != caller);
+    }
+
+    /// Age answered handshakes; drop those that have seen [`PENDING_TICKS`]
+    /// ticks without a CONFIRM. Returns the callers whose handshake was
+    /// dropped. Call it at a steady pace (e.g. once per initiator wait).
     pub fn tick(&mut self) -> Vec<T> {
         let mut expired = Vec::new();
         self.pending.retain(|(from, _), pending| {
@@ -474,12 +549,12 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         expired
     }
 
-    /// How many half-finished handshakes are waiting.
+    /// How many answered handshakes are waiting for a CONFIRM.
     pub fn pending(&self) -> usize {
         self.pending.len()
     }
 
-    /// Drop a caller, e.g. because they have no open channel.
+    /// Drop a caller's reply handle (its sessions and pending handshakes).
     pub fn forget(&mut self, from: &T) {
         self.pending.retain(|(t, _), _| t != from);
         self.sessions.remove(from);

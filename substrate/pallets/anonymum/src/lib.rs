@@ -63,7 +63,7 @@ pub fn key_binding_message(key: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Every sealed contact note is exactly this long (see `anonymum-core`).
-pub const SEALED_NOTE_LEN: u32 = 427;
+pub const SEALED_NOTE_LEN: u32 = 587;
 
 /// Basis points per whole (100%).
 pub const BPS_DENOMINATOR: u16 = 10_000;
