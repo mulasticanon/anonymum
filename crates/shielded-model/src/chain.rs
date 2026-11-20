@@ -16,12 +16,22 @@ use crate::objects::*;
 pub const N_IN: usize = 2;
 /// Output slots per transaction (new notes or dummies).
 pub const N_OUT: usize = 3;
-/// Encrypted payload slots per transaction.
+/// Encrypted payload slots per transaction: two coin-note slots and one
+/// stranger-note slot, the same in every transaction of every branch.
 pub const N_PAY: usize = 3;
-/// Bytes per payload slot. A placeholder: the size is open (P10). Sized to
-/// hold the sender's recovery copy: a 12-byte nonce, the 176-byte escrow,
-/// two 24-byte key paths and a 16-byte authentication tag.
-pub const PAYLOAD_LEN: usize = 252;
+/// Coin-note slots (0 and 1): a note's delivery data, or the sender's
+/// recovery copy (12-byte nonce, 172-byte sealed escrow fields and key
+/// paths, 16-byte tag). Placeholder size (P10).
+pub const N_COIN: usize = 2;
+pub const COIN_PAYLOAD_LEN: usize = 200;
+/// The stranger-note slot (2): sized for the hybrid post-quantum note of
+/// `anonymum-crypto` (format v5: admission commitment 32, ML-KEM-768
+/// ciphertext 1,088, Noise Xpsk0 message 667). Every transaction carries
+/// one; it is pruned 24 hours after its window starts.
+pub const STRANGER_SLOT: usize = 2;
+pub const STRANGER_NOTE_LEN: usize = 1_787;
+/// Exact length of each slot, in order.
+pub const PAYLOAD_LENS: [usize; N_PAY] = [COIN_PAYLOAD_LEN, COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN];
 /// Request lifetime: claims stop and timeouts start here (O4, O8).
 pub const TTL: Time = 24 * 60 * 60;
 
@@ -194,6 +204,9 @@ pub enum Reject {
     FeeReserveWrong,
     MissingSurcharge,
     TierMismatch,
+    /// A transaction that is not a request carries an admission record with
+    /// a contact key or request digest (spec section 3, W3).
+    NonEmptyAdmission,
     ReceiptEscrowMismatch,
     ClaimPayoutWrong,
     RefundNotDerived,
@@ -224,8 +237,13 @@ pub struct Chain {
     roots: HashMap<Hash, u64>,
     current_root: Hash,
     nullifiers: HashSet<Nullifier>,
-    /// Every accepted public transaction, in order (what a scanner sees).
+    /// Every accepted public transaction, in order (what a scanner sees),
+    /// with its stranger-note slot moved out to `stranger_notes`.
     log: Vec<PublicTx>,
+    /// Prunable stranger-note blobs: transaction index -> (window start,
+    /// bytes). Kept for `TTL` after the window starts, then pruned; the
+    /// tree, nullifiers and admission commitments stay permanent.
+    stranger_notes: std::collections::BTreeMap<usize, (Time, Vec<u8>)>,
     /// Tree position of each logged transaction's first output.
     first_output: Vec<u64>,
     issued: u128,
@@ -247,6 +265,7 @@ impl Chain {
             current_root: empty_root,
             nullifiers: HashSet::new(),
             log: Vec::new(),
+            stranger_notes: std::collections::BTreeMap::new(),
             first_output: Vec::new(),
             issued: 0,
             fees_collected: 0,
@@ -271,6 +290,22 @@ impl Chain {
     }
     pub fn log(&self) -> &[PublicTx] {
         &self.log
+    }
+    /// The stranger-note slot of the logged transaction `index`, while it
+    /// is kept (24 hours from its window start).
+    pub fn stranger_note(&self, index: usize) -> Option<&[u8]> {
+        self.stranger_notes.get(&index).map(|(_, bytes)| bytes.as_slice())
+    }
+    /// How many stranger-note blobs are currently kept.
+    pub fn stranger_notes_kept(&self) -> usize {
+        self.stranger_notes.len()
+    }
+    /// Drop every stranger note whose window started `TTL` or more before
+    /// `block_time`. Nothing else changes. Returns how many were dropped.
+    pub fn prune_stranger_notes(&mut self, block_time: Time) -> usize {
+        let before = self.stranger_notes.len();
+        self.stranger_notes.retain(|_, (window_start, _)| block_time < window_start.saturating_add(TTL));
+        before - self.stranger_notes.len()
     }
     /// Tree positions of the outputs of the logged transaction `index`.
     pub fn output_positions(&self, index: usize) -> std::ops::Range<u64> {
@@ -312,6 +347,7 @@ impl Chain {
                 &(self.leaves.len() as u64).to_le_bytes(),
                 &nf_bytes,
                 &(self.log.len() as u64).to_le_bytes(),
+                &(self.stranger_notes.len() as u64).to_le_bytes(),
                 &self.fees_collected.to_le_bytes(),
                 &self.fees_burned.to_le_bytes(),
                 &self.node_pool.to_le_bytes(),
@@ -343,8 +379,12 @@ impl Chain {
         self.fees_collected += fee;
         self.fees_burned += burned;
         self.node_pool += fee - burned;
-        self.log.push(public.clone());
+        let mut logged = public.clone();
+        let note = std::mem::take(&mut logged.payloads[STRANGER_SLOT]);
+        self.stranger_notes.insert(self.log.len(), (created_at, note));
+        self.log.push(logged);
         self.first_output.push(first_position);
+        self.prune_stranger_notes(block_time);
         Ok(Receipt { first_position, created_at })
     }
 
@@ -361,7 +401,7 @@ impl Chain {
         if public.base_fee != p.base_fee {
             return Err(Reject::WrongBaseFee);
         }
-        if public.payloads.iter().any(|slot| slot.len() != PAYLOAD_LEN) {
+        if public.payloads.iter().zip(PAYLOAD_LENS).any(|(slot, len)| slot.len() != len) {
             return Err(Reject::MalformedPayload);
         }
         // Windows come from the shared grid: one grid cell, half-open.
@@ -458,6 +498,9 @@ impl Chain {
                 if tier != want || witness.admission.escrow.is_some() {
                     return Err(Reject::TierMismatch);
                 }
+                if witness.branch == Branch::Transfer && !witness.admission.is_empty() {
+                    return Err(Reject::NonEmptyAdmission);
+                }
                 if real_inputs.iter().any(|(n, _, _, _)| !matches!(n, Note::Ordinary { .. })) {
                     return Err(Reject::WrongInputType);
                 }
@@ -495,6 +538,9 @@ impl Chain {
             Branch::Claim | Branch::Decline | Branch::SenderRefund => {
                 if tier != Tier::None || witness.admission.escrow.is_some() {
                     return Err(Reject::TierMismatch);
+                }
+                if !witness.admission.is_empty() {
+                    return Err(Reject::NonEmptyAdmission);
                 }
                 let [(Note::Escrow(escrow), created_at, escrow_position, authority)] = real_inputs.as_slice() else {
                     return Err(Reject::WrongInputType);

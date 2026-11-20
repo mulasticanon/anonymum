@@ -9,7 +9,7 @@
 mod common;
 
 use anonymum_shielded_model::build::TxBuilder;
-use anonymum_shielded_model::chain::PAYLOAD_LEN;
+use anonymum_shielded_model::chain::{COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN};
 use anonymum_shielded_model::wallet::{escrow_status, EscrowStatus, KeyPath, RecoveryError, Wallet};
 use anonymum_shielded_model::*;
 use common::*;
@@ -69,9 +69,9 @@ fn decline(w: &mut World, escrow: &EscrowNote, pos: u64, tag: &str) {
         .output(derived_refund(escrow, pos))
         .output(Note::Retired { value: penalty(escrow.price), blinding: blinding(&format!("{tag}/p")) })
         // Deliberately unusable settlement data.
-        .payload(0, vec![0xEE; PAYLOAD_LEN])
-        .payload(1, vec![0x00; PAYLOAD_LEN])
-        .payload(2, (0..PAYLOAD_LEN).map(|i| i as u8).collect())
+        .payload(0, vec![0xEE; COIN_PAYLOAD_LEN])
+        .payload(1, vec![0x00; COIN_PAYLOAD_LEN])
+        .payload(2, (0..STRANGER_NOTE_LEN).map(|i| i as u8).collect())
         .build(&w.chain, w.time);
     w.submit(&public, &witness).expect("decline accepted");
 }
@@ -254,13 +254,13 @@ fn a_recovery_copy_opens_with_one_decryption_and_no_chain_context() {
         ..escrow_note(101, &parties(), "e")
     };
     let slot = wallet.seal_recovery(&escrow, &refund, &cancel, [0x5C; 12]).unwrap();
-    assert_eq!(slot.len(), PAYLOAD_LEN);
+    assert_eq!(slot.len(), COIN_PAYLOAD_LEN);
     let opened = wallet.open_recovery(&slot).expect("opens");
     assert_eq!((opened.escrow, opened.refund, opened.cancel), (escrow, refund.clone(), cancel.clone()));
     assert_ne!(slot, wallet.seal_recovery(&escrow, &refund, &cancel, [0x5D; 12]).unwrap());
     let mut tampered = slot.clone();
     tampered[40] ^= 1;
-    assert_eq!(wallet.open_recovery(&vec![0; PAYLOAD_LEN]), None);
+    assert_eq!(wallet.open_recovery(&vec![0; COIN_PAYLOAD_LEN]), None);
     assert_eq!(wallet.open_recovery(&tampered), None);
     assert_eq!(Wallet::from_backup(blinding("other")).open_recovery(&slot), None);
 }

@@ -168,7 +168,8 @@ composition and whether it answers questions 11 and 12:
   forward secrecy for notes sealed to a long-lived inbox key (inbox key
   rotation as a candidate mitigation); no delay between claim finality and
   the callback; dummy payload slots that must be indistinguishable from
-  real ones, and the model's 252-byte slot against the 667-byte note;
+  real ones (slot sizes now proposed: two 200-byte coin slots and one
+  1,787-byte stranger slot, I24);
   post-quantum key exchange and ratcheting as long-term questions; and
   the host Ed25519 check (ZIP 215 via `ed25519-zebra`) accepting small-order
   invite keys that `verify_strict` refuses.
@@ -179,11 +180,20 @@ composition and whether it answers questions 11 and 12:
   commitment, the empty one freshly blinded (the model derives that
   blinding from a test salt today); dummy note slots as real Noise X notes
   between fresh random keys; one pool and one fee structure. Open: hybrid
-  post-quantum key exchange and its size cost (about 1,755-byte notes and
-  2,592-byte cards with ML-KEM-768) before the note format is frozen; key
+  post-quantum key exchange for handshakes (for notes it is now
+  prototyped, see below) before the note format is frozen; key
   rotation and contact recognition; persistent wallet versus throwaway
   listener; cover traffic (on by default in `nym-sdk` 1.21.6, by reading
   the code); message retrieval at scale.
+- **Payload slots, pruning and the hybrid note** (issues file I28, I29;
+  2026-11-20, unreviewed): every transaction has two 200-byte coin slots
+  and one 1,787-byte stranger slot; the stranger slot is pruned 24 hours
+  after its window starts, which leaves those proofs uncheckable for a
+  late-syncing node unless a hash of the slot is kept (I28). The note is
+  now hybrid: ML-KEM-768 ciphertext in the Noise prologue and its shared
+  secret as the psk of `Noise_Xpsk0` (`ml-kem` 0.3.3); one ML-KEM key per
+  card, signed through its BLAKE2s hash (card 1,408 bytes). Sender
+  authentication stays classical. Is this the right hybrid?
 - **Open questions for you** (issues file, "Open questions recorded
   2026-11-20"): durable and multi-device grant state; Bob's callback using
   the handshake key on his card (I16); timing equivalence between authorised and unauthorised

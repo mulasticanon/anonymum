@@ -15,7 +15,7 @@ fn card(who: &ContactIdentity) -> ContactCard {
 }
 
 fn seal(to: &ContactIdentity, from: &ContactIdentity, intro: &str) -> SealedNote {
-    seal_note(&NET, &to.inbox_key().public(), from, &card(from), &ROUTE, intro, &ADMISSION).unwrap()
+    seal_note(&NET, &card(to), from, &card(from), &ROUTE, intro, &ADMISSION).unwrap()
 }
 
 #[test]
@@ -28,9 +28,10 @@ fn a_note_opens_and_names_the_right_sender() {
     assert_eq!(opened.admission, ADMISSION);
     assert_eq!(opened.sender(), carol.signing_key());
     assert_eq!(opened.callback(), carol.handshake_key().public());
-    assert_eq!(opened.card, card(&carol), "the sender's full card, verified");
+    assert_eq!(opened.card, card(&carol).summary(), "the sender's card (post-quantum key as its hash), verified");
     assert_eq!((opened.route, opened.intro.as_str()), (ROUTE, intro));
-    for key in [carol.signing_key(), carol.handshake_key().public(), carol.inbox_key().public(), bob.inbox_key().public()] {
+    let carol_pq_hash = card(&carol).summary().pq_inbox_hash;
+    for key in [carol.signing_key(), carol.handshake_key().public(), carol.inbox_key().public(), bob.inbox_key().public(), carol_pq_hash] {
         assert!(!note.0.windows(32).any(|w| w == key), "a key is visible in the note");
     }
     assert!(!note.0.windows(ROUTE_LEN).any(|w| w == ROUTE), "the route is not visible");
@@ -39,14 +40,14 @@ fn a_note_opens_and_names_the_right_sender() {
 #[test]
 fn a_fresh_wallet_finds_and_opens_its_note_with_no_sender_hint() {
     let bob = ContactIdentity::generate();
-    let (s, h, i) = bob.to_secret_bytes();
+    let (s, h, i, pq) = bob.to_secret_bytes();
     let others: Vec<ContactIdentity> = (0..4).map(|_| ContactIdentity::generate()).collect();
     let carol = ContactIdentity::generate();
     let mut chain_notes: Vec<SealedNote> = others.iter().map(|o| seal(o, &carol, "not for Bob")).collect();
     chain_notes.insert(2, seal(&bob, &carol, "for Bob"));
     chain_notes.push(seal(&others[0], &ContactIdentity::generate(), "also not"));
 
-    let fresh = ContactIdentity::from_secret_bytes(s, h, i);
+    let fresh = ContactIdentity::from_secret_bytes(s, h, i, pq);
     let mine: Vec<_> = chain_notes.iter().filter_map(|n| open_note(&fresh, &NET, n, NOW).ok()).collect();
     assert_eq!(mine.len(), 1);
     assert_eq!((mine[0].intro.as_str(), mine[0].sender()), ("for Bob", carol.signing_key()));
@@ -66,7 +67,7 @@ fn every_note_has_the_same_size() {
 #[test]
 fn intro_over_280_bytes_is_refused_at_the_client() {
     let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
-    let inbox = bob.inbox_key().public();
+    let inbox = card(&bob);
     let long = "x".repeat(INTRO_MAX_BYTES + 1);
     let result = seal_note(&NET, &inbox, &carol, &card(&carol), &ROUTE, &long, &ADMISSION);
     assert!(matches!(result, Err(NoteError::IntroTooLong { len: 281 })));
@@ -82,8 +83,8 @@ fn a_note_for_another_recipient_does_not_open() {
     // Not the sender, not someone else, and not Bob's handshake key.
     assert!(matches!(open_note(&carol, &NET, &note, NOW), Err(NoteError::Noise(_))));
     assert!(matches!(open_note(&ContactIdentity::generate(), &NET, &note, NOW), Err(NoteError::Noise(_))));
-    let (s, _, i) = bob.to_secret_bytes();
-    let swapped = ContactIdentity::from_secret_bytes(s, i, bob.handshake_key().to_bytes());
+    let (s, h, i, pq) = bob.to_secret_bytes();
+    let swapped = ContactIdentity::from_secret_bytes(s, i, h, pq);
     assert!(matches!(open_note(&swapped, &NET, &note, NOW), Err(NoteError::Noise(_))));
 }
 
@@ -107,7 +108,8 @@ fn a_note_sealed_for_one_network_does_not_open_on_another() {
 fn tampered_or_truncated_notes_are_rejected() {
     let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
     let note = seal(&bob, &carol, "hi");
-    for index in [0, 31, 32, 40, 100, 200, SEALED_NOTE_LEN - 1] {
+    // Admission, ML-KEM ciphertext, Noise ephemeral, static and payload.
+    for index in [0, 31, 32, 600, 1_119, 1_120, 1_160, 1_300, SEALED_NOTE_LEN - 1] {
         let mut bad = note.clone();
         bad.0[index] ^= 1;
         assert!(open_note(&bob, &NET, &bad, NOW).is_err(), "flip at {index}");
@@ -175,7 +177,7 @@ fn a_card_expired_or_not_yet_valid_at_creation_is_refused() {
         open_note(&bob, &NET, &note, 100),
         Err(NoteError::BadCard(anonymum_crypto::ContactError::Expired))
     ));
-    let later = seal_note(&NET, &bob.inbox_key().public(), &carol, &carol.card(NET, 1_000, 60, 100), &ROUTE, "hi", &ADMISSION)
+    let later = seal_note(&NET, &card(&bob), &carol, &carol.card(NET, 1_000, 60, 100), &ROUTE, "hi", &ADMISSION)
         .unwrap();
     assert!(matches!(
         open_note(&bob, &NET, &later, 59),

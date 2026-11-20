@@ -173,6 +173,13 @@ impl AdmissionRecord {
         AdmissionRecord { contact_key: [0; 32], request_digest: [0; 32], tier: Tier::None, escrow: None, blinding }
     }
 
+    /// Is this the empty record a non-request carries: tier none, no
+    /// escrow, zero contact key and request digest? (The blinding is not
+    /// checked: it must be fresh and random, which no rule can see.)
+    pub fn is_empty(&self) -> bool {
+        self.tier == Tier::None && self.escrow.is_none() && self.contact_key == [0; 32] && self.request_digest == [0; 32]
+    }
+
     pub fn commitment(&self) -> Commitment {
         let tier = [match self.tier {
             Tier::None => 0,

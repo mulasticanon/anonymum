@@ -77,6 +77,28 @@ fn a_card_holds_three_contact_keys_and_no_wallet_key() {
 }
 
 #[test]
+fn a_card_carries_one_post_quantum_inbox_key_covered_by_its_signature() {
+    let bob = ContactIdentity::generate();
+    let card = bob.card(NET, 5, 10, 20);
+    assert_eq!((ContactCard::LEN, card.to_bytes().len()), (1_408, 1_408));
+    assert_eq!(card.pq_inbox_key, bob.pq_inbox_key());
+    assert_eq!(card.summary().pq_inbox_hash, anonymum_crypto::contact::pq_key_hash(&bob.pq_inbox_key()));
+    // Another valid ML-KEM key swapped in: the signature (over its hash) fails.
+    let mut swapped = card.clone();
+    swapped.pq_inbox_key = ContactIdentity::generate().pq_inbox_key();
+    assert_eq!(swapped.verify(&NET, 15), Err(ContactError::BadSignature));
+    let mut flipped = card.clone();
+    flipped.pq_inbox_key[1_000] ^= 1;
+    assert_eq!(flipped.verify(&NET, 15), Err(ContactError::BadSignature));
+    // A summary (what a note carries) verifies exactly when the card does.
+    assert_eq!(card.summary().verify(&NET, 15), Ok(()));
+    assert_eq!(swapped.summary().verify(&NET, 15), Err(ContactError::BadSignature));
+    // Restoring an identity restores its post-quantum key.
+    let (s, h, i, pq) = bob.to_secret_bytes();
+    assert_eq!(ContactIdentity::from_secret_bytes(s, h, i, pq).card(NET, 5, 10, 20), card);
+}
+
+#[test]
 fn a_card_for_another_network_is_refused() {
     let bob = ContactIdentity::generate();
     let card = bob.card(NET, 5, 10, 20);
@@ -285,7 +307,7 @@ fn offline_carol_accepts_only_bobs_callback() {
     let carol_card = carol.card(NET, 1_000, 0, NOW + 86_400);
     let route = [0x77; ROUTE_LEN];
     let admission = [0xAD; 32];
-    let note = seal_note(&NET, &card.inbox_key, &carol, &carol_card, &route, "Carol here", &admission).unwrap();
+    let note = seal_note(&NET, &card, &carol, &carol_card, &route, "Carol here", &admission).unwrap();
     // The key Bob will call back: Carol's handshake key, the one the note's
     // Noise X message authenticates (no separate callback key any more).
     let callback = carol.handshake_key();

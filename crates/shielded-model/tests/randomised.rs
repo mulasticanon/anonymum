@@ -8,7 +8,7 @@ mod common;
 use std::collections::HashMap;
 
 use anonymum_shielded_model::build::{rebind, reseal, TxBuilder};
-use anonymum_shielded_model::chain::PAYLOAD_LEN;
+use anonymum_shielded_model::chain::PAYLOAD_LENS;
 use anonymum_shielded_model::*;
 use common::*;
 
@@ -202,7 +202,11 @@ impl Sim {
     fn corrupt(&mut self, public: &PublicTx, witness: &Witness) -> (PublicTx, Witness) {
         let (mut p, mut w) = (public.clone(), *witness);
         match self.rng.below(6) {
-            0 => p.payloads[self.rng.below(3) as usize][self.rng.below(PAYLOAD_LEN as u64) as usize] ^= 0x40, // relay tampering
+            0 => {
+                // relay tampering
+                let slot = self.rng.below(3) as usize;
+                p.payloads[slot][self.rng.below(PAYLOAD_LENS[slot] as u64) as usize] ^= 0x40;
+            }
             1 => {
                 p.nullifiers[self.rng.below(2) as usize] = Nullifier(blinding(&format!("junk{}", self.counter)));
                 rebind(&p, &mut w);

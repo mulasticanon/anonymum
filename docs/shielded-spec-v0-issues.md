@@ -7,7 +7,8 @@ The design review of 2026-11-19 (`design-review-2026-11-19.md`) adds
 findings H1–H7 and M1–M4, tracked below. I15–I26 were raised while
 prototyping v0.7 section 2a in `crates/crypto` (2026-11-20); I27 is a
 question for the cryptographer about one of those choices. W1-W6 (spec
-section 2b) are proposed wallet and network rules. Each entry says
+section 2b) are proposed wallet and network rules. I28-I29 come from the
+payload slots, pruning and hybrid note of 2026-11-20. Each entry says
 how it stands and what the model or prototype does.
 
 | # | Issue | Status |
@@ -163,7 +164,7 @@ carried on. Each needs the owner's or the cryptographer's answer.
 | I21 | Rule 3 asks that a replayed first message not reopen a blocked contact or use an invitation twice, but says nothing of a still-authorised caller. | A recorded message 1 from a caller who is still a contact gets a message 2 (it cannot be confirmed, so no session and no grant). An availability signal: question 11. Repeats of an answered message 1 are re-checked against the gate before the cached reply is resent. |
 | I22 | Rule 4 puts the sender's contact identity inside the note but does not say it is authenticated. | The sender signs (contact signing key) the admission commitment, the recipient's inbox key and the note body, so a note cannot claim another identity or be forwarded to a third person as if written to them. |
 | I23 | Rule 4: a note must not be recognisable from the public card. | The note's ciphertext does not name the recipient, but its ephemeral key is a raw X25519 point, distinguishable from random bytes (not linkable to the recipient). Elligator-style encoding would need a vetted library. Question 12. **Preferred option for dummy slots (W4, proposed, unreviewed):** fill them with real Noise X notes between fresh random keys, so a dummy has the same structure as a real note instead of being random bytes. |
-| I24 | The shielded design's payload slot size (P10) is open; the note is now 587 bytes. | Recorded; the model's 204-byte slot is a placeholder and cannot hold it. |
+| I24 | The shielded design's payload slot size (P10) is open; the note is now 587 bytes. | **Proposed 2026-11-20:** two 200-byte coin-note slots and one 1,787-byte stranger-note slot in every transaction (spec P10), implemented in the model (`PAYLOAD_LENS`); the stranger slot holds the v5 note exactly. Sizes unreviewed. |
 | I25 | Whether an existing contact may call about anything, or only its relationship. | A contact's calls must name the reference recorded when it was admitted; any other reference gets nothing. |
 | I26 | The transparent chain still requires a wallet-bound messaging key before it accepts a request, and records requests wallet to wallet. | Kept for the prototype chain (a known gap until stage 5). Notes are sealed to the card's inbox key and never use that key. |
 
@@ -303,11 +304,12 @@ Status after the fixes of 2026-11-20:
   timing links the chain event to the mixnet traffic. Random delay or batched
   callbacks are candidates.
 - **Dummy payload slots must be indistinguishable from real ones.** The
-  model pads with zeros (review M2), and its 252-byte slot cannot hold the
-  587-byte note (I24): slot size and dummy content must be fixed together.
+  model pads with zeros (review M2). Slot sizes are now proposed (I24: the
+  1,787-byte stranger slot holds a v5 note exactly); dummy content is W4.
 - **Post-quantum key exchange and ratcheting** remain long-term questions:
   no per-message forward secrecy (no double ratchet) and no post-quantum
-  key agreement in sessions or notes.
+  key agreement in sessions. Notes have a hybrid ML-KEM-768 layer since
+  2026-11-20 (I29).
 
 ## Wallet and network behaviour rules W1-W6 (proposed, unreviewed, 2026-11-20)
 
@@ -318,7 +320,7 @@ them. All proposed and unreviewed.
 |---|---|---|
 | W1 | Never query a node about a specific nullifier, commitment, admission record, request or block of interest: sync what every wallet syncs, or fetch over the mixnet | **Proposed, unreviewed.** The prototype breaks it by design: `e2e.mjs`, `smoke.mjs` and the demo read specific requests, keys and block timestamps from a local node to check results |
 | W2 | Random delay before a callback after a claim is final; before a sender refund after expiry (never the first eligible block); no spending of an Open's change in the next block | **Proposed, unreviewed.** Distributions are a question for the cryptographer. The demo calls back at once |
-| W3 | Every transaction carries one admission commitment; the empty record in Transfer, Claim, Decline and Sender refund has a fresh, secret, uniformly random blinding, so its commitment is indistinguishable from a real one | **Proposed, unreviewed.** What the spec and model do: see below |
+| W3 | Every transaction carries one admission commitment; the empty record in Transfer, Claim, Decline and Sender refund has a fresh, secret, uniformly random blinding, so its commitment is indistinguishable from a real one | **Proposed, unreviewed; zero fields enforced 2026-11-20.** The model rejects a non-empty record in those branches at no charge (`Reject::NonEmptyAdmission`, tests in `slots_and_pruning.rs`). The blinding is still salt-derived in the model: see below |
 | W4 | A dummy payload slot holds a real Noise X note from a fresh random key to a fresh random key, not random bytes | **Proposed, unreviewed.** Preferred option for I23 |
 | W5 | Transfers, invited requests and stranger escrows share one pool and one fee structure | **Proposed, unreviewed.** Consistent with O3 and the spec's single circuit |
 | W6 | Open questions (below) | **Recorded** |
@@ -335,8 +337,9 @@ them. All proposed and unreviewed.
   `TxBuilder::build` uses `AdmissionRecord::empty(blinding)` when no record
   is given, with zero contact key and digest, tier none, no escrow. The
   chain checks only that Transfer, Claim, Decline and Sender refund carry
-  tier none and no escrow; it does not (and cannot) check that the blinding
-  is fresh, nor that the other fields are zero. **The model's blinding is
+  tier none and no escrow, and since 2026-11-20 also that the contact key
+  and request digest are zero (`AdmissionRecord::is_empty`); it does not
+  (and cannot) check that the blinding is fresh. **The model's blinding is
   not random:** it is derived from the builder's salt
   (`H("builder/derived", salt, "admission", 0)`), which the caller supplies.
   The code says "a real wallet would use fresh randomness"; two
@@ -348,7 +351,10 @@ them. All proposed and unreviewed.
 
 **W6, open questions.**
 - *Hybrid post-quantum key exchange* for notes and handshakes, decided
-  before the note format is frozen. Size cost with ML-KEM-768 (public key
+  before the note format is frozen. **Notes: prototyped 2026-11-20 (I29).**
+  The estimate below (two KEM keys per card) was not what was built: the
+  card carries one ML-KEM-768 key, for the inbox, so it is 1,408 bytes;
+  the note is 1,787 bytes. Handshakes and callbacks stay classical. Size cost with ML-KEM-768 (public key
   1,184 bytes, ciphertext 1,088 bytes): a note would grow by at least one
   KEM ciphertext, from 667 to about 1,755 bytes; a card carrying KEM public
   keys for the inbox and handshake keys would grow from 224 to about 2,592
@@ -377,3 +383,56 @@ them. All proposed and unreviewed.
   its gateway.
 - *Message retrieval at scale* (oblivious message retrieval, fuzzy message
   detection): roadmap only. Today every wallet tries every note.
+
+## Payload slots, pruning and the hybrid note (2026-11-20, unreviewed)
+
+**I28. A pruned stranger note leaves its proof uncheckable.** Spec
+section 4 now lets nodes discard a transaction's 1,787-byte stranger-note
+slot 24 hours after its window starts (the request can no longer be
+claimed, O8). The tree, nullifiers, admission commitments and coin-note
+slots stay. But statement 6 binds the proof to every payload slot, so a
+node syncing from genesis after pruning cannot recheck the proofs of
+pruned transactions. Candidate fix: the chain keeps a 32-byte hash of
+each stranger slot permanently and the proof binds to that hash. The
+reference model (`Chain::prune_stranger_notes`) drops the bytes and keeps
+no hash; it has no proofs to recheck. For the cryptographer.
+
+**I29. Hybrid post-quantum stranger note (format v5), prototyped.**
+`anonymum-crypto::note`, unreviewed.
+- *Card:* one ML-KEM-768 encapsulation key (`pq_inbox_key`, 1,184 bytes),
+  from a 64-byte seed in the contact identity. The card format is v3: its
+  signature covers `BLAKE2s-256("anonymum/pq-inbox-key/v1" || key)`, not
+  the key. Card size 1,408 bytes. `ContactCard::verify` also runs FIPS
+  203's input check on the key (`ContactError::BadPqKey`).
+- *Note:* admission (32) || ML-KEM ciphertext (1,088) || one
+  `Noise_Xpsk0_25519_ChaChaPoly_BLAKE2s` message (667). Prologue
+  `"anonymum/contact-note/v5" || network || admission || ciphertext`; the
+  ML-KEM shared secret is psk0. The payload adds the sender's 32-byte
+  post-quantum key hash to the v4 card fields, so the recipient rebuilds a
+  `CardSummary` and checks its signature without the 1,184-byte key.
+  Total 1,787 bytes (`SEALED_NOTE_LEN` in core and the pallet; runtime
+  `spec_version` 6). v4 (667-byte) notes are refused.
+- *Crate:* RustCrypto `ml-kem` pinned to `=0.3.3`. 0.3.4, the newest,
+  would have moved two packages already in the lockfile (`ctutils`
+  0.4.2 to 0.4.8, `module-lattice` 0.2.3 to 0.2.4); 0.3.3 only adds
+  packages (`kem`, `ml-kem`, `sha3` 0.12, `shake`, `sponge-cursor`). Only
+  `anonymum-crypto` uses it: the pallet and the wasm runtime do not, so
+  no `no_std` build is affected. `ml-kem` has not been audited, as far as
+  I know.
+- *What it gives:* reading a note needs both the X25519 and the ML-KEM
+  inbox secrets (tested: an identity with the right X25519 key and another
+  ML-KEM key cannot open it). A tampered ciphertext fails (tested).
+- *What it does not give:* sender authentication is classical. Anyone
+  with the X25519 inbox secret can still forge notes (the post-quantum key
+  is public), and so can anyone who breaks X25519; the callback is
+  classical Noise IK. Deniability is unchanged: the recipient can forge a
+  v5 note from any card (tested).
+- *Untestable by design:* binding the ciphertext into the prologue is
+  defence in depth. Removing it from both sides is not caught by any test,
+  because a changed ciphertext already changes the shared secret (ML-KEM's
+  implicit rejection). Removing it from one side is caught.
+- *Question for the cryptographer:* is "KEM secret as Noise psk0, KEM
+  ciphertext in the prologue" a sound hybrid here, compared with a
+  standard hybrid KEM combiner (for example X-Wing) or `snow`'s
+  non-default `hfs` feature?
+

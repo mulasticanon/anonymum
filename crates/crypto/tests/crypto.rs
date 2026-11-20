@@ -65,8 +65,9 @@ fn identities_survive_save_and_restore() {
     let (signing, messaging) = wallet.to_secret_bytes();
     assert_eq!(Identity::from_secret_bytes(signing, messaging).address(), wallet.address());
     let bob = ContactIdentity::generate();
-    let (s, h, i) = bob.to_secret_bytes();
-    let restored = ContactIdentity::from_secret_bytes(s, h, i);
+    let (s, h, i, pq) = bob.to_secret_bytes();
+    let restored = ContactIdentity::from_secret_bytes(s, h, i, pq);
+    assert_eq!(restored.pq_inbox_key(), bob.pq_inbox_key());
     assert_eq!(restored.signing_key(), bob.signing_key());
     assert_eq!(restored.handshake_key().public(), bob.handshake_key().public());
     assert_eq!(restored.inbox_key().public(), bob.inbox_key().public());

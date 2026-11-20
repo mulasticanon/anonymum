@@ -26,7 +26,7 @@ impl TxBuilder {
             inputs: Vec::new(),
             outputs: Vec::new(),
             admission: None,
-            payloads: std::array::from_fn(|_| vec![0; PAYLOAD_LEN]),
+            payloads: std::array::from_fn(|i| vec![0; PAYLOAD_LENS[i]]),
             salt: h("builder/salt", &[salt]),
         }
     }

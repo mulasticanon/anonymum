@@ -16,9 +16,9 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise X, deniable sender authentication) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 101 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 106 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
-| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
+| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes) and a prunable 24-hour stranger-note store. | 57 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
@@ -106,6 +106,14 @@ live demo passed in 267 s, Eve and Dave again getting nothing.
 With 24-hour requests and the sender's card checked at the request's
 creation time read from chain state (runtime `spec_version` 5,
 2026-11-20): `smoke.mjs` and `e2e.mjs` passed against the dev node.
+
+With the hybrid post-quantum note (format v5, 1,787 bytes; cards 1,408
+bytes with one ML-KEM-768 key; runtime `spec_version` 6; 2026-11-20):
+`smoke.mjs` passed against the dev node with a 1,787-byte note, and
+`e2e.mjs` passed: Carol sealed a v5 note to Bob's real card, Bob read it
+back from chain state, opened it with his two inbox secrets, and called
+Carol's handshake key over the live Nym mixnet. The live demo was not
+rerun.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -281,13 +289,17 @@ I14).
    between two addresses clears blocks both ways, since it only opens with
    both sides' consent.
 9. **No mixnet address is ever published.** Each user has a contact identity
-   separate from the wallet: a signing key, a handshake key and an inbox key,
-   listed on a signed contact card (with network, price and validity). A stranger's
-   request carries a note sealed to the inbox key (one Noise X message from
-   the stranger's contact handshake key): the stranger's card, a throwaway
-   route and an intro of at most 280 bytes, padded so every note is 667
-   bytes. It opens with the inbox key alone (no sender hint) and is bound to
-   the network and the request's admission commitment. The recipient is
+   separate from the wallet: a signing key, a handshake key, an inbox key
+   and a post-quantum inbox key (ML-KEM-768), listed on a signed contact
+   card (with network, price and validity; 1,408 bytes). A stranger's
+   request carries a note sealed to both inbox keys (an ML-KEM-768
+   ciphertext whose shared secret keys one Noise Xpsk0 message from the
+   stranger's contact handshake key): the stranger's card (its
+   post-quantum key as a hash), a throwaway route and an intro of at most
+   280 bytes, padded so every note is 1,787 bytes. It opens with the inbox
+   secrets alone (no sender hint) and is bound to the network, the
+   request's admission commitment and its ML-KEM ciphertext. Sender
+   authentication is classical (X25519) only. The recipient is
    convinced who sent it but cannot prove it to anyone else (deniable; no
    signature over the contact). On accept, the recipient calls the
    stranger's handshake key at the throwaway route; only its holder can

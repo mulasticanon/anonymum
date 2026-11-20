@@ -26,7 +26,7 @@ pub mod note;
 mod session;
 pub mod wire;
 
-pub use contact::{is_contributory_key, random_bytes, ContactCard, ContactError, ContactIdentity, Invitation, Network, Purpose, StaticKey};
+pub use contact::{is_contributory_key, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, Invitation, Network, Purpose, StaticKey};
 pub use gate::{Gate, Grant, Now};
 pub use identity::Identity;
 pub use invite::{Ed25519Invites, InviteSecret};

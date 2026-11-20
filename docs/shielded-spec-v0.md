@@ -12,6 +12,12 @@ v0.5 resolves the twelve issues the reference model raised
 (`shielded-spec-v0-issues.md`, I1 to I12). Each change is marked with its
 issue number.
 
+Updated 2026-11-20 (still v0.7, all unreviewed): fixed asymmetric payload
+slots and a prunable stranger-note slot (P10, section 4), the empty
+admission record's zero fields enforced (W3), and a hybrid post-quantum
+stranger note with one ML-KEM-768 key on the contact card (rules 2 and 4
+of section 2a, W6).
+
 v0.6 takes in the findings of `design-review-2026-11-19.md` (an AI-written
 review, not the human specialist review still required): a separate
 contact identity (section 2a), key locators in the sender's recovery copy,
@@ -120,12 +126,15 @@ half-open convention is used everywhere. A one-second window, as in the
 alternative protocol's reference profile, would be includable in roughly
 one block in six on a 6-second chain.
 
-**P10. Encrypted payload size is open.** The prototype's stranger note
-(667 bytes since the deniable format v4 of 2026-11-20; 587 and 427 bytes
-before)
-cannot carry a quantum-resistant key exchange (ML-KEM-768 alone needs 1,088
-bytes). The model treats payloads as opaque fixed-size slots; the size and
-the encryption suite are for the cryptographer to fix.
+**P10. Encrypted payload slots (sizes proposed 2026-11-20, unreviewed).**
+Every transaction carries exactly three slots, the same in every branch:
+two *coin-note* slots of 200 bytes (a note's delivery data, or the
+sender's recovery copy) and one *stranger-note* slot of 1,787 bytes, sized
+for the hybrid post-quantum note (format v5: admission commitment 32,
+ML-KEM-768 ciphertext 1,088, Noise Xpsk0 message 667). A slot with nothing
+to carry holds a dummy of the same shape (W4). The stranger-note slot is
+prunable (section 4). The sizes and the encryption suite remain for the
+cryptographer to confirm.
 
 ## 2a. Contact identity (new in v0.6; review findings H3, H4)
 
@@ -141,8 +150,14 @@ whatever the payment proofs hide. Rules:
    hold several contact identities.
 2. **Contact card.** What a user hands out or lists publicly, signed by
    the contact signing key: that signing key, a handshake key, an inbox
-   key for sealed notes, a price and a validity period. The three keys
-   have separate roles and none is a wallet key.
+   key for sealed notes, a post-quantum inbox key (ML-KEM-768, 1,184
+   bytes; added 2026-11-20), the network, a price and a validity period.
+   The keys have separate roles and none is a wallet key. The signature
+   covers a 32-byte hash of the post-quantum key
+   (`BLAKE2s("anonymum/pq-inbox-key/v1" || key)`), not the key itself, so
+   a note can carry the hash in place of the key. Prototype card: 1,408
+   bytes. The handshake key has no post-quantum counterpart: post-quantum
+   callbacks are to be negotiated off-chain later.
 3. **Handshake: answer only authorised callers.** (Rewritten in v0.7.
    v0.6 said the caller should prove it knows the answerer's contact key.
    That is not enough: anyone can know a public card. Correction from the
@@ -189,9 +204,17 @@ whatever the payment proofs hide. Rules:
      Noise X authenticates by Diffie-Hellman rather than by a signature;
      the rest of the sender's signed card travels inside, so the recipient
      learns the contact identity (the card's signature covers the card, not
-     the act of contacting). The note field is 667 bytes.
-   - **The cost.** Anyone holding the recipient's inbox secret can make a
-     note that opens as if from any sender whose card they have.
+     the act of contacting).
+   - **Hybrid post-quantum confidentiality** (format v5, 2026-11-20,
+     prototyped, unreviewed). The sender encapsulates to the recipient's
+     post-quantum inbox key (ML-KEM-768); the ciphertext is bound into the
+     Noise prologue and the shared secret is the Noise pre-shared key
+     (`Noise_Xpsk0`). Reading a note needs both inbox secrets. Sender
+     authentication stays classical (X25519). The note field is 1,787
+     bytes.
+   - **The cost.** Anyone holding the recipient's X25519 inbox secret can
+     make a note that opens as if from any sender whose card they have
+     (encapsulating to the public post-quantum key needs no secret).
    - **The callback is answered by the key the note authenticated.** The
      recipient calls the sender's handshake key itself, so a forger holding
      only the inbox secret cannot complete the callback. There is no
@@ -253,21 +276,29 @@ blinding is fresh, secret and uniformly random, drawn by the wallet for
 that transaction alone: never derived from anything public, never reused.
 With a hiding commitment, an empty record's commitment then looks exactly
 like a stranger's or an invited request's. (Section 3 already says every
-transaction carries one that "looks the same"; this rule states how.)
+transaction carries one that "looks the same"; this rule states how.) The
+chain can and does check the part that is not secret: a Transfer, Claim,
+Decline or Sender refund whose admission record has a non-zero contact
+key or request digest is rejected at no charge (in the reference model,
+`Reject::NonEmptyAdmission`, 2026-11-20). The blinding cannot be checked.
 
 **W4. Dummy note slots.** A payload slot that carries no note holds a
-real note-shaped object: a Noise X message, built exactly like a real
-note, from a fresh random static key to a fresh random recipient key, at
-the full note length. Not random bytes: an X25519 public key is not a
+real note-shaped object built exactly like a real one: in the
+stranger-note slot, a format v5 note (ML-KEM-768 encapsulation to a fresh
+random post-quantum key, then the Noise Xpsk0 message from a fresh random
+static key to a fresh random inbox key), at the full length. Not random
+bytes: neither an X25519 public key nor an ML-KEM ciphertext is a
 uniformly random string, so random bytes can be told apart from a real
-note's ephemeral key.
+note.
 
 **W5. One pool.** Transfers, invited requests and stranger escrows share
 one note pool and one public fee structure (one identical base fee, O3).
 No transaction type gets a separate pool, tree or fee.
 
 **W6. Open questions** (recorded, not decided): hybrid post-quantum key
-exchange for notes and handshakes, and its size cost, before the note
+exchange for handshakes and callbacks (for notes it is now prototyped:
+format v5, one ML-KEM-768 key per card, 1,408-byte cards and 1,787-byte
+notes), and whether the note's construction is right, before the note
 format is frozen; inbox and handshake key rotation and how a rotated key
 is still recognised as the same contact; a persistently connected wallet
 versus a throwaway listener; the mixnet client's cover traffic; message
@@ -336,7 +367,8 @@ unused slots:
 
 - accepted tree root, chain and version identifiers;
 - a fixed number of nullifiers and of new commitments;
-- a fixed number of encrypted payload slots;
+- three encrypted payload slots of fixed sizes: two coin-note slots and
+  one stranger-note slot (P10);
 - a validity window `[not_before, not_after)`: one cell of the single
   window grid in P11, half-open (I1);
 - the admission record's commitment;
@@ -344,6 +376,18 @@ unused slots:
 - a proof that the hidden statement below holds.
 
 Nothing public says which kind of transaction it is.
+
+**The stranger-note slot is prunable** (proposed 2026-11-20, unreviewed).
+Nodes keep each transaction's stranger-note slot for 24 hours from the
+start of its validity window, then may discard it: a request lives 24
+hours (O4), so no recipient needs the note afterwards. The tree, the
+nullifiers, the admission commitment and the coin-note slots stay
+permanent; pruning changes none of them. Open (I28): the proof is bound
+to the payload slots (statement 6), so a node that syncs history after a
+note was pruned cannot recheck that proof unless the chain keeps a
+commitment to the pruned slot (for example its 32-byte hash) that the
+proof binds to instead. The reference model prunes the bytes and keeps
+no such hash.
 
 Hidden statement, common part:
 
@@ -361,7 +405,7 @@ Branches:
 
 | Branch | Spends | Creates | Authority | Time condition |
 |---|---|---|---|---|
-| Transfer | ordinary notes | ordinary notes; empty admission record | owners | none |
+| Transfer | ordinary notes | ordinary notes; empty admission record (W3) | owners | none |
 | Invited request | ordinary notes | change; admission record with tier "invited" and no escrow | owners | none |
 | Open (stranger request) | ordinary notes | one escrow note with `fee_reserve = F`; a retired note of `S`; change; admission record with tier "stranger" naming that escrow | owners | none |
 | Claim | one escrow note | ordinary note of `price` owned by `recipient`; empty admission record (W3) | `recipient` | `not_after <= created_at + 24h` |
@@ -423,9 +467,13 @@ refund. Writing this copy correctly is in the sender's own interest, so it
 is not proven. The copy also records how to derive the refund identity and
 the cancel authority (which key purpose and index), so a restored wallet
 derives both directly and never has to search for them (review H2). The
-copy sits in a payload slot together with a fresh random
-nonce, so a restored wallet makes one decryption attempt per payload, the
-same work as finding any other note (I11).
+copy sits in a coin-note slot together with a fresh random
+nonce, so a restored wallet makes one decryption attempt per coin-note
+slot, the same work as finding any other note (I11). To fit the 200-byte
+slot, the copy records the escrow's price, reserve, recipient, seed and
+blinding and the two key paths, but not the refund identity and cancel
+authority themselves: the wallet derives both from the key paths, and the
+escrow commitment confirms them when the escrow is found.
 
 **Finding a refund.** A wallet does not look for the expected refund
 commitment anywhere in history. It first finds the finalised transaction

@@ -15,27 +15,35 @@
 //!
 //! The copy is sealed with ChaCha20-Poly1305 (the `chacha20poly1305` crate)
 //! and stored with its fresh random nonce, so a restored wallet makes one
-//! decryption attempt per payload slot (spec v0.5, I11). How the key is
-//! derived is a model choice, not a reviewed design (spec question 9).
+//! decryption attempt per coin-note payload slot (spec v0.5, I11). How the
+//! key is derived is a model choice, not a reviewed design (spec question 9).
+//!
+//! The copy fits one 200-byte coin slot: it records the escrow's price,
+//! reserve, recipient, seed and blinding plus the two key paths, but not the
+//! refund and cancel authorities, which the wallet re-derives from the paths
+//! (they are checked against the escrow commitment when it is found).
 
 use std::collections::HashSet;
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
-use crate::chain::{Chain, PAYLOAD_LEN};
+use crate::chain::{Chain, COIN_PAYLOAD_LEN, N_COIN};
 use crate::hash::{h, Hash};
 use crate::objects::*;
 
 const NONCE_BYTES: usize = 12;
-const ESCROW_BYTES: usize = 8 + 8 + 32 * 5;
+/// Price, fee reserve, recipient, seed, blinding (the authorities are
+/// re-derived from the key paths).
+const ESCROW_BYTES: usize = 8 + 8 + 32 * 3;
 const PURPOSE_BYTES: usize = 16;
 const PATH_BYTES: usize = PURPOSE_BYTES + 8;
 const TAG_BYTES: usize = 16;
-const PLAIN_BYTES: usize = ESCROW_BYTES + 2 * PATH_BYTES;
+const PAD_BYTES: usize = COIN_PAYLOAD_LEN - NONCE_BYTES - TAG_BYTES - ESCROW_BYTES - 2 * PATH_BYTES;
+const PLAIN_BYTES: usize = ESCROW_BYTES + 2 * PATH_BYTES + PAD_BYTES;
 const _: () = assert!(
-    NONCE_BYTES + PLAIN_BYTES + TAG_BYTES == PAYLOAD_LEN,
-    "a recovery copy (nonce + sealed escrow and key paths) fills one payload slot"
+    NONCE_BYTES + PLAIN_BYTES + TAG_BYTES == COIN_PAYLOAD_LEN,
+    "a recovery copy (nonce + sealed escrow fields and key paths) fills one coin slot"
 );
 
 /// How a wallet derives one of its secrets: a purpose and an index.
@@ -131,7 +139,7 @@ impl Wallet {
         let mut plain = Vec::with_capacity(PLAIN_BYTES);
         plain.extend_from_slice(&escrow.price.to_le_bytes());
         plain.extend_from_slice(&escrow.fee_reserve.to_le_bytes());
-        for part in [&escrow.recipient.0, &escrow.refund_to.0, &escrow.canceller.0, &escrow.seed, &escrow.blinding] {
+        for part in [&escrow.recipient.0, &escrow.seed, &escrow.blinding] {
             plain.extend_from_slice(part);
         }
         for path in [refund, cancel] {
@@ -144,6 +152,7 @@ impl Wallet {
             plain.extend_from_slice(&field);
             plain.extend_from_slice(&path.index.to_le_bytes());
         }
+        plain.extend_from_slice(&[0u8; PAD_BYTES]);
         let sealed = self
             .recovery_cipher()
             .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
@@ -155,15 +164,12 @@ impl Wallet {
     /// recovery copies? Its key paths must derive the authorities the escrow
     /// names, so a restored wallet can act on what it returns.
     pub fn open_recovery(&self, slot: &[u8]) -> Option<Recovered> {
-        if slot.len() != PAYLOAD_LEN {
+        if slot.len() != COIN_PAYLOAD_LEN {
             return None;
         }
         let (nonce, sealed) = slot.split_at(NONCE_BYTES);
         let plain = self.recovery_cipher().decrypt(Nonce::from_slice(nonce), sealed).ok()?;
-        let recovered = decode(&plain)?;
-        let ok = self.secret_at(&recovered.refund).authority() == recovered.escrow.refund_to
-            && self.secret_at(&recovered.cancel).authority() == recovered.escrow.canceller;
-        ok.then_some(recovered)
+        self.decode(&plain)
     }
 
     /// Every escrow this wallet opened that the chain holds, recovered from
@@ -171,7 +177,7 @@ impl Wallet {
     pub fn recover_escrows(&self, chain: &Chain) -> Vec<Recovered> {
         let on_chain: HashSet<Commitment> = chain.leaves().iter().map(|l| l.commitment).collect();
         let mut found: Vec<Recovered> = Vec::new();
-        for slot in chain.log().iter().flat_map(|tx| tx.payloads.iter()) {
+        for slot in chain.log().iter().flat_map(|tx| tx.payloads[..N_COIN].iter()) {
             if let Some(r) = self.open_recovery(slot) {
                 if on_chain.contains(&Note::Escrow(r.escrow).commitment()) && !found.contains(&r) {
                     found.push(r);
@@ -231,35 +237,37 @@ pub fn escrow_status(chain: &Chain, escrow: &EscrowNote, escrow_position: u64) -
         .unwrap_or(EscrowStatus::ResolvedWithoutRefund { tx_index })
 }
 
-fn decode(plain: &[u8]) -> Option<Recovered> {
-    if plain.len() != PLAIN_BYTES {
-        return None;
-    }
-    let u64_at = |at: usize| u64::from_le_bytes(plain[at..at + 8].try_into().expect("8 bytes"));
-    let h_at = |at: usize| -> Hash { plain[at..at + 32].try_into().expect("32 bytes") };
-    let escrow = EscrowNote {
-        price: u64_at(0),
-        fee_reserve: u64_at(8),
-        recipient: Authority(h_at(16)),
-        refund_to: Authority(h_at(48)),
-        canceller: Authority(h_at(80)),
-        seed: h_at(112),
-        blinding: h_at(144),
-    };
-    let path_at = |at: usize| -> Option<KeyPath> {
-        let field = &plain[at..at + PURPOSE_BYTES];
-        let end = field.iter().position(|b| *b == 0).unwrap_or(PURPOSE_BYTES);
-        if field[end..].iter().any(|b| *b != 0) {
-            return None; // not zero-padded: not something this wallet wrote
+impl Wallet {
+    /// The escrow and key paths in a recovery copy's plaintext; the refund
+    /// and cancel authorities are derived from the paths.
+    fn decode(&self, plain: &[u8]) -> Option<Recovered> {
+        if plain.len() != PLAIN_BYTES || plain[ESCROW_BYTES + 2 * PATH_BYTES..].iter().any(|b| *b != 0) {
+            return None;
         }
-        let purpose = String::from_utf8(field[..end].to_vec()).ok()?;
-        Some(KeyPath { purpose, index: u64_at(at + PURPOSE_BYTES) })
-    };
-    Some(Recovered {
-        escrow,
-        refund: path_at(ESCROW_BYTES)?,
-        cancel: path_at(ESCROW_BYTES + PATH_BYTES)?,
-    })
+        let u64_at = |at: usize| u64::from_le_bytes(plain[at..at + 8].try_into().expect("8 bytes"));
+        let h_at = |at: usize| -> Hash { plain[at..at + 32].try_into().expect("32 bytes") };
+        let path_at = |at: usize| -> Option<KeyPath> {
+            let field = &plain[at..at + PURPOSE_BYTES];
+            let end = field.iter().position(|b| *b == 0).unwrap_or(PURPOSE_BYTES);
+            if field[end..].iter().any(|b| *b != 0) {
+                return None; // not zero-padded: not something this wallet wrote
+            }
+            let purpose = String::from_utf8(field[..end].to_vec()).ok()?;
+            Some(KeyPath { purpose, index: u64_at(at + PURPOSE_BYTES) })
+        };
+        let refund = path_at(ESCROW_BYTES)?;
+        let cancel = path_at(ESCROW_BYTES + PATH_BYTES)?;
+        let escrow = EscrowNote {
+            price: u64_at(0),
+            fee_reserve: u64_at(8),
+            recipient: Authority(h_at(16)),
+            refund_to: self.secret_at(&refund).authority(),
+            canceller: self.secret_at(&cancel).authority(),
+            seed: h_at(48),
+            blinding: h_at(80),
+        };
+        Some(Recovered { escrow, refund, cancel })
+    }
 }
 
 /// Every position at which a note with this commitment sits. A match alone

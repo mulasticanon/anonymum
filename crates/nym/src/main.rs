@@ -310,7 +310,7 @@ async fn run() -> Result<(), AnyError> {
     let intro = "Hello Bob, it's Carol from the climbing club. Can we talk about Saturday?";
     let note = seal_note(
         &NETWORK,
-        &card.inbox_key,
+        &card,
         &carol,
         &carol_card,
         &throwaway_route.to_bytes(),
@@ -556,13 +556,13 @@ fn fixed<const N: usize>(text: &str) -> Result<[u8; N], AnyError> {
 }
 
 /// `name=hex` lines from a key file.
-fn field(path: &str, name: &str) -> Result<[u8; 32], AnyError> {
+fn field<const N: usize>(path: &str, name: &str) -> Result<[u8; N], AnyError> {
     let text = std::fs::read_to_string(path)?;
     let line = text
         .lines()
         .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')))
         .ok_or(format!("{path}: no {name}"))?;
-    fixed::<32>(line)
+    fixed::<N>(line)
 }
 
 fn load_wallet(path: &str) -> Result<Identity, AnyError> {
@@ -574,6 +574,7 @@ fn load_contact(path: &str) -> Result<ContactIdentity, AnyError> {
         field(path, "contact_signing")?,
         field(path, "contact_handshake")?,
         field(path, "contact_inbox")?,
+        field(path, "contact_pq")?,
     ))
 }
 
@@ -581,16 +582,17 @@ fn cmd_wallet(args: &[String]) -> Result<(), AnyError> {
     let path = args.first().ok_or("usage: wallet <file>")?;
     if !std::path::Path::new(path).exists() {
         let (signing, messaging) = Identity::generate().to_secret_bytes();
-        let (cs, ch, ci) = ContactIdentity::generate().to_secret_bytes();
+        let (cs, ch, ci, cpq) = ContactIdentity::generate().to_secret_bytes();
         std::fs::write(
             path,
             format!(
-                "signing={}\nmessaging={}\ncontact_signing={}\ncontact_handshake={}\ncontact_inbox={}\n",
+                "signing={}\nmessaging={}\ncontact_signing={}\ncontact_handshake={}\ncontact_inbox={}\ncontact_pq={}\n",
                 to_hex(&signing),
                 to_hex(&messaging),
                 to_hex(&cs),
                 to_hex(&ch),
-                to_hex(&ci)
+                to_hex(&ci),
+                to_hex(&cpq)
             ),
         )?;
     }
@@ -623,7 +625,7 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
     let admission = random_bytes();
     let note = seal_note(
         &NETWORK,
-        &card.inbox_key,
+        &card,
         &sender,
         &sender_card,
         &fixed::<96>(flag(args, "--reply")?)?,

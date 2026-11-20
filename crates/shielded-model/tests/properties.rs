@@ -723,7 +723,7 @@ fn a_relay_that_alters_payload_bytes_invalidates_the_transaction() {
     let (mut public, witness) = TxBuilder::new(Branch::Transfer, b"t")
         .spend(w.notes[0], 0, 0, p.sender)
         .output(ordinary(100 - F, &p.sender, "c"))
-        .payload(0, vec![7; anonymum_shielded_model::chain::PAYLOAD_LEN])
+        .payload(0, vec![7; anonymum_shielded_model::chain::COIN_PAYLOAD_LEN])
         .build(&w.chain, w.time);
     public.payloads[0][5] ^= 1;
     assert_eq!(w.submit(&public, &witness), Err(Reject::BindingMismatch));

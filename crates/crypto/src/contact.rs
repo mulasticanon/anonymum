@@ -7,7 +7,10 @@
 //!
 //! * a **contact signing key** (Ed25519) signs the card and invitations;
 //! * a **handshake key** (X25519) is the Noise static key callers reach;
-//! * an **inbox key** (X25519) opens sealed notes from strangers.
+//! * an **inbox key** (X25519) opens sealed notes from strangers;
+//! * a **post-quantum inbox key** (ML-KEM-768, FIPS 203, via the RustCrypto
+//!   `ml-kem` crate) is combined with the inbox key in the hybrid note (v5).
+//!   The handshake key has no post-quantum counterpart yet.
 //!
 //! Callers use *caller keys* ([`StaticKey`]) scoped to one relationship or
 //! one request; an invitation is issued to such a holder key.
@@ -17,7 +20,10 @@
 
 use std::fmt;
 
+use blake2::{Blake2s256, Digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ml_kem::{Decapsulate, Encapsulate, KeyExport};
+use ml_kem::{DecapsulationKey768, EncapsulationKey768};
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -44,6 +50,34 @@ pub enum ContactError {
     PriceOutOfRange,
     /// An invitation that was cancelled by a block or a removal.
     Revoked,
+    /// An ML-KEM-768 encapsulation key that does not decode (FIPS 203 check).
+    BadPqKey,
+}
+
+/// Length of an ML-KEM-768 encapsulation key.
+pub const PQ_KEY_LEN: usize = 1_184;
+/// Length of an ML-KEM-768 ciphertext.
+pub const PQ_CIPHERTEXT_LEN: usize = 1_088;
+/// Length of the seed an ML-KEM-768 decapsulation key is derived from.
+pub const PQ_SEED_LEN: usize = 64;
+
+/// The 32-byte commitment to a post-quantum inbox key that the card
+/// signature covers: `BLAKE2s-256("anonymum/pq-inbox-key/v1" || key)`. A note
+/// carries this hash instead of the 1,184-byte key.
+pub fn pq_key_hash(key: &[u8; PQ_KEY_LEN]) -> [u8; 32] {
+    Blake2s256::new().chain_update(b"anonymum/pq-inbox-key/v1").chain_update(key).finalize().into()
+}
+
+/// The ML-KEM-768 encapsulation key in `bytes`, if it passes FIPS 203's
+/// input check.
+pub(crate) fn pq_encapsulation_key(bytes: &[u8; PQ_KEY_LEN]) -> Result<EncapsulationKey768, ContactError> {
+    EncapsulationKey768::new(&(*bytes).into()).map_err(|_| ContactError::BadPqKey)
+}
+
+/// Encapsulate to `key`: the ciphertext and the 32-byte shared secret.
+pub(crate) fn pq_encapsulate(key: &[u8; PQ_KEY_LEN]) -> Result<([u8; PQ_CIPHERTEXT_LEN], [u8; 32]), ContactError> {
+    let (ciphertext, shared) = pq_encapsulation_key(key)?.encapsulate();
+    Ok((ciphertext.into(), shared.into()))
 }
 
 impl fmt::Display for ContactError {
@@ -122,34 +156,57 @@ impl fmt::Debug for StaticKey {
     }
 }
 
-/// A contact identity: signing, handshake and inbox keys.
+/// A contact identity: signing, handshake and inbox keys, and the seed of
+/// the post-quantum inbox key.
 pub struct ContactIdentity {
     signing: SigningKey,
     handshake: StaticKey,
     inbox: StaticKey,
+    pq_seed: Zeroizing<[u8; PQ_SEED_LEN]>,
 }
 
 impl ContactIdentity {
     pub fn generate() -> Self {
+        let mut pq_seed = Zeroizing::new([0u8; PQ_SEED_LEN]);
+        OsRng.fill_bytes(pq_seed.as_mut());
         ContactIdentity {
             signing: SigningKey::generate(&mut OsRng),
             handshake: StaticKey::generate(),
             inbox: StaticKey::generate(),
+            pq_seed,
         }
     }
 
-    /// Restore from the three secrets (signing, handshake, inbox).
-    pub fn from_secret_bytes(signing: [u8; 32], handshake: [u8; 32], inbox: [u8; 32]) -> Self {
+    /// Restore from the four secrets (signing, handshake, inbox, and the
+    /// 64-byte seed of the post-quantum inbox key).
+    pub fn from_secret_bytes(signing: [u8; 32], handshake: [u8; 32], inbox: [u8; 32], pq_seed: [u8; PQ_SEED_LEN]) -> Self {
         ContactIdentity {
             signing: SigningKey::from_bytes(&signing),
             handshake: StaticKey::from_bytes(handshake),
             inbox: StaticKey::from_bytes(inbox),
+            pq_seed: Zeroizing::new(pq_seed),
         }
     }
 
-    /// The three secrets, for encrypted storage. Handle with care.
-    pub fn to_secret_bytes(&self) -> ([u8; 32], [u8; 32], [u8; 32]) {
-        (self.signing.to_bytes(), self.handshake.to_bytes(), self.inbox.to_bytes())
+    /// The four secrets, for encrypted storage. Handle with care.
+    pub fn to_secret_bytes(&self) -> ([u8; 32], [u8; 32], [u8; 32], [u8; PQ_SEED_LEN]) {
+        (self.signing.to_bytes(), self.handshake.to_bytes(), self.inbox.to_bytes(), *self.pq_seed)
+    }
+
+    fn pq_decapsulation_key(&self) -> DecapsulationKey768 {
+        DecapsulationKey768::from_seed((*self.pq_seed).into())
+    }
+
+    /// The post-quantum inbox key (ML-KEM-768 encapsulation key) for the card.
+    pub fn pq_inbox_key(&self) -> [u8; PQ_KEY_LEN] {
+        self.pq_decapsulation_key().encapsulation_key().to_bytes().into()
+    }
+
+    /// The shared secret in `ciphertext`, as ML-KEM decapsulates it (an
+    /// unrelated value for a ciphertext not made for this key: FIPS 203's
+    /// implicit rejection).
+    pub(crate) fn pq_decapsulate(&self, ciphertext: &[u8; PQ_CIPHERTEXT_LEN]) -> [u8; 32] {
+        self.pq_decapsulation_key().decapsulate(&(*ciphertext).into()).into()
     }
 
     /// The public contact signing key: who this contact is.
@@ -177,12 +234,13 @@ impl ContactIdentity {
             signing_key: self.signing_key(),
             handshake_key: self.handshake.public(),
             inbox_key: self.inbox.public(),
+            pq_inbox_key: self.pq_inbox_key(),
             price,
             not_before,
             not_after,
             signature: [0; 64],
         };
-        card.signature = self.sign(&card.signed_bytes());
+        card.signature = self.sign(&card.summary().signed_bytes());
         card
     }
 
@@ -212,30 +270,54 @@ fn take<const N: usize>(bytes: &[u8], at: &mut usize) -> [u8; N] {
 // ---- contact card ------------------------------------------------------------
 
 /// What a user hands out or lists publicly, signed by the contact signing key.
-/// Valid on one network only (issue I20).
+/// Valid on one network only (issue I20). Format v3: the signature covers a
+/// 32-byte hash of the post-quantum inbox key ([`pq_key_hash`]), not the
+/// 1,184 bytes themselves, so a note can carry the hash and the recipient
+/// can still check the card.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ContactCard {
     pub network: Network,
     pub signing_key: [u8; 32],
     pub handshake_key: [u8; 32],
     pub inbox_key: [u8; 32],
+    pub pq_inbox_key: [u8; PQ_KEY_LEN],
     pub price: Amount,
     pub not_before: u64,
     pub not_after: u64,
     pub signature: [u8; 64],
 }
 
-impl ContactCard {
-    /// Serialised length.
-    pub const LEN: usize = 32 + 32 * 3 + 16 + 8 + 8 + 64;
+/// A card's signed content with the post-quantum key replaced by its hash:
+/// what a note carries about its sender, and what the signature covers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CardSummary {
+    pub network: Network,
+    pub signing_key: [u8; 32],
+    pub handshake_key: [u8; 32],
+    pub inbox_key: [u8; 32],
+    pub pq_inbox_hash: [u8; 32],
+    pub price: Amount,
+    pub not_before: u64,
+    pub not_after: u64,
+    pub signature: [u8; 64],
+}
 
-    fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = b"anonymum/contact-card/v2".to_vec();
-        out.extend_from_slice(&self.to_bytes()[..Self::LEN - 64]);
+impl CardSummary {
+    /// The bytes the card's signature covers (card format v3).
+    pub(crate) fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = b"anonymum/contact-card/v3".to_vec();
+        out.extend_from_slice(&self.network);
+        out.extend_from_slice(&self.signing_key);
+        out.extend_from_slice(&self.handshake_key);
+        out.extend_from_slice(&self.inbox_key);
+        out.extend_from_slice(&self.pq_inbox_hash);
+        out.extend_from_slice(&self.price.to_be_bytes());
+        out.extend_from_slice(&self.not_before.to_be_bytes());
+        out.extend_from_slice(&self.not_after.to_be_bytes());
         out
     }
 
-    /// Signature, network, keys, price and validity at time `now`.
+    /// Signature, network, X25519 keys, price and validity at time `now`.
     pub fn verify(&self, network: &Network, now: u64) -> Result<(), ContactError> {
         verify(&self.signing_key, &self.signed_bytes(), &self.signature)?;
         if &self.network != network {
@@ -254,6 +336,35 @@ impl ContactCard {
         }
         Ok(())
     }
+}
+
+impl ContactCard {
+    /// Serialised length: network, three X25519 keys, the ML-KEM-768 key,
+    /// price, validity and signature.
+    pub const LEN: usize = 32 + 32 * 3 + PQ_KEY_LEN + 16 + 8 + 8 + 64;
+
+    /// The signed content with the post-quantum key hashed.
+    pub fn summary(&self) -> CardSummary {
+        CardSummary {
+            network: self.network,
+            signing_key: self.signing_key,
+            handshake_key: self.handshake_key,
+            inbox_key: self.inbox_key,
+            pq_inbox_hash: pq_key_hash(&self.pq_inbox_key),
+            price: self.price,
+            not_before: self.not_before,
+            not_after: self.not_after,
+            signature: self.signature,
+        }
+    }
+
+    /// Signature, network, keys (including the post-quantum key's FIPS 203
+    /// check), price and validity at time `now`.
+    pub fn verify(&self, network: &Network, now: u64) -> Result<(), ContactError> {
+        self.summary().verify(network, now)?;
+        pq_encapsulation_key(&self.pq_inbox_key)?;
+        Ok(())
+    }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::LEN);
@@ -261,6 +372,7 @@ impl ContactCard {
         out.extend_from_slice(&self.signing_key);
         out.extend_from_slice(&self.handshake_key);
         out.extend_from_slice(&self.inbox_key);
+        out.extend_from_slice(&self.pq_inbox_key);
         out.extend_from_slice(&self.price.to_be_bytes());
         out.extend_from_slice(&self.not_before.to_be_bytes());
         out.extend_from_slice(&self.not_after.to_be_bytes());
@@ -278,6 +390,7 @@ impl ContactCard {
             signing_key: take(bytes, at),
             handshake_key: take(bytes, at),
             inbox_key: take(bytes, at),
+            pq_inbox_key: take(bytes, at),
             price: u128::from_be_bytes(take(bytes, at)),
             not_before: u64::from_be_bytes(take(bytes, at)),
             not_after: u64::from_be_bytes(take(bytes, at)),
@@ -429,7 +542,7 @@ pub(crate) mod tests {
         let mut card = id.card(NET, price, 0, 100);
         card.handshake_key = handshake;
         card.inbox_key = inbox;
-        card.signature = id.sign(&card.signed_bytes());
+        card.signature = id.sign(&card.summary().signed_bytes());
         card
     }
 
@@ -452,6 +565,19 @@ pub(crate) mod tests {
             assert_eq!(signed_card(&id, good, weak, 1).verify(&NET, 50), Err(ContactError::WeakKey));
         }
         assert_eq!(signed_card(&id, good, StaticKey::generate().public(), 1).verify(&NET, 50), Ok(()));
+    }
+
+    #[test]
+    fn a_signed_card_with_an_invalid_post_quantum_key_is_refused() {
+        // Signed by its holder, so only the FIPS 203 input check catches it:
+        // coefficients of 0xFFF are not below the ML-KEM modulus.
+        let id = ContactIdentity::generate();
+        let mut card = id.card(NET, 1, 0, 100);
+        card.pq_inbox_key = [0xFF; PQ_KEY_LEN];
+        card.signature = id.sign(&card.summary().signed_bytes());
+        assert_eq!(card.summary().verify(&NET, 50), Ok(()), "the signature itself is fine");
+        assert_eq!(card.verify(&NET, 50), Err(ContactError::BadPqKey));
+        assert_eq!(id.card(NET, 1, 0, 100).verify(&NET, 50), Ok(()));
     }
 
     #[test]

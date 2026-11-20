@@ -16,7 +16,7 @@ const INVITE_FEE = COIN / 100n;
 const COLD_FEE = COIN / 2n;
 const DECLINE_FEE = COIN / 100n;
 // Hex, because Polkadot.js reads a raw Uint8Array as already length-prefixed.
-const NOTE = u8aToHex(new Uint8Array(667).fill(0xab));
+const NOTE = u8aToHex(new Uint8Array(1787).fill(0xab));
 
 await cryptoWaitReady();
 const api = await ApiPromise.create({ provider: new WsProvider('ws://127.0.0.1:9944'), noInitWarn: true });
@@ -113,7 +113,7 @@ const aliceChannel = r.events.find((e) => e.method === 'ChannelOpened').data[0].
 console.log('\n3. Charlie, a stranger, pays to reach Bob with a sealed note; Bob accepts.');
 before = await account(charlie);
 r = await send(charlie, api.tx.anonymum.requestContact(bob.address, COIN, NOTE));
-check(r.error === null && eventNames(r).includes('ContactRequested'), 'request on chain with its 667-byte note');
+check(r.error === null && eventNames(r).includes('ContactRequested'), 'request on chain with its 1,787-byte note');
 after = await account(charlie);
 check(before.free - after.free === COLD_FEE + COIN + r.fee, 'Charlie paid 0.5 network fee + 1.0 price + transaction fee');
 check(after.held - before.held === COIN, 'the 1.0 price is held in escrow');

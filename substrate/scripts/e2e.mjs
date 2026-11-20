@@ -144,7 +144,7 @@ try {
   const keepFile = join(carolDir, 'carol.keep');
   const { note } = rust('seal', '--card', bob.card, '--sender', join(carolDir, 'carol.wallet'),
     '--reply', throwaway.address, '--intro', INTRO, '--keep', keepFile);
-  check(note.length === 2 * 667, 'sealed note is 667 bytes (admission commitment + Noise X via snow)');
+  check(note.length === 2 * 1787, 'sealed note is 1,787 bytes (admission commitment + ML-KEM-768 ciphertext + Noise Xpsk0 via snow)');
   check(!note.includes(carol.address) && !note.includes(bob.address), 'no wallet address in the note');
   r = await send(carolAccount, api.tx.anonymum.requestContact(bobAccount.address, COIN, '0x' + note));
   const requested = r.events.find((e) => e.method === 'ContactRequested');
