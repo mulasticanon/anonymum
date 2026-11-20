@@ -10,6 +10,8 @@ publish = false
 codec = { workspace = true }
 scale-info = { workspace = true }
 log = { version = "0.4.22", default-features = false }
+# Only to refuse weak (small-order) invite keys at registration; no_std.
+ed25519-dalek = { version = "2.2.0", default-features = false }
 polkadot-sdk = { workspace = true, features = ["experimental", "runtime"] }
 
 [dev-dependencies]
@@ -17,4 +19,4 @@ polkadot-sdk = { workspace = true, features = ["experimental", "runtime", "palle
 
 [features]
 default = ["std"]
-std = ["codec/std", "log/std", "polkadot-sdk/std", "scale-info/std"]
+std = ["codec/std", "ed25519-dalek/std", "log/std", "polkadot-sdk/std", "scale-info/std"]

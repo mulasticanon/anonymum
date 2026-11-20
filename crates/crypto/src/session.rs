@@ -217,9 +217,13 @@ impl Session {
         if plaintext.len() > MAX_PLAINTEXT {
             return Err(SessionError::TooLarge);
         }
-        // Noise reserves the last nonce value; refuse rather than wrap.
+        // Noise reserves the nonce u64::MAX; u64::MAX - 1 is the last one
+        // used. Refuse rather than wrap.
         let nonce = self.next_send;
-        let next = nonce.checked_add(1).filter(|n| *n < u64::MAX).ok_or(SessionError::Exhausted)?;
+        if nonce == u64::MAX {
+            return Err(SessionError::Exhausted);
+        }
+        let next = nonce + 1;
         let mut out = vec![0u8; NONCE_LEN + plaintext.len() + TAG_LEN];
         out[..NONCE_LEN].copy_from_slice(&nonce.to_le_bytes());
         let n = self.transport.write_message(nonce, plaintext, &mut out[NONCE_LEN..])?;
@@ -494,7 +498,11 @@ mod tests {
         let (mut a, mut b) = connect(&alice, &bob);
         // u64::MAX is reserved by Noise; the last usable nonce is MAX - 1.
         a.next_send = u64::MAX - 2;
+        let before = a.seal(b"before").unwrap();
+        assert_eq!(b.open(&before).unwrap(), b"before");
+        assert_eq!(a.next_send, u64::MAX - 1);
         let last = a.seal(b"last").unwrap();
+        assert_eq!(&last[..8], &(u64::MAX - 1).to_le_bytes(), "sealed with nonce MAX - 1");
         assert_eq!(b.open(&last).unwrap(), b"last");
         assert!(matches!(a.seal(b"one too many"), Err(SessionError::Exhausted)));
         assert!(matches!(a.seal(b"still"), Err(SessionError::Exhausted)), "and stays refused");

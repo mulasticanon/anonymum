@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 94 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 96 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -160,10 +160,10 @@ Differences from the in-process simulation:
   benchmarked yet.
 - Invite proofs: the crates check with `ed25519-dalek`'s `verify_strict`,
   the pallet with the runtime's `ed25519_verify` host function, which here
-  follows ZIP 215 (`ed25519-zebra`) and is more permissive: a test shows an
-  invite with a small-order key that anyone can open. Only the invite's
-  owner picks the key, so it hurts no one else today, but the two checks
-  differ.
+  follows ZIP 215 (`ed25519-zebra`) and is more permissive: it would accept
+  a trivial proof for a small-order key. The pallet therefore refuses weak
+  invite keys at registration (`ed25519-dalek`'s `is_weak`), but the two
+  proof checks still differ in other edge cases.
 - Balances are `u128` everywhere: simulation, pallet mock and dev runtime
   (the runtime used `u64` until 2026-11-18).
 - Expiry uses one queue per block; at most `MaxRequestsPerBlock` (256)

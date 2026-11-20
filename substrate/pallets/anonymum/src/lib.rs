@@ -17,9 +17,10 @@
 //!   cofactored check), or `ed25519-dalek`'s non-strict `verify` when the
 //!   node registers `UseDalekExt`; on a live chain the node binary's own
 //!   copy decides. Either way it accepts signatures `verify_strict`
-//!   rejects: `tests.rs` shows an invite with a small-order key that any
-//!   opener can use. Only the invite's owner chooses the key (audit F6;
-//!   2026-11-20 audit HIGH-04).
+//!   rejects; a small-order invite key would let anyone open the invite
+//!   with a trivially made proof. `register_invite` therefore refuses keys
+//!   `ed25519-dalek` cannot decode or calls weak (audit F6; 2026-11-20 audit
+//!   HIGH-04). The proof check itself still differs from `verify_strict`.
 //! * Signed messages (v2) carry the chain's genesis hash, and the key
 //!   binding also the signing account, so a signature made for another
 //!   chain or another account is refused.
@@ -358,6 +359,10 @@ pub mod pallet {
         ExpiryQueueFull,
         /// The invite has no expiry, or it has not passed yet.
         InviteNotExpired,
+        /// The invite key is not a valid Ed25519 key, or is a weak
+        /// (small-order) one that the host signature check would accept
+        /// trivially signed proofs for.
+        WeakInviteKey,
     }
 
     #[pallet::hooks]
@@ -438,6 +443,7 @@ pub mod pallet {
             expires_at: Option<BlockNumberFor<T>>,
         ) -> DispatchResult {
             let owner = ensure_signed(origin)?;
+            ensure!(Self::is_usable_invite_key(&key), Error::<T>::WeakInviteKey);
             ensure!(!Invites::<T>::contains_key(&owner, key), Error::<T>::InviteAlreadyRegistered);
             let deposit = T::InviteDeposit::get();
             Self::hold(HoldReason::InviteDeposit, &owner, deposit)?;
@@ -682,6 +688,14 @@ pub mod pallet {
             let rem = (amount % denom) * bps;
             let up = (rem + denom - 1u32.into()) / denom;
             amount / denom * bps + up
+        }
+
+        /// A key `ed25519-dalek` decodes and does not call weak (small
+        /// order). The host function `ed25519_verify` follows ZIP 215 and
+        /// would accept a trivially made proof for a weak key, so such keys
+        /// are refused before they are stored (2026-11-20 audit HIGH-04).
+        pub fn is_usable_invite_key(key: &InviteKey) -> bool {
+            ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|k| !k.is_weak())
         }
 
         /// The burned share of a network fee, rounded down; cannot overflow.

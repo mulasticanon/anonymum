@@ -999,20 +999,30 @@ fn an_invite_proof_for_another_chain_is_refused() {
 }
 
 #[test]
-fn the_host_ed25519_check_accepts_a_small_order_invite_key() {
-    // Observed, not desired: sp-core 43's native ed25519 verification
-    // follows ZIP 215, so the identity point is a valid key and (R =
-    // identity, S = 0) verifies for every message. `verify_strict` in
-    // anonymum-crypto refuses both (see crates/crypto/tests/crypto.rs).
-    // Only an invite's owner chooses its key, so this makes an invite
-    // anyone can use, at the owner's own choice.
+fn a_weak_invite_key_is_refused_and_charges_nothing() {
+    // The host ed25519 check (ZIP 215) would accept (R = identity, S = 0)
+    // for a small-order key, so such keys are refused at registration.
     new_test_ext().execute_with(|| {
         let mut identity = [0u8; 32];
         identity[0] = 1;
-        assert_ok!(Anonymum::register_invite(signed("bob"), identity, None));
+        // An Ed25519 point of order 8.
+        let order_8: [u8; 32] = [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a,
+            0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+        ];
+        for weak in [identity, order_8] {
+            assert!(!Anonymum::is_usable_invite_key(&weak));
+            assert_noop!(Anonymum::register_invite(signed("bob"), weak, None), Error::<Test>::WeakInviteKey);
+        }
+        // So the trivial proof never gets a key to verify against.
         let mut proof = [0u8; 64];
-        proof[0] = 1; // R = identity, S = 0
-        assert_ok!(Anonymum::open_with_invite(signed("alice"), account("bob"), identity, proof));
+        proof[0] = 1;
+        assert_noop!(
+            Anonymum::open_with_invite(signed("alice"), account("bob"), identity, proof),
+            Error::<Test>::UnknownInvite
+        );
+        // An ordinary key is still accepted.
+        assert_ok!(Anonymum::register_invite(signed("bob"), ed25519::Pair::from_seed(&[4; 32]).public().0, None));
     });
 }
 
@@ -1046,12 +1056,13 @@ fn id_and_sequence_counters_refuse_to_wrap_charging_nothing() {
         assert_noop!(req("carol", "bob", COIN), DispatchError::Arithmetic(ArithmeticError::Overflow));
         crate::pallet::NextId::<Test>::put(u64::MAX - 1);
         assert_ok!(req("carol", "bob", COIN));
+        let key = ed25519::Pair::from_seed(&[5; 32]).public().0;
         crate::pallet::NextSeq::<Test>::put(u64::MAX);
         assert_noop!(
-            Anonymum::register_invite(signed("bob"), [5; 32], None),
+            Anonymum::register_invite(signed("bob"), key, None),
             DispatchError::Arithmetic(ArithmeticError::Overflow)
         );
         crate::pallet::NextSeq::<Test>::put(u64::MAX - 1);
-        assert_ok!(Anonymum::register_invite(signed("bob"), [5; 32], None));
+        assert_ok!(Anonymum::register_invite(signed("bob"), key, None));
     });
 }

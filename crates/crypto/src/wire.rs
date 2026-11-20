@@ -467,9 +467,11 @@ pub struct Responder<T> {
     sessions: HashMap<[u8; 32], Live<T>>,
     /// Reply handle -> the caller key whose session answers on it.
     routes: HashMap<T, [u8; 32]>,
-    /// A new handle a caller repeated its CONFIRM from. The session moves
-    /// there only when a fresh data frame from it decrypts, so a replayed
-    /// CONFIRM cannot redirect anyone's replies.
+    /// A new handle a caller repeated its CONFIRM from, at most one per
+    /// caller (a newer one replaces it). The session moves there only when a
+    /// fresh data frame from it decrypts, so a replayed CONFIRM cannot
+    /// redirect anyone's replies, and replaying it from many handles cannot
+    /// grow this table.
     candidates: HashMap<T, [u8; 32]>,
 }
 
@@ -751,6 +753,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
             let live = self.admitted(caller)?;
             let (ack, handle) = (live.ack.clone(), live.handle.clone());
             if handle != from {
+                self.candidates.retain(|_, c| *c != caller);
                 self.candidates.insert(from, caller);
             }
             return Ok(ResponderEvent::Reply(ack));
@@ -783,7 +786,10 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         self.candidates.retain(|t, c| *c != peer && *t != from);
         if let Some(other) = self.routes.insert(from.clone(), peer) {
             if other != peer {
-                self.sessions.remove(&other); // a handle answers one caller
+                // A handle answers one caller: the other caller's session
+                // and candidate handles go.
+                self.sessions.remove(&other);
+                self.candidates.retain(|_, c| *c != other);
             }
         }
         let ack = handshake_frame(ACK, at, &pending.session.seal(&control(ACK, at, ACK_MARKER))?);
@@ -812,6 +818,11 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     /// How many answered handshakes are waiting for a CONFIRM.
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// How many candidate handles are remembered (at most one per caller).
+    pub fn candidate_handles(&self) -> usize {
+        self.candidates.len()
     }
 
     /// How many live sessions there are (one per caller key).

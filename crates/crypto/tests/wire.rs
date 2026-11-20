@@ -813,3 +813,38 @@ fn the_session_cap_refuses_a_new_caller_and_commits_nothing() {
     let ack = established(bob.handle(3, &confirm).unwrap(), &dave);
     assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
 }
+
+#[test]
+fn replaying_a_confirm_from_many_handles_keeps_one_candidate() {
+    let mut bob = Bob::new();
+    let alice = bob.invite();
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    let ack = established(bob.handle(1, &confirm).unwrap(), &alice);
+    assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
+    for tag in 1_000..1_200 {
+        let _ = bob.handle(tag, &confirm);
+    }
+    assert_eq!(bob.side.candidate_handles(), 1, "at most one candidate per caller");
+    assert!(bob.side.is_live(&1));
+    talks(&mut call, &alice, &mut bob, 1);
+}
+
+#[test]
+fn evicting_a_peer_from_a_handle_drops_its_candidates_too() {
+    let mut bob = Bob::new();
+    let (alice, carol) = (bob.invite(), bob.invite());
+    // Alice's session on handle 1, with a candidate handle 7.
+    let (mut call, hello) = bob.call(&alice, POLICY);
+    let welcome = reply(bob.handle(1, &hello).unwrap());
+    let confirm = send(call.handle(&welcome).unwrap());
+    established(bob.handle(1, &confirm).unwrap(), &alice);
+    reply(bob.handle(7, &confirm).unwrap());
+    assert_eq!(bob.side.candidate_handles(), 1);
+    // Carol completes a handshake on handle 1: Alice is evicted from it.
+    let mut carol_call = establish(&carol, &mut bob, 1);
+    assert_eq!(bob.side.candidate_handles(), 0, "Alice's candidate went with her");
+    assert_eq!(bob.side.sessions(), 1);
+    talks(&mut carol_call, &carol, &mut bob, 1);
+}
