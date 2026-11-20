@@ -1,4 +1,4 @@
-# Shielded money: specification v0.6 (draft for review)
+# Shielded money: specification v0.7 (draft for review)
 
 Status: draft, 2026-11-19. Written to be reviewed by a cryptographer and to
 drive a plain-Rust reference model. It is not a security design until it
@@ -137,17 +137,42 @@ whatever the payment proofs hide. Rules:
    encryption key) are generated independently. Nothing in a contact
    identity can spend, view balances or compute a nullifier. A user may
    hold several contact identities.
-2. **Contact card.** What a user hands out or lists publicly: contact
-   signing key, contact encryption key, price, validity period, signed by
-   the contact signing key. It carries no wallet key.
-3. **Handshake.** Sessions authenticate contact identities, never wallet
-   keys. The answering side must not reveal its contact identity to a
-   caller it has not authenticated. In every flow the caller already holds
-   the answerer's contact key (from an invitation, a contact card, or a
-   stranger's note), so the handshake should use a pattern in which the
-   caller proves it knows that key before the answerer reveals anything.
-   The current pattern (Noise XX, answerer reveals first) does not do
-   this. Which pattern replaces it is question 11.
+2. **Contact card.** What a user hands out or lists publicly, signed by
+   the contact signing key: that signing key, a handshake key, an inbox
+   key for sealed notes, a price and a validity period. The three keys
+   have separate roles and none is a wallet key.
+3. **Handshake: answer only authorised callers.** (Rewritten in v0.7.
+   v0.6 said the caller should prove it knows the answerer's contact key.
+   That is not enough: anyone can know a public card. Correction from the
+   owner's ChatGPT consultation of 2026-11-20.) Before sending any reply,
+   the answering side checks that the caller controls a key it has
+   authorised: an invitation it issued, a request it accepted, or an
+   existing contact, still valid and not blocked. Otherwise it sends
+   nothing at all: no handshake reply, no credential, no error.
+   - Proposed pattern: Noise IK. The caller already holds the answerer's
+     handshake key (from the card, invitation or note). IK lets the
+     answerer read the caller's authenticated key in the first message and
+     decide before replying. Noise XX, used today, makes the answerer
+     reveal itself first; Noise XK would make it reply before learning who
+     is calling.
+   - Invited caller: the answerer checks the caller's key against the
+     invitation or contact list, and block status, before message 2.
+   - Paying stranger: reverse rendezvous is kept. The stranger's sealed
+     note carries a fresh callback handshake key and a throwaway route.
+     Once the recipient's claim is final, the recipient calls. The
+     stranger is now the answering side and replies only if the caller is
+     the recipient they addressed.
+   - Uninvited caller: gets no reply.
+   - The reference to the accepted request travels inside the encrypted
+     first message, never in a clear header.
+   - Known cost of IK, for the cryptographer (question 11): the first
+     message can be replayed, and if the answerer's handshake key is later
+     compromised, a recorded first message reveals the caller's key and
+     that message's contents. So: caller keys scoped to one relationship
+     or request; a minimal first-message payload; an invitation is
+     consumed and a caller treated as present only after a fresh session
+     confirmation; a replayed first message must not reopen a blocked
+     contact or use an invitation twice.
 4. **Stranger's note.** The recipient opens it with their contact
    encryption key alone. The sender's contact identity and the throwaway
    reply address are inside the ciphertext, not needed to open it. The note
@@ -161,8 +186,10 @@ whatever the payment proofs hide. Rules:
    request's identifier into the session, so a session cannot be passed
    off as belonging to a different paid request.
 
-Changing the handshake and the note format in `crates/crypto` waits for
-the cryptographer's answer to questions 11 and 12.
+The handshake and note format in `crates/crypto` may be prototyped on
+these rules, using only standard Noise patterns through the library's
+public interface. They stay marked unreviewed until the cryptographer has
+answered questions 11 and 12.
 
 ## 3. Objects
 
@@ -448,10 +475,11 @@ and reward payout; network-layer privacy of submission and queries.
     ones resolve under a rule that hides the difference; or the reserve is
     over-funded and the excess retired. Until this is settled, `F` cannot
     be changed on a network with open escrows.
-11. Which handshake pattern should replace Noise XX so that the answering
-    side reveals its contact identity only to a caller who already knows
-    its contact key (for example XK or IK), and what does each cost in
-    identity hiding and forward secrecy?
+11. Is Noise IK, with the authorisation check before the first reply, the
+    right replacement for Noise XX here? Are the mitigations for its
+    replayable first message and weaker caller privacy (section 2a,
+    rule 3) sufficient, and does a reply to a replayed authorised message
+    leak availability in a way that matters?
 12. What envelope should carry a stranger's note so that it opens with the
     recipient's contact key alone, carries the sender's identity inside,
     and cannot be recognised by anyone holding only the recipient's public
