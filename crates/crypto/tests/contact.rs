@@ -282,20 +282,23 @@ fn a_replayed_first_message_cannot_reopen_a_blocked_contact() {
 fn offline_carol_accepts_only_bobs_callback() {
     let (bob, card, _) = bob_with_card();
     let carol = ContactIdentity::generate();
-    let callback = StaticKey::generate();
+    let carol_card = carol.card(NET, 1_000, 0, NOW + 86_400);
     let route = [0x77; ROUTE_LEN];
     let admission = [0xAD; 32];
-    let note = seal_note(&NET, &card.inbox_key, &carol, &callback.public(), &route, "Carol here", &admission).unwrap();
+    let note = seal_note(&NET, &card.inbox_key, &carol, &carol_card, &route, "Carol here", &admission).unwrap();
+    // The key Bob will call back: Carol's handshake key, the one the note's
+    // Noise X message authenticates (no separate callback key any more).
+    let callback = carol.handshake_key();
 
     // Carol's throwaway side answers only Bob's handshake key, about this
     // request. It is offline: frames queue at her gateway.
     let deadline = Instant::now() + Duration::from_secs(3_600);
     let mut carol_side: Responder<u32> =
-        Responder::for_callback(&callback, NET, card.handshake_key, admission, deadline).unwrap();
+        Responder::for_callback(callback, NET, card.handshake_key, admission, deadline).unwrap();
     let mut gateway: VecDeque<(u32, Vec<u8>)> = VecDeque::new();
 
-    // Eve learned the route and the callback key (say from a leak): her own
-    // key gets nothing, whatever reference she names.
+    // Eve learned the route (Carol's handshake key is on her public card):
+    // her own key gets nothing, whatever reference she names.
     let eve = StaticKey::generate();
     for reference in [admission, [0; 32]] {
         let (_, hello) = Initiator::start_with(&eve, callback.public(), NET, reference, POLICY).unwrap();
@@ -312,10 +315,10 @@ fn offline_carol_accepts_only_bobs_callback() {
     // Bob opens the note with his inbox key alone; once his claim is final
     // he calls the callback key, naming the request inside the encrypted
     // first message.
-    let opened = open_note(&bob, &NET, &note).unwrap();
-    assert_eq!((opened.sender, opened.callback, opened.route), (carol.signing_key(), callback.public(), route));
+    let opened = open_note(&bob, &NET, &note, NOW).unwrap();
+    assert_eq!((opened.sender(), opened.callback(), opened.route), (carol.signing_key(), callback.public(), route));
     let (mut call, hello) =
-        Initiator::start_with(bob.handshake_key(), opened.callback, NET, opened.admission, POLICY).unwrap();
+        Initiator::start_with(bob.handshake_key(), opened.callback(), NET, opened.admission, POLICY).unwrap();
     assert!(!hello.windows(32).any(|w| w == admission), "the request reference is not in clear");
     gateway.push_back((7, hello));
 

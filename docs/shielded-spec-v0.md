@@ -121,7 +121,8 @@ alternative protocol's reference profile, would be includable in roughly
 one block in six on a 6-second chain.
 
 **P10. Encrypted payload size is open.** The prototype's stranger note
-(587 bytes since the section 2a prototype of 2026-11-20; 427 bytes before)
+(667 bytes since the deniable format v4 of 2026-11-20; 587 and 427 bytes
+before)
 cannot carry a quantum-resistant key exchange (ML-KEM-768 alone needs 1,088
 bytes). The model treats payloads as opaque fixed-size slots; the size and
 the encryption suite are for the cryptographer to fix.
@@ -181,6 +182,21 @@ whatever the payment proofs hide. Rules:
    is bound to the admission record of the same transaction. Nobody
    holding only the recipient's public contact card can tell that a note is
    addressed to them (question 12).
+   - **Deniable sender authentication** (owner decision, 2026-11-20; I27,
+     prototyped, unreviewed). The recipient is convinced who sent a note
+     but cannot prove it to anyone else. Prototype: one Noise X message
+     whose sender static key is the sender's contact handshake key, which
+     Noise X authenticates by Diffie-Hellman rather than by a signature;
+     the rest of the sender's signed card travels inside, so the recipient
+     learns the contact identity (the card's signature covers the card, not
+     the act of contacting). The note field is 667 bytes.
+   - **The cost.** Anyone holding the recipient's inbox secret can make a
+     note that opens as if from any sender whose card they have.
+   - **The callback is answered by the key the note authenticated.** The
+     recipient calls the sender's handshake key itself, so a forger holding
+     only the inbox secret cannot complete the callback. There is no
+     separate per-request callback key any more (see I16).
+   - Forward secrecy for notes is still open.
 5. **Invitations** are issued by a contact identity to a holder key, and
    name the network, an expiry and the purpose. The recipient's app checks
    them and records which ones it has honoured.

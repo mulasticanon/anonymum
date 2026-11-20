@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise N) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 96 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (Noise X, deniable sender authentication) opened with the inbox key alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 99 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. | 51 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -97,6 +97,11 @@ After the AI audit of 3f7092d (2026-11-20; runtime `spec_version` 2, v2
 signed messages with the genesis hash): `smoke.mjs` and `e2e.mjs` passed
 against the dev node, which verified the real v2 key binding and invite
 proof; the live demo passed in 205 s.
+
+With the deniable note (format v4, Noise X, 667 bytes; runtime
+`spec_version` 4; 2026-11-20): `smoke.mjs` and `e2e.mjs` passed against the
+dev node, Bob calling Carol's handshake key from the note he decrypted; the
+live demo passed in 267 s, Eve and Dave again getting nothing.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -273,13 +278,15 @@ I14).
 9. **No mixnet address is ever published.** Each user has a contact identity
    separate from the wallet: a signing key, a handshake key and an inbox key,
    listed on a signed contact card (with network, price and validity). A stranger's
-   request carries a note sealed to the inbox key (Noise N): the stranger's
-   contact key, a fresh callback key, a throwaway route and an intro of at
-   most 280 bytes, all signed and padded so every note is 587 bytes. It opens
-   with the inbox key alone (no sender hint) and is bound to the request's
-   admission commitment. On accept, the recipient calls the callback key at
-   the throwaway route; the stranger's side answers only that caller, and the
-   two swap real routes inside the session. Invited contacts call with a
+   request carries a note sealed to the inbox key (one Noise X message from
+   the stranger's contact handshake key): the stranger's card, a throwaway
+   route and an intro of at most 280 bytes, padded so every note is 667
+   bytes. It opens with the inbox key alone (no sender hint) and is bound to
+   the network and the request's admission commitment. The recipient is
+   convinced who sent it but cannot prove it to anyone else (deniable; no
+   signature over the contact). On accept, the recipient calls the
+   stranger's handshake key at the throwaway route; only its holder can
+   answer, and the two swap real routes inside the session. Invited contacts call with a
    caller key the invitation names. Wallets can be invite-only; requests to
    them fail before any fee. (The transparent chain still records requests
    wallet to wallet, and still needs a wallet-bound key published.)

@@ -166,27 +166,44 @@ carried on. Each needs the owner's or the cryptographer's answer.
 | I25 | Whether an existing contact may call about anything, or only its relationship. | A contact's calls must name the reference recorded when it was admitted; any other reference gets nothing. |
 | I26 | The transparent chain still requires a wallet-bound messaging key before it accepts a request, and records requests wallet to wallet. | Kept for the prototype chain (a known gap until stage 5). Notes are sealed to the card's inbox key and never use that key. |
 
-**I27. The note's signature is transferable proof of who made contact (for
-the cryptographer).** The prototype has the stranger sign the note with
-their contact signing key (I22), so the recipient can tell a note does not
-claim someone else's identity and has not been forwarded from another
-recipient. But an Ed25519 signature convinces anyone: the recipient can
-show the opened note, with the signature over the admission commitment and
-the recipient's own inbox key, to a third party as proof that this contact
-identity reached out to them, and when. For a messaging system whose
-purpose is anonymity that is a real cost.
-*Question:* should authentication that only the two parties can verify
-replace the signature, so that the recipient is convinced but cannot
-convince anyone else? For example, a Noise pattern that authenticates the
-sender's static key by Diffie-Hellman (Noise X, or the K-family) instead
-of a signature, or a designated-verifier signature. What does each cost
-against the two attacks the signature guards: forwarding a note to a third
-person as if written to them, and claiming another identity? Note that a
-recipient who can verify alone can also forge such a note to themselves,
-which is the point of deniability but means the note proves nothing to an
-arbiter either. Does that interact with the admission record and the
-escrow, where the payment itself is on-chain? *Prototype:* unchanged
-(signature); this needs a decision.
+**I27. Deniable sender authentication for the note: prototyped,
+unreviewed.** v3 had the stranger sign the note (I22), which gave the
+recipient transferable proof of who contacted them. Owner decision
+(2026-11-20): the recipient should be convinced who sent a note but must
+not be able to prove it to anyone else.
+*Prototype (note format v4, 667 bytes):* one Noise X message
+(`Noise_X_25519_ChaChaPoly_BLAKE2s`, snow's public API) from the sender's
+contact handshake key to the recipient's inbox key; prologue
+`"anonymum/contact-note/v4" || network || admission`; inside, version 4,
+the sender's card fields (signing key, inbox key, price, validity,
+signature; the handshake key is the authenticated static and the network
+is the prologue's), the route and the intro (still 280 bytes). The
+recipient rebuilds and verifies the card, and checks the sender's static
+key with `was_contributory` before trusting anything. Tests: a note opens
+and names the sender; another recipient, network or admission fails; a
+small-order sender key is refused; v3 and v4 notes cannot be confused; the
+recipient can forge a note that opens as from any sender (the deniability
+itself); and the cost, below.
+*Size:* with the intro kept at 280 bytes the payload no longer fit 587
+bytes (the card fields and the encrypted static cost more than the
+signature and callback key they replace), so the field is now 667 bytes in
+core, the pallet (runtime `spec_version` 4), the spec, the scripts and the
+tests. A 200-byte intro would have kept 587; the intro cap is the owner's
+open question, so it was not cut.
+*The cost, for the cryptographer:* anyone holding the recipient's inbox
+secret can forge notes to that inbox from any sender whose card they have
+(a test shows it). Against that, the callback is now answered by the
+sender's handshake key itself, the key Noise X authenticated: a forger
+with only the inbox secret cannot complete the callback (tested). Its
+privacy cost: there is no per-request callback key any more, so the
+recipient's first callback message is encrypted to the sender's long-lived
+handshake key, and a later compromise of that key reveals the recipient's
+card key and the request reference from a recorded first message (before,
+only the fresh callback key's compromise did). A per-request key would need
+binding to the identity again, which is what the signature did.
+*Still open:* forward secrecy for notes (an inbox key leak opens every
+recorded note); whether Noise X's identity hiding and the visible
+ephemeral key meet question 12.
 
 ## Source review of cdad354 (2026-11-20)
 
@@ -203,7 +220,7 @@ section 2a prototype. Status after the fixes of 2026-11-20 in
 | R4 | e2e started the callback before finality and rebuilt Bob's inputs from Carol's private keep file | **Fixed.** Every transaction waits for finalisation; Bob and Carol run as two processes with separate folders; Bob's process gets his own wallet file and the note bytes read from chain state, nothing else; a contact key that does not match the note's sender is now an error. Not yet run: the review's copied-field and losing-claim cases (they need the shielded admission record) |
 | R5 | Lost ACK: the demo stopped reading after its first ACK; a caller that moved to a higher attempt was welcomed but its CONFIRM was tested against the older live session | **Fixed.** A CONFIRM is matched first to the exact live attempt (resend the ACK, after a gate check), then to the matching pending attempt, which replaces the old session as a contact without using the invitation again. The demo's responders keep reading after establishing; `ANONYMUM_DROP_FIRST_ACK=1` drops the first ACK in a live run. Tests: the higher-attempt case and a driver loop under eight deterministic loss patterns |
 | R6 | Frame type, call id and attempt were outside the authenticated content | **Fixed.** Call id and attempt are in the IK prologue; every sealed record carries its type, and CONFIRM and ACK also carry call id and attempt, inside the ciphertext; a record whose inner type or labels do not match is refused without using up its counter. Data frames carry at most 65,518 bytes (one byte for the type) |
-| R7 | Bob's callback uses his card key (I16); the note signature is transferable (I27) | **Open, with the cryptographer**, unchanged by the owner's decision (see the open questions below) |
+| R7 | Bob's callback uses his card key (I16); the note signature is transferable (I27) | I16 **open, with the cryptographer**. I27 **prototyped, unreviewed** (deniable Noise X note, 2026-11-20; see I27) |
 | R8 | In-memory grant state; no idle or callback expiry; pending expiry only on receive timeouts | **Partly fixed.** Answered handshakes expire after `PENDING_TIMEOUT` (180 s), sessions after `SESSION_IDLE_TIMEOUT` (30 min) without traffic, callback grants at their deadline, all checked against an injected monotonic clock on every operation. **Open:** durable and multi-device grant state, crash recovery of an invitation consumed while its ACK is outstanding |
 | R9 | `Incoming::accept` could build a WELCOME without a gate | **Fixed.** The answering handshake types are crate-private; `Responder` is the only way to answer (compile-fail doc tests) |
 | R10 | `record_invitation` trusted its caller | **Fixed.** It checks issuer (our signing key), signature, network, holder key and expiry; a callback listener records none |
@@ -235,8 +252,9 @@ Is that acceptable for IK and N here, or must the resolver fail closed?
   A recorder of the callback's first message who later learns the callback
   secret learns Bob's key and the request reference. How should the
   stranger privately authorise a request-scoped callback key instead?
-- **The note's signature is transferable proof of who made contact** (I27).
-  Should authentication that only the two parties can verify replace it?
+- **The note's signature was transferable proof of who made contact**
+  (I27). Prototyped as deniable Noise X on 2026-11-20 (unreviewed); the
+  forgery-on-inbox-compromise cost is recorded under I27.
 - **Timing equivalence between authorised and unauthorised callers is
   unmeasured.** Both get no frame from an unauthorised refusal, but the
   work before refusing differs (a blocked key, an unknown key and a wrong

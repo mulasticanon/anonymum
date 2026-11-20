@@ -61,9 +61,9 @@ pub fn key_binding_message(genesis: &[u8; 32], account: &Address, key: &Messagin
 // nothing. The chain checks only that size; the layout, sealing and opening
 // live in `anonymum-crypto::note`.
 
-/// Exact length of a note field: admission commitment (32) + Noise N
-/// envelope (555).
-pub const SEALED_NOTE_LEN: usize = 587;
+/// Exact length of a note field: admission commitment (32) + Noise X
+/// envelope (635), format v4 (deniable sender authentication, 2026-11-20).
+pub const SEALED_NOTE_LEN: usize = 667;
 
 /// An encrypted contact note. Opaque to the chain apart from its length.
 #[derive(Clone, PartialEq, Eq, Debug)]

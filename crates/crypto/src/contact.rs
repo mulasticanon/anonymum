@@ -203,10 +203,6 @@ fn verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Result<(), Co
     key.verify_strict(message, &Signature::from_bytes(signature)).map_err(|_| ContactError::BadSignature)
 }
 
-pub(crate) fn verify_signature(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-    verify(key, message, signature).is_ok()
-}
-
 fn take<const N: usize>(bytes: &[u8], at: &mut usize) -> [u8; N] {
     let out = bytes[*at..*at + N].try_into().expect("length checked by caller");
     *at += N;

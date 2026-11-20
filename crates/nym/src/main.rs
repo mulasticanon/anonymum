@@ -11,10 +11,11 @@
 //!   after her fresh confirmation counts the invitation as used.
 //! * Carol is a stranger. Bob's route is never published, so she reaches
 //!   him by reverse rendezvous: she seals a note to the inbox key on his card
-//!   (her contact identity, a fresh callback key and a throwaway route
+//!   (her contact card and a throwaway route; her handshake key is
+//!   authenticated deniably by Noise X
 //!   inside) and pays for a contact request. Her throwaway client goes
 //!   offline. Bob finds the note with his inbox key alone, accepts on chain,
-//!   and calls her callback key at the throwaway route. Eve, who learned the
+//!   and calls her handshake key at the throwaway route. Eve, who learned the
 //!   route, calls too and gets nothing. Inside the session Bob and Carol swap
 //!   long-lived routes.
 //! * Dave has Bob's real card and route but no invitation. Bob's client
@@ -298,7 +299,7 @@ async fn run() -> Result<(), AnyError> {
     // ---- Carol, a stranger, by note and reverse rendezvous ---------------------
     println!("\nCarol -> Bob: a stranger. Bob's route is not published; she has only his card.");
     let carol = ContactIdentity::generate();
-    let callback = StaticKey::generate();
+    let carol_card = carol.card(NETWORK, COIN, now_secs(), now_secs() + 86_400);
     let throwaway_dir = std::env::temp_dir().join(format!("anonymum-throwaway-{}", std::process::id()));
     let throwaway = Endpoint::connect_persistent("carol (throwaway)", &throwaway_dir).await?;
     let throwaway_route = throwaway.address();
@@ -309,12 +310,15 @@ async fn run() -> Result<(), AnyError> {
         &NETWORK,
         &card.inbox_key,
         &carol,
-        &callback.public(),
+        &carol_card,
         &throwaway_route.to_bytes(),
         intro,
         &admission,
     )?;
-    println!("  sealed note: {} bytes, same size for every request, opens with Bob's inbox key alone", note.0.len());
+    println!(
+        "  sealed note: {} bytes, same size for every request, opens with Bob's inbox key alone; Carol is authenticated deniably (Noise X)",
+        note.0.len()
+    );
     let events = chain.apply(
         carol_wallet.address(),
         Tx::RequestContact { recipient: bob_wallet.address(), max_price: COIN, note },
@@ -329,17 +333,17 @@ async fn run() -> Result<(), AnyError> {
     // Bob's client tries his inbox key on the request's note: no sender
     // address or hint. Everything he needs to call back comes from the note.
     let req = chain.request(request).ok_or("request vanished")?.clone();
-    let opened = open_note(&bob, &NETWORK, &req.note)?;
+    let opened = open_note(&bob, &NETWORK, &req.note, now_secs())?;
     println!(
         "  Bob's client opens the note with his inbox key alone. Sender's contact key {}, intro: {:?}",
-        short(&opened.sender),
+        short(&opened.sender()),
         opened.intro
     );
     chain.apply(bob_wallet.address(), Tx::AcceptContact { request })?;
     println!("  On-chain: Bob accepts (the claim is final in this simulation).");
 
     println!(
-        "\nBob calls the callback key from the note at its throwaway route; Carol is offline for {}s.",
+        "\nBob calls Carol's handshake key (authenticated by the note) at its throwaway route; Carol is offline for {}s.",
         offline.as_secs()
     );
     println!("Eve learned the route and calls too.");
@@ -349,10 +353,10 @@ async fn run() -> Result<(), AnyError> {
     let bob_calls = recipient_side(&mut bob_net, &bob, &opened);
     let eve_calls = async {
         let eve_key = StaticKey::generate();
-        let result = call(&mut eve_net, &eve_key, opened.callback, opened.admission, reply_to, SHORT_POLICY).await;
+        let result = call(&mut eve_net, &eve_key, opened.callback(), opened.admission, reply_to, SHORT_POLICY).await;
         Ok::<_, AnyError>(result.is_ok())
     };
-    let carol_answers = stranger_side(&throwaway_dir, &callback, &card, admission, &carol, carol_net.address(), offline);
+    let carol_answers = stranger_side(&throwaway_dir, &card, admission, &carol, carol_net.address(), offline);
     let (bob_end, eve_end, carol_end) = tokio::join!(bob_calls, eve_calls, carol_answers);
     let carol_route = bob_end?;
     let bob_route_learned = carol_end?;
@@ -398,7 +402,8 @@ async fn run() -> Result<(), AnyError> {
 }
 
 /// The recipient's half of reverse rendezvous. Everything comes from the
-/// note the recipient opened: the callback key to call, the route to call it
+/// note the recipient opened: the sender's handshake key to call (the one
+/// Noise X authenticated), the route to call it
 /// at, the request reference to name, and the sender's contact key the
 /// stranger must present. Calls (retrying), checks the presented contact
 /// key, and swaps long-lived routes. Returns the stranger's route.
@@ -406,11 +411,11 @@ async fn recipient_side(net: &mut Endpoint, me: &ContactIdentity, note: &Contact
     let route = Recipient::try_from_bytes(note.route)?;
     let my_route = net.address();
     let (mut call, early) =
-        call(net, me.handshake_key(), note.callback, note.admission, route, RENDEZVOUS_POLICY).await?;
+        call(net, me.handshake_key(), note.callback(), note.admission, route, RENDEZVOUS_POLICY).await?;
     println!("  Bob: the stranger's side acknowledged (attempt {}).", call.attempt());
     let text = String::from_utf8(next_message(net, &mut call, early).await?)?;
     let (their_route, their_key) = text.split_once(' ').ok_or("malformed hello")?;
-    if their_key != to_hex(&note.sender) {
+    if their_key != to_hex(&note.sender()) {
         return Err("the stranger presented a contact key other than the note's sender".into());
     }
     let their_route: Recipient = their_route.parse()?;
@@ -433,7 +438,6 @@ async fn recipient_side(net: &mut Endpoint, me: &ContactIdentity, note: &Contact
 /// at once, learns the recipient's route, and is deleted from disk.
 async fn stranger_side(
     throwaway_dir: &PathBuf,
-    callback: &StaticKey,
     recipient_card: &ContactCard,
     reference: [u8; 32],
     me: &ContactIdentity,
@@ -443,8 +447,11 @@ async fn stranger_side(
     tokio::time::sleep(offline).await;
     let started = Instant::now();
     let mut throwaway = Endpoint::connect_persistent("carol (throwaway, back online)", throwaway_dir).await?;
+    // Answered with the stranger's own handshake key, the key the note
+    // authenticated: someone who forged the note (with the recipient's inbox
+    // secret) cannot answer.
     let mut side: Responder<AnonymousSenderTag> = Responder::for_callback(
-        callback,
+        me.handshake_key(),
         NETWORK,
         recipient_card.handshake_key,
         reference,
@@ -489,8 +496,8 @@ async fn stranger_side(
 //   anonymum-nym throwaway <dir>     create a persisted throwaway Nym client;
 //                                    print its address, then go offline
 //   anonymum-nym seal --card HEX --sender F --reply R --intro TEXT --keep F
-//                                    seal a note; keep the callback key and
-//                                    admission stand-in in Carol's file F
+//                                    seal a note; keep the admission
+//                                    stand-in in Carol's file F
 //   anonymum-nym open --wallet F --note HEX    (no sender hint)
 //   anonymum-nym answer --carol F --keep F --dir D --card HEX
 //                                    Carol's process: answer Bob's callback
@@ -604,20 +611,20 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
     let card = ContactCard::from_bytes(&from_hex(flag(args, "--card")?)?)?;
     card.verify(&NETWORK, now_secs())?;
     let sender = load_contact(flag(args, "--sender")?)?;
-    let callback = StaticKey::generate();
+    let sender_card = sender.card(NETWORK, COIN, 0, now_secs() + 86_400);
     let admission = random_bytes();
     let note = seal_note(
         &NETWORK,
         &card.inbox_key,
         &sender,
-        &callback.public(),
+        &sender_card,
         &fixed::<96>(flag(args, "--reply")?)?,
         flag(args, "--intro")?,
         &admission,
     )?;
     std::fs::write(
         flag(args, "--keep")?,
-        format!("callback={}\nadmission={}\n", to_hex(&callback.to_bytes()), to_hex(&admission)),
+        format!("admission={}\n", to_hex(&admission)),
     )?;
     println!("note={}", to_hex(&note.0));
     Ok(())
@@ -626,10 +633,10 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
 fn cmd_open(args: &[String]) -> Result<(), AnyError> {
     let contact = load_contact(flag(args, "--wallet")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
-    let opened = open_note(&contact, &NETWORK, &note)?;
+    let opened = open_note(&contact, &NETWORK, &note, now_secs())?;
     println!("reply={}", to_hex(&opened.route));
-    println!("sender={}", to_hex(&opened.sender));
-    println!("callback={}", to_hex(&opened.callback));
+    println!("sender={}", to_hex(&opened.sender()));
+    println!("callback={}", to_hex(&opened.callback()));
     println!("admission={}", to_hex(&opened.admission));
     println!("intro={}", opened.intro.replace('\n', " "));
     Ok(())
@@ -640,13 +647,12 @@ fn cmd_open(args: &[String]) -> Result<(), AnyError> {
 async fn cmd_answer(args: &[String]) -> Result<(), AnyError> {
     let carol = load_contact(flag(args, "--carol")?)?;
     let keep = flag(args, "--keep")?;
-    let callback = StaticKey::from_bytes(field(keep, "callback")?);
     let admission = field(keep, "admission")?;
     let card = ContactCard::from_bytes(&from_hex(flag(args, "--card")?)?)?;
     card.verify(&NETWORK, now_secs())?;
     let dir = PathBuf::from(flag(args, "--dir")?);
     let carol_net = Endpoint::connect("carol (long-lived)").await?;
-    let learned = stranger_side(&dir, &callback, &card, admission, &carol, carol_net.address(), Duration::ZERO).await?;
+    let learned = stranger_side(&dir, &card, admission, &carol, carol_net.address(), Duration::ZERO).await?;
     println!("mine={}", carol_net.address());
     carol_net.client.disconnect().await;
     println!("learned={learned}");
@@ -660,7 +666,7 @@ async fn cmd_answer(args: &[String]) -> Result<(), AnyError> {
 async fn cmd_callback(args: &[String]) -> Result<(), AnyError> {
     let bob = load_contact(flag(args, "--bob")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
-    let opened = open_note(&bob, &NETWORK, &note)?;
+    let opened = open_note(&bob, &NETWORK, &note, now_secs())?;
     let mut bob_net = Endpoint::connect("bob").await?;
     let learned = recipient_side(&mut bob_net, &bob, &opened).await?;
     println!("mine={}", bob_net.address());

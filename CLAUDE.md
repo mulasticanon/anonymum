@@ -46,7 +46,7 @@ Windows machine (see the update below).
 | Crate | Contents | Verified |
 |---|---|---|
 | `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 48 h expiry, client-side inbox admission, token-bucket rate limit, storage deposits. Zero dependencies. | 63 tests, run by CI on Linux and Windows |
-| `crates/crypto` (`anonymum-crypto`) | `Identity` (wallet: Ed25519 address + X25519 key bound to it, for the transparent chain only), `InviteSecret` / `Ed25519Invites` (chain invites); spec v0.7 section 2a prototype: `contact` (`ContactIdentity` with signing, handshake and inbox keys; `ContactCard`; `Invitation` to a holder key; `StaticKey` caller keys), `gate` (`Gate`: authorise before replying, commit on confirmation; changed only through the responder), crate-private Noise IK handshake types, `note` (stranger's note opened with the inbox key alone, bound to network and admission commitment), `wire` (HELLO / WELCOME / CONFIRM / ACK; unauthorised callers get nothing; call id and attempt in the IK prologue; inner record types; atomic revocation; deadlines with an injected `Now`). Received X25519 keys checked with `was_contributory`; block and remove cancel the key's unused invitation and callback grant too; sessions keyed by caller key with caps (`Limits`, one candidate handle per caller); send counter cannot wrap. Unreviewed. | 96 tests, run by CI on Linux and Windows |
+| `crates/crypto` (`anonymum-crypto`) | `Identity` (wallet: Ed25519 address + X25519 key bound to it, for the transparent chain only), `InviteSecret` / `Ed25519Invites` (chain invites); spec v0.7 section 2a prototype: `contact` (`ContactIdentity` with signing, handshake and inbox keys; `ContactCard`; `Invitation` to a holder key; `StaticKey` caller keys), `gate` (`Gate`: authorise before replying, commit on confirmation; changed only through the responder), crate-private Noise IK handshake types, `note` (stranger's note opened with the inbox key alone, bound to network and admission commitment), `wire` (HELLO / WELCOME / CONFIRM / ACK; unauthorised callers get nothing; call id and attempt in the IK prologue; inner record types; atomic revocation; deadlines with an injected `Now`). Received X25519 keys checked with `was_contributory`; block and remove cancel the key's unused invitation and callback grant too; sessions keyed by caller key with caps (`Limits`, one candidate handle per caller); send counter cannot wrap. Unreviewed. | 99 tests, run by CI on Linux and Windows |
 | `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 64 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
 | `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce and the key paths of the refund and cancel keys; refunds found via the consuming transaction). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305` (pinned, already in the lockfile). | 51 tests (section 5 properties, randomised conservation, 5b acceptance); every rule mutation-checked |
@@ -168,13 +168,15 @@ tests for every rule and failure path (failed transactions change nothing;
   `mock_binding` in core tests). A key may be replaced; notes sealed to the
   old key can no longer be opened.
 - `Tx::RequestContact` carries `note: SealedNote`. The chain checks only its
-  length (`SEALED_NOTE_LEN` = 587 since 2026-11-20, was 427; core and pallet).
-  Format v2 (`anonymum-crypto::note`): admission commitment (32) || Noise N
-  to the recipient's contact inbox key, prologue
-  `"anonymum/contact-note/v2" || admission`; plaintext = version, sender
-  contact key, callback handshake key, 96-byte route, u16 intro length,
-  intro padded to 280, Ed25519 signature by the sender's contact key. Opens
-  with the inbox key alone.
+  length (`SEALED_NOTE_LEN` = 667 since 2026-11-20; 587 and 427 before;
+  core and pallet). Format v4 (`anonymum-crypto::note`, deniable, I27):
+  admission commitment (32) || one Noise X message from the sender's
+  contact handshake key to the recipient's inbox key, prologue
+  `"anonymum/contact-note/v4" || network || admission`; payload = version
+  4, the sender's card fields, 96-byte route, u16 intro length, intro
+  padded to 280; no signature over the contact. Opens with the inbox key
+  alone. The callback goes to the sender's handshake key (no separate
+  callback key).
 - `Tx::SetAcceptStrangers { accept }`: invite-only wallets refuse requests
   with `StrangersNotAccepted` before any fee. My choice, easy to change:
   switching to invite-only leaves already-pending requests answerable.
@@ -306,8 +308,11 @@ limit; done 2026-11-20 (table A1-A7 in the issues file). The host function
 `sp_io::crypto::ed25519_verify` follows ZIP 215 here and accepts small-order
 invite keys that `verify_strict` refuses, so `register_invite` now refuses
 weak keys (`ed25519-dalek`'s `is_weak`, built into the wasm runtime).
-spec_version is now 3 (2: v1 proofs and bindings no longer verify; 3: weak
-invite keys refused).
+spec_version is now 4 (2: v1 proofs and bindings no longer verify; 3: weak
+invite keys refused; 4: 667-byte deniable notes, I27 prototyped, unreviewed).
+Cost recorded for the cryptographer: whoever holds an inbox secret can forge
+notes to it; the callback, answered by the sender's handshake key, stops
+such a forger completing contact. Note forward secrecy is still open.
 
 ## Decided 2026-11-18 (late), not yet implemented
 
@@ -364,7 +369,7 @@ hiding amounts and activity:
   submit it;
 - either side cancelling at any time becomes "first finalised wins";
 - blocking cannot be enforced by the chain once contact state is private;
-- the stranger's note (427 bytes then, 587 now) does not fit a post-quantum key exchange;
+- the stranger's note (427 bytes then, 667 now) does not fit a post-quantum key exchange;
 - invites checked inside a proof probably need a circuit-friendly
   signature; Ed25519, used today, is costly inside a circuit.
 

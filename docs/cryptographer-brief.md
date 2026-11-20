@@ -143,16 +143,20 @@ composition and whether it answers questions 11 and 12:
   session, so a replayed message 1 cannot use an invitation twice or
   reopen a blocked contact. Retries, call ids and exact frame lengths
   around that.
-- `note.rs`: the stranger's note as one Noise N message to the inbox key,
-  prologue bound to the admission commitment; inside, the sender's contact
-  key, a fresh callback key, the throwaway route, the intro and the
-  sender's Ed25519 signature over all of it plus the recipient's inbox key.
-  **Question (issue I27):** that signature gives the recipient
-  transferable proof of who contacted them. Should authentication only the
-  two parties can verify (e.g. a Diffie-Hellman-authenticated Noise pattern
-  such as X, or a designated-verifier signature) replace it, and what does
-  that cost against forwarding a note to a third person and claiming
-  another identity?
+- `note.rs` (format v4, 667 bytes; deniable, prototyped 2026-11-20 on
+  the owner's decision): the stranger's note as one Noise X message from
+  the sender's contact handshake key to the recipient's inbox key, prologue
+  bound to network and admission commitment; inside, the sender's card
+  fields, the throwaway route and the intro. Noise X authenticates the
+  sender by Diffie-Hellman, so the recipient is convinced but could have
+  made the same note. **For you (issue I27):** (1) anyone holding the
+  recipient's inbox secret can forge notes to it from any sender whose card
+  they have; the callback, answered by the sender's handshake key itself,
+  stops such a forger from completing contact. Is that enough? (2) There
+  is no per-request callback key any more, so a later compromise of the
+  sender's handshake key reveals the recipient's card key and the request
+  reference from a recorded callback message. (3) Forward secrecy for notes
+  is still open.
 - `invite.rs`: the transparent chain's one-time invites (Ed25519), kept.
 - Since the source review of cdad354 (`docs/source-review-cdad354-2026-11-20.md`,
   AI-written): revocation is atomic, received X25519 keys are checked for
@@ -164,20 +168,19 @@ composition and whether it answers questions 11 and 12:
   forward secrecy for notes sealed to a long-lived inbox key (inbox key
   rotation as a candidate mitigation); no delay between claim finality and
   the callback; dummy payload slots that must be indistinguishable from
-  real ones, and the model's 252-byte slot against the 587-byte note;
+  real ones, and the model's 252-byte slot against the 667-byte note;
   post-quantum key exchange and ratcheting as long-term questions; and
   the host Ed25519 check (ZIP 215 via `ed25519-zebra`) accepting small-order
   invite keys that `verify_strict` refuses.
 - **Open questions for you** (issues file, "Open questions recorded
   2026-11-20"): durable and multi-device grant state; Bob's callback using
-  the handshake key on his card (I16); the note signature as transferable
-  proof (I27); timing equivalence between authorised and unauthorised
+  the handshake key on his card (I16); timing equivalence between authorised and unauthorised
   callers, which nobody has measured; and whether the unchecked ephemeral
   keys inside `snow` are acceptable.
 - Known limits: IK's replayable message 1 (a still-authorised caller's
   recorded message 1 gets a reply: an availability signal, question 11);
-  IK's weaker caller privacy if the answerer's handshake key leaks; Noise N
-  has no forward secrecy for the inbox key; the ephemeral key in a note is
+  IK's weaker caller privacy if the answerer's handshake key leaks; notes
+  (Noise X) have no forward secrecy for the inbox key; the ephemeral key in a note is
   a raw X25519 point (question 12); forward secrecy per session only; no
   post-quantum key exchange; nothing audited. Questions raised while
   building it are I15-I27 in the issues file.

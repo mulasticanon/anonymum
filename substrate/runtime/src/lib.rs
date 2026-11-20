@@ -99,7 +99,9 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 2: signed messages v2 (genesis hash in invite proofs and key bindings,
 	// account in key bindings); v1 signatures no longer verify.
 	// 3: register_invite refuses weak (small-order) Ed25519 invite keys.
-	spec_version: 3,
+	// 4: contact notes grow to 667 bytes (format v4, Noise X, deniable sender
+	// authentication); 587-byte notes are refused.
+	spec_version: 4,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
