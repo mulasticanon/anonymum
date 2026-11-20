@@ -184,6 +184,12 @@ whatever the payment proofs hide. Rules:
 5. **Invitations** are issued by a contact identity to a holder key, and
    name the network, an expiry and the purpose. The recipient's app checks
    them and records which ones it has honoured.
+   - **Revocation cancels every grant** (owner decision, 2026-11-20).
+     Removing a contact or blocking a key ends its sessions, drops any
+     cached replies, and cancels any unused invitation and any outstanding
+     callback grant for that key, all in one step. A cancelled invitation
+     can never be used again, and unblocking restores nothing: a closed
+     channel needs a new invitation to reopen.
 6. **The session is tied to the request.** Both sides mix the accepted
    request's identifier into the session, so a session cannot be passed
    off as belonging to a different paid request.

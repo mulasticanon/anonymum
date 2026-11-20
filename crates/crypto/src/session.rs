@@ -374,6 +374,108 @@ mod tests {
         assert!(matches!(hs.finish(&forged), Err(SessionError::Noise(_))));
     }
 
+    /// A test-only snow resolver: everything is snow's default, except that
+    /// a static key set to `MARK` reports the small-order point `point` as
+    /// its public key and an all-zero agreement result. That is exactly what
+    /// a caller with a small-order static key would produce, built through
+    /// snow's public `CryptoResolver` / `Dh` traits; no Noise processing is
+    /// written by hand.
+    mod weak_static {
+        use snow::params::{CipherChoice, DHChoice, HashChoice};
+        use snow::resolvers::{CryptoResolver, DefaultResolver};
+        use snow::types::{Cipher, Dh, Hash, Random};
+
+        pub(super) const MARK: [u8; 32] = [0xEE; 32];
+
+        pub(super) struct Resolver(pub(super) [u8; 32]);
+
+        struct WeakDh {
+            inner: Box<dyn Dh>,
+            point: [u8; 32],
+            weak: bool,
+        }
+
+        impl Dh for WeakDh {
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+            fn pub_len(&self) -> usize {
+                self.inner.pub_len()
+            }
+            fn priv_len(&self) -> usize {
+                self.inner.priv_len()
+            }
+            fn set(&mut self, privkey: &[u8]) {
+                self.weak = privkey == MARK;
+                self.inner.set(privkey);
+            }
+            fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
+                self.weak = false;
+                self.inner.generate(rng)
+            }
+            fn pubkey(&self) -> &[u8] {
+                if self.weak { &self.point } else { self.inner.pubkey() }
+            }
+            fn privkey(&self) -> &[u8] {
+                self.inner.privkey()
+            }
+            fn dh(&self, pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
+                if self.weak {
+                    out[..32].fill(0); // what any secret gives with a small-order point
+                    Ok(())
+                } else {
+                    self.inner.dh(pubkey, out)
+                }
+            }
+        }
+
+        impl CryptoResolver for Resolver {
+            fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+                DefaultResolver.resolve_rng()
+            }
+            fn resolve_dh(&self, choice: &DHChoice) -> Option<Box<dyn Dh>> {
+                let inner = DefaultResolver.resolve_dh(choice)?;
+                Some(Box::new(WeakDh { inner, point: self.0, weak: false }))
+            }
+            fn resolve_hash(&self, choice: &HashChoice) -> Option<Box<dyn Hash>> {
+                DefaultResolver.resolve_hash(choice)
+            }
+            fn resolve_cipher(&self, choice: &CipherChoice) -> Option<Box<dyn Cipher>> {
+                DefaultResolver.resolve_cipher(choice)
+            }
+        }
+    }
+
+    #[test]
+    fn a_hello_from_a_small_order_caller_key_is_refused_after_reading() {
+        let bob = ContactIdentity::generate();
+        let prologue = prologue(&NET, &CTX);
+        for weak in crate::contact::tests::SMALL_ORDER {
+            let mut caller = snow::Builder::with_resolver(
+                PATTERN.parse().unwrap(),
+                Box::new(weak_static::Resolver(weak)),
+            )
+            .prologue(&prologue)
+            .unwrap()
+            .local_private_key(&weak_static::MARK)
+            .unwrap()
+            .remote_public_key(&bob.handshake_key().public())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+            let mut message1 = vec![0u8; MESSAGE1_LEN];
+            let n = caller.write_message(&REF, &mut message1).unwrap();
+            message1.truncate(n);
+            // The message decrypts (snow accepts the all-zero agreement) and
+            // is refused by our check on the caller's key.
+            assert!(matches!(Incoming::read(bob.handshake_key(), &NET, &CTX, &message1), Err(SessionError::WeakKey)));
+        }
+        // Control: the same resolver with an ordinary key reads fine.
+        let alice = StaticKey::generate();
+        let (_hs, m1) = Handshake::initiate(&alice, &bob.handshake_key().public(), &NET, &CTX, &REF).unwrap();
+        assert!(Incoming::read(bob.handshake_key(), &NET, &CTX, &m1).is_ok());
+    }
+
     #[test]
     fn calling_a_small_order_key_is_refused() {
         let alice = StaticKey::generate();

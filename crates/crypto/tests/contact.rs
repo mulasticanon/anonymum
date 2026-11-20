@@ -411,3 +411,79 @@ fn calling_or_sealing_to_a_small_order_key_is_refused() {
         assert!(!anonymum_crypto::is_contributory_key(&weak));
     }
 }
+
+// ---- revocation cancels outstanding grants (owner decision 2026-11-20) -----
+
+#[test]
+fn removing_a_contact_cancels_its_unused_invitation_and_a_fresh_one_works() {
+    let (bob, card, mut bob_side) = bob_with_card();
+    let alice = StaticKey::generate();
+    let first = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
+    bob_side.record_invitation(first.clone(), now()).unwrap();
+    connect(&alice, card.handshake_key, first.id, &mut bob_side, 1);
+    // A second, still unused invitation to the same key.
+    let spare = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
+    bob_side.record_invitation(spare.clone(), now()).unwrap();
+
+    bob_side.remove_contact(alice.public());
+    let (_, hello) = Initiator::start_with(&alice, card.handshake_key, NET, spare.id, POLICY).unwrap();
+    assert!(matches!(bob_side.handle(2, &hello, now()), Err(WireError::Unauthorised)), "no reply");
+    assert_eq!(bob_side.pending(), 0);
+    // Re-recording the cancelled invitation does not bring it back.
+    assert_eq!(bob_side.record_invitation(spare, now()), Err(ContactError::Revoked));
+    assert!(matches!(bob_side.handle(3, &hello, now()), Err(WireError::Unauthorised)));
+
+    // A fresh invitation issued afterwards reopens the channel.
+    let fresh = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
+    bob_side.record_invitation(fresh.clone(), now()).unwrap();
+    let (_, _, _, grant) = connect(&alice, card.handshake_key, fresh.id, &mut bob_side, 4);
+    assert_eq!(grant, Grant::Invitation { id: fresh.id });
+}
+
+#[test]
+fn removing_a_key_that_never_connected_cancels_its_invitation() {
+    let (bob, card, mut bob_side) = bob_with_card();
+    let alice = StaticKey::generate();
+    let invitation = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
+    bob_side.record_invitation(invitation.clone(), now()).unwrap();
+    bob_side.remove_contact(alice.public());
+    let (_, hello) = Initiator::start_with(&alice, card.handshake_key, NET, invitation.id, POLICY).unwrap();
+    assert!(matches!(bob_side.handle(1, &hello, now()), Err(WireError::Unauthorised)), "no reply");
+    assert!(!bob_side.gate().is_honoured(&invitation.id));
+}
+
+#[test]
+fn blocking_cancels_grants_and_unblocking_restores_none() {
+    let (bob, card, mut bob_side) = bob_with_card();
+    let alice = StaticKey::generate();
+    let invitation = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
+    bob_side.record_invitation(invitation.clone(), now()).unwrap();
+    bob_side.block(alice.public());
+    bob_side.unblock(&alice.public());
+    let (_, hello) = Initiator::start_with(&alice, card.handshake_key, NET, invitation.id, POLICY).unwrap();
+    assert!(matches!(bob_side.handle(1, &hello, now()), Err(WireError::Unauthorised)), "no reply");
+    assert_eq!(bob_side.record_invitation(invitation, now()), Err(ContactError::Revoked));
+    let fresh = bob.invite(NET, alice.public(), Purpose::Contact, NOW + 3_600);
+    bob_side.record_invitation(fresh.clone(), now()).unwrap();
+    let (_, _, _, grant) = connect(&alice, card.handshake_key, fresh.id, &mut bob_side, 2);
+    assert_eq!(grant, Grant::Invitation { id: fresh.id });
+}
+
+#[test]
+fn removing_the_recipient_cancels_an_outstanding_callback_grant() {
+    let bob = ContactIdentity::generate();
+    let callback = StaticKey::generate();
+    let deadline = Instant::now() + Duration::from_secs(3_600);
+    let mut carol_side: Responder<u32> =
+        Responder::for_callback(&callback, NET, bob.handshake_key().public(), [1; 32], deadline).unwrap();
+    carol_side.remove_contact(bob.handshake_key().public());
+    let (_, hello) = Initiator::start_with(bob.handshake_key(), callback.public(), NET, [1; 32], POLICY).unwrap();
+    assert!(matches!(carol_side.handle(7, &hello, now()), Err(WireError::Unauthorised)), "no reply");
+    assert_eq!(carol_side.pending(), 0);
+    // Blocking cancels it the same way.
+    let mut carol_side: Responder<u32> =
+        Responder::for_callback(&callback, NET, bob.handshake_key().public(), [1; 32], deadline).unwrap();
+    carol_side.block(bob.handshake_key().public());
+    carol_side.unblock(&bob.handshake_key().public());
+    assert!(matches!(carol_side.handle(7, &hello, now()), Err(WireError::Unauthorised)), "no reply");
+}

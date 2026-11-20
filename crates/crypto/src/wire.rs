@@ -523,8 +523,10 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         self.gate.record_invitation(invitation, now)
     }
 
-    /// Block a caller key: refused from now on, and its sessions, pending
-    /// handshakes and cached replies are dropped together.
+    /// Block a caller key: refused from now on. In the same step its
+    /// sessions, pending handshakes and cached replies are dropped and its
+    /// unused invitation and outstanding callback grant are cancelled;
+    /// unblocking restores none of them.
     pub fn block(&mut self, caller: [u8; 32]) {
         self.gate.block(caller);
         self.drop_peer(&caller);
@@ -535,9 +537,9 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     }
 
     /// End a relationship without blocking: the caller key is no longer a
-    /// contact, and its sessions, pending handshakes and cached replies are
-    /// dropped together. (An outstanding invitation or callback grant for
-    /// the same key is not cancelled.)
+    /// contact, and in the same step its sessions, pending handshakes and
+    /// cached replies are dropped and its unused invitation and outstanding
+    /// callback grant are cancelled. Reopening needs a new invitation.
     pub fn remove_contact(&mut self, caller: [u8; 32]) {
         self.gate.remove_contact(&caller);
         self.drop_peer(&caller);

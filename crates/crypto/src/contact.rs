@@ -42,6 +42,8 @@ pub enum ContactError {
     WeakKey,
     /// A price that does not fit the shielded design's 64-bit amounts.
     PriceOutOfRange,
+    /// An invitation that was cancelled by a block or a removal.
+    Revoked,
 }
 
 impl fmt::Display for ContactError {

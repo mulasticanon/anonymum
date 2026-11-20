@@ -78,6 +78,8 @@ pub struct Gate {
     /// Invitations we issued and have not honoured, by holder key.
     issued: HashMap<[u8; 32], Invitation>,
     honoured: HashSet<[u8; 32]>,
+    /// Invitations cancelled by a block or a removal; never usable again.
+    revoked: HashSet<[u8; 32]>,
     /// Caller key -> the reference its calls must name.
     contacts: HashMap<[u8; 32], [u8; 32]>,
     /// Caller key -> (reference, deadline).
@@ -92,6 +94,7 @@ impl Gate {
             issuer,
             issued: HashMap::new(),
             honoured: HashSet::new(),
+            revoked: HashSet::new(),
             contacts: HashMap::new(),
             callbacks: HashMap::new(),
             blocked: HashSet::new(),
@@ -108,6 +111,9 @@ impl Gate {
     pub(crate) fn record_invitation(&mut self, invitation: Invitation, now: Now) -> Result<(), ContactError> {
         let issuer = self.issuer.ok_or(ContactError::WrongIssuer)?;
         invitation.verify(&issuer, &self.network, now.unix)?;
+        if self.revoked.contains(&invitation.id) {
+            return Err(ContactError::Revoked);
+        }
         self.issued.insert(invitation.holder, invitation);
         Ok(())
     }
@@ -125,12 +131,27 @@ impl Gate {
         Ok(())
     }
 
+    /// End the relationship with `caller` and cancel every grant it still
+    /// holds: an unused invitation (revoked for good) and an outstanding
+    /// callback. A closed channel needs a new invitation to reopen (owner
+    /// decision, 2026-11-20).
     pub(crate) fn remove_contact(&mut self, caller: &[u8; 32]) {
         self.contacts.remove(caller);
+        self.cancel_grants(caller);
     }
 
+    /// Block `caller` and cancel its grants, as [`Gate::remove_contact`]
+    /// does. Unblocking later restores nothing.
     pub(crate) fn block(&mut self, caller: [u8; 32]) {
         self.blocked.insert(caller);
+        self.cancel_grants(&caller);
+    }
+
+    fn cancel_grants(&mut self, caller: &[u8; 32]) {
+        if let Some(invitation) = self.issued.remove(caller) {
+            self.revoked.insert(invitation.id);
+        }
+        self.callbacks.remove(caller);
     }
 
     pub(crate) fn unblock(&mut self, caller: &[u8; 32]) {
@@ -173,7 +194,8 @@ impl Gate {
             && invitation.network == self.network
             && invitation.purpose == Purpose::Contact
             && now.unix < invitation.expires_at
-            && !self.honoured.contains(&invitation.id);
+            && !self.honoured.contains(&invitation.id)
+            && !self.revoked.contains(&invitation.id);
         usable.then_some(Grant::Invitation { id: invitation.id })
     }
 
