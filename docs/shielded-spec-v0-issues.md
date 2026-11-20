@@ -6,7 +6,8 @@ resolves all but I8. I13–I14 were raised by v0.5; v0.6 fixes their wording.
 The design review of 2026-11-19 (`design-review-2026-11-19.md`) adds
 findings H1–H7 and M1–M4, tracked below. I15–I26 were raised while
 prototyping v0.7 section 2a in `crates/crypto` (2026-11-20); I27 is a
-question for the cryptographer about one of those choices. Each entry says
+question for the cryptographer about one of those choices. W1-W6 (spec
+section 2b) are proposed wallet and network rules. Each entry says
 how it stands and what the model or prototype does.
 
 | # | Issue | Status |
@@ -161,7 +162,7 @@ carried on. Each needs the owner's or the cryptographer's answer.
 | I20 | A contact card names keys, price and validity but no network; invitations name the network. | Fixed after 299f429: the card now carries and signs the network id, and `ContactCard::verify` refuses a card for another network (tested). |
 | I21 | Rule 3 asks that a replayed first message not reopen a blocked contact or use an invitation twice, but says nothing of a still-authorised caller. | A recorded message 1 from a caller who is still a contact gets a message 2 (it cannot be confirmed, so no session and no grant). An availability signal: question 11. Repeats of an answered message 1 are re-checked against the gate before the cached reply is resent. |
 | I22 | Rule 4 puts the sender's contact identity inside the note but does not say it is authenticated. | The sender signs (contact signing key) the admission commitment, the recipient's inbox key and the note body, so a note cannot claim another identity or be forwarded to a third person as if written to them. |
-| I23 | Rule 4: a note must not be recognisable from the public card. | Noise N gives that for the ciphertext, but its ephemeral key is a raw X25519 point, distinguishable from random bytes (not linkable to the recipient). Elligator-style encoding would need a vetted library. Question 12. |
+| I23 | Rule 4: a note must not be recognisable from the public card. | The note's ciphertext does not name the recipient, but its ephemeral key is a raw X25519 point, distinguishable from random bytes (not linkable to the recipient). Elligator-style encoding would need a vetted library. Question 12. **Preferred option for dummy slots (W4, proposed, unreviewed):** fill them with real Noise X notes between fresh random keys, so a dummy has the same structure as a real note instead of being random bytes. |
 | I24 | The shielded design's payload slot size (P10) is open; the note is now 587 bytes. | Recorded; the model's 204-byte slot is a placeholder and cannot hold it. |
 | I25 | Whether an existing contact may call about anything, or only its relationship. | A contact's calls must name the reference recorded when it was admitted; any other reference gets nothing. |
 | I26 | The transparent chain still requires a wallet-bound messaging key before it accepts a request, and records requests wallet to wallet. | Kept for the prototype chain (a known gap until stage 5). Notes are sealed to the card's inbox key and never use that key. |
@@ -307,3 +308,72 @@ Status after the fixes of 2026-11-20:
 - **Post-quantum key exchange and ratcheting** remain long-term questions:
   no per-message forward secrecy (no double ratchet) and no post-quantum
   key agreement in sessions or notes.
+
+## Wallet and network behaviour rules W1-W6 (proposed, unreviewed, 2026-11-20)
+
+Spec section 2b. Rules for what a wallet does; the chain cannot check
+them. All proposed and unreviewed.
+
+| # | Rule | Status |
+|---|---|---|
+| W1 | Never query a node about a specific nullifier, commitment, admission record, request or block of interest: sync what every wallet syncs, or fetch over the mixnet | **Proposed, unreviewed.** The prototype breaks it by design: `e2e.mjs`, `smoke.mjs` and the demo read specific requests, keys and block timestamps from a local node to check results |
+| W2 | Random delay before a callback after a claim is final; before a sender refund after expiry (never the first eligible block); no spending of an Open's change in the next block | **Proposed, unreviewed.** Distributions are a question for the cryptographer. The demo calls back at once |
+| W3 | Every transaction carries one admission commitment; the empty record in Transfer, Claim, Decline and Sender refund has a fresh, secret, uniformly random blinding, so its commitment is indistinguishable from a real one | **Proposed, unreviewed.** What the spec and model do: see below |
+| W4 | A dummy payload slot holds a real Noise X note from a fresh random key to a fresh random key, not random bytes | **Proposed, unreviewed.** Preferred option for I23 |
+| W5 | Transfers, invited requests and stranger escrows share one pool and one fee structure | **Proposed, unreviewed.** Consistent with O3 and the spec's single circuit |
+| W6 | Open questions (below) | **Recorded** |
+
+**W3, what the spec and the model actually do.**
+- *Spec:* section 3 says every transaction carries one admission record and
+  that non-requests carry "an empty one that looks the same"; section 4
+  lists the admission commitment among every transaction's public fields.
+  But the branch table named the empty record only for Transfer, and
+  nowhere said how the empty record is blinded. The table now names it for
+  Claim and Decline (Sender refund is "same as Decline"), and W3 states the
+  blinding rule.
+- *Model:* every transaction does carry an admission commitment.
+  `TxBuilder::build` uses `AdmissionRecord::empty(blinding)` when no record
+  is given, with zero contact key and digest, tier none, no escrow. The
+  chain checks only that Transfer, Claim, Decline and Sender refund carry
+  tier none and no escrow; it does not (and cannot) check that the blinding
+  is fresh, nor that the other fields are zero. **The model's blinding is
+  not random:** it is derived from the builder's salt
+  (`H("builder/derived", salt, "admission", 0)`), which the caller supplies.
+  The code says "a real wallet would use fresh randomness"; two
+  transactions built with the same salt would carry identical empty
+  commitments. This is a test convenience that W3 forbids in a wallet. The
+  model's commitment is a domain-separated BLAKE2s hash with a 32-byte
+  blinding: hiding only if the blinding is secret and random. The real
+  scheme is for the cryptographer.
+
+**W6, open questions.**
+- *Hybrid post-quantum key exchange* for notes and handshakes, decided
+  before the note format is frozen. Size cost with ML-KEM-768 (public key
+  1,184 bytes, ciphertext 1,088 bytes): a note would grow by at least one
+  KEM ciphertext, from 667 to about 1,755 bytes; a card carrying KEM public
+  keys for the inbox and handshake keys would grow from 224 to about 2,592
+  bytes. `snow` 0.10 offers hybrid forward secrecy (Kyber1024) only behind
+  its non-default `hfs` feature; whether that or another construction is
+  right is open.
+- *Inbox and handshake key rotation*, and how a rotated key is recognised
+  as the same contact (a new card signed by the same signing key is the
+  obvious path; what it costs in linkability is open). Rotating the inbox
+  key is also the candidate mitigation for the missing forward secrecy of
+  notes.
+- *A persistently connected wallet versus a throwaway listener.* A wallet
+  that stays connected is reachable and sends cover traffic all the time;
+  a throwaway listener that comes online only to answer a callback shows
+  when it is online. Which the product wants, and when, is open.
+- *Cover traffic, checked 2026-11-20 by reading the code of the locked
+  versions (`nym-sdk` 1.21.6, `nym-client-core-config-types` 1.21.6), not
+  by measurement:* the SDK's client configuration uses the default debug
+  configuration, in which the loop cover traffic stream is on
+  (`disable_loop_cover_traffic_stream: false`, average delay 200 ms) and
+  the main Poisson packet stream is on
+  (`disable_main_poisson_packet_distribution: false`, average 20 ms), so
+  real packets are mixed into a constant-rate stream. The demo does not
+  change these settings. Cover traffic stops whenever a client
+  disconnects, so a throwaway client's online periods remain visible to
+  its gateway.
+- *Message retrieval at scale* (oblivious message retrieval, fuzzy message
+  detection): roadmap only. Today every wallet tries every note.

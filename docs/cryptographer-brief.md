@@ -172,6 +172,18 @@ composition and whether it answers questions 11 and 12:
   post-quantum key exchange and ratcheting as long-term questions; and
   the host Ed25519 check (ZIP 215 via `ed25519-zebra`) accepting small-order
   invite keys that `verify_strict` refuses.
+- **Wallet and network behaviour rules W1-W6** (spec section 2b, issues
+  file; proposed, unreviewed): no targeted chain queries; random delays
+  before callbacks, refunds and spending an Open's change (the
+  distributions are for you); every transaction carries an admission
+  commitment, the empty one freshly blinded (the model derives that
+  blinding from a test salt today); dummy note slots as real Noise X notes
+  between fresh random keys; one pool and one fee structure. Open: hybrid
+  post-quantum key exchange and its size cost (about 1,755-byte notes and
+  2,592-byte cards with ML-KEM-768) before the note format is frozen; key
+  rotation and contact recognition; persistent wallet versus throwaway
+  listener; cover traffic (on by default in `nym-sdk` 1.21.6, by reading
+  the code); message retrieval at scale.
 - **Open questions for you** (issues file, "Open questions recorded
   2026-11-20"): durable and multi-device grant state; Bob's callback using
   the handshake key on his card (I16); timing equivalence between authorised and unauthorised

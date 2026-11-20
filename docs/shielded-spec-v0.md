@@ -219,6 +219,61 @@ these rules, using only standard Noise patterns through the library's
 public interface. They stay marked unreviewed until the cryptographer has
 answered questions 11 and 12.
 
+## 2b. Wallet and network behaviour rules (proposed, unreviewed)
+
+Added 2026-11-20. These rules govern what a wallet does, not what the
+chain checks. A protocol that hides contacts and amounts on-chain still
+leaks them if wallets query, time or pad carelessly. All of this is
+proposed and unreviewed; the cryptographer is asked to confirm or replace
+each rule (issues file, W1-W6).
+
+**W1. Chain access.** A wallet never asks a node about a specific
+nullifier, commitment, admission record, request or block of interest.
+It downloads the same data every other wallet downloads (every block, or
+every leaf, nullifier and payload of a range) and searches it locally, or
+it fetches over the mixnet. A query that names a value the wallet cares
+about tells the node which value that is. *The prototype breaks this rule
+by design:* `e2e.mjs`, `smoke.mjs` and the demo read specific requests,
+keys and block timestamps directly from a local node to check results.
+
+**W2. Timing.** A wallet adds a random delay before each action that
+follows a public event, so the action's timing does not link it to the
+event:
+- before calling back after a claim (or acceptance) is final;
+- before a sender refund after expiry, and never in the first block in
+  which the refund becomes possible;
+- before spending change from an Open: never in the next block.
+The delay distributions are left to the cryptographer.
+
+**W3. Every transaction carries one admission commitment, and the empty
+one is indistinguishable from a real one.** Transfer, Claim, Decline and
+Sender refund each carry the commitment to an *empty* admission record
+(tier "none", zero contact key and request digest, no escrow) whose
+blinding is fresh, secret and uniformly random, drawn by the wallet for
+that transaction alone: never derived from anything public, never reused.
+With a hiding commitment, an empty record's commitment then looks exactly
+like a stranger's or an invited request's. (Section 3 already says every
+transaction carries one that "looks the same"; this rule states how.)
+
+**W4. Dummy note slots.** A payload slot that carries no note holds a
+real note-shaped object: a Noise X message, built exactly like a real
+note, from a fresh random static key to a fresh random recipient key, at
+the full note length. Not random bytes: an X25519 public key is not a
+uniformly random string, so random bytes can be told apart from a real
+note's ephemeral key.
+
+**W5. One pool.** Transfers, invited requests and stranger escrows share
+one note pool and one public fee structure (one identical base fee, O3).
+No transaction type gets a separate pool, tree or fee.
+
+**W6. Open questions** (recorded, not decided): hybrid post-quantum key
+exchange for notes and handshakes, and its size cost, before the note
+format is frozen; inbox and handshake key rotation and how a rotated key
+is still recognised as the same contact; a persistently connected wallet
+versus a throwaway listener; the mixnet client's cover traffic; message
+retrieval at scale (oblivious message retrieval, fuzzy message
+detection), as roadmap only. Details in the issues file.
+
 ## 3. Objects
 
 All amounts are unsigned 64-bit integers in base units; sums are checked
@@ -309,8 +364,8 @@ Branches:
 | Transfer | ordinary notes | ordinary notes; empty admission record | owners | none |
 | Invited request | ordinary notes | change; admission record with tier "invited" and no escrow | owners | none |
 | Open (stranger request) | ordinary notes | one escrow note with `fee_reserve = F`; a retired note of `S`; change; admission record with tier "stranger" naming that escrow | owners | none |
-| Claim | one escrow note | ordinary note of `price` owned by `recipient` | `recipient` | `not_after <= created_at + 24h` |
-| Decline | one escrow note | ordinary note of `price - penalty` owned by `refund_to`; retired note of `penalty` | `recipient` | none |
+| Claim | one escrow note | ordinary note of `price` owned by `recipient`; empty admission record (W3) | `recipient` | `not_after <= created_at + 24h` |
+| Decline | one escrow note | ordinary note of `price - penalty` owned by `refund_to`; retired note of `penalty`; empty admission record (W3) | `recipient` | none |
 | Sender refund | one escrow note | same as Decline | `canceller` | none |
 
 `penalty = ceil(price / 100)`, constrained as integers. The explicit
