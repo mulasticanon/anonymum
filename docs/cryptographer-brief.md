@@ -205,7 +205,9 @@ composition and whether it answers questions 11 and 12:
   ACK that follows a committed grant. This is crash safety for **one
   device**. Several devices must not share one gate: each device gets its
   own contact identity (own keys and invitations). Revoked and consumed
-  invitation ids are pruned at expiry plus 300 s of clock skew.
+  invitation ids are pruned at expiry plus 300 s of clock skew, and the
+  gate keeps a persisted clock floor so a clock set back cannot revive
+  them (a clock that once ran ahead keeps the gate in that future).
 - **Open questions for you** (issues file, "Open questions recorded
   2026-11-20"): multi-device grant state; Bob's callback using
   the handshake key on his card (I16); timing equivalence between authorised and unauthorised

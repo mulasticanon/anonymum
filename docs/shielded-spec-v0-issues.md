@@ -474,11 +474,26 @@ encrypted, without any database dependency.
   unused invitations and callback grants past their deadline are dropped
   too. A grant pruned at its deadline stays gone if the clock later reads
   earlier.
+- *Clock floor (2026-11-21):* the gate remembers the latest Unix time it
+  has seen (`last_seen`, in the snapshot) and judges every expiry and
+  deadline at `effective_now = max(last_seen, now)`: pruning, `authorise`,
+  `commit`, `record_invitation` and `export_snapshot` (which now takes
+  `now`). Setting the clock back, within a run or across a restart, cannot
+  make a pruned revocation or consumed invitation usable again, nor
+  resurrect a callback grant (tested). With the floor, pruning expired
+  invitations and callback grants changes no decision (they are refused at
+  the floor anyway); it only frees space, which the tests check through the
+  snapshot's size. The cost: a clock that once ran far ahead keeps the gate
+  in that future until real time catches up, so invitations and callbacks
+  issued with expiries before it are refused. The floor's use in `commit`
+  cannot be observed through the API (every `handle` prunes first, which
+  raises the floor, and `commit` re-runs `authorise`, which reads it), so
+  no test catches its removal.
 - *Snapshot:* `version (1, clear) || nonce (12) || ChaCha20-Poly1305
   ciphertext || tag`, associated data `"anonymum/gate-snapshot/v1" ||
   network`, a fresh random nonce each time, under a `StorageKey` (32 bytes,
   wiped on drop, never printed). The plaintext repeats the version and the
-  network and lists issued and consumed invitations, revocations,
+  network, the clock floor, and lists issued and consumed invitations, revocations,
   contacts, callback grants and blocks, sorted, with exact lengths. Crate
   `chacha20poly1305` `=0.10.1`, already pinned in the lockfile for the
   shielded model (no version moved).

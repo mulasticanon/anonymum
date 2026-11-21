@@ -584,10 +584,12 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         }
     }
 
-    /// The gate's state, encrypted under `key` for this responder's network
-    /// with a fresh nonce. Write it durably before replying (see the module
+    /// The gate's state at `now` (its clock floor moved up to `now` first),
+    /// encrypted under `key` for this responder's network with a fresh
+    /// nonce. Write it durably before replying (see the module
     /// documentation, "Persist before reply").
-    pub fn export_snapshot(&self, key: &StorageKey) -> Vec<u8> {
+    pub fn export_snapshot(&mut self, key: &StorageKey, now: Now) -> Vec<u8> {
+        self.gate.effective_now(now.unix);
         let plaintext = zeroize::Zeroizing::new(self.gate.encode());
         snapshot::seal(key, &self.gate.network(), &plaintext)
     }

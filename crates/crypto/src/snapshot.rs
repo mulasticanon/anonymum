@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(sealed_gate(|p| { p.pop(); }).err(), Some(SnapshotError::Malformed));
         assert_eq!(sealed_gate(|p| p[33] = 2).err(), Some(SnapshotError::Malformed));
         // A table count larger than what follows.
-        assert_eq!(sealed_gate(|p| p[66..70].copy_from_slice(&1u32.to_be_bytes())).err(), Some(SnapshotError::Malformed));
+        assert_eq!(sealed_gate(|p| p[74..78].copy_from_slice(&1u32.to_be_bytes())).err(), Some(SnapshotError::Malformed));
     }
 
     #[test]

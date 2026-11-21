@@ -47,6 +47,13 @@
 //! has expired plus [`CLOCK_SKEW_SECS`], after which the invitation itself
 //! no longer verifies, so [`Gate::prune`] may forget it.
 //!
+//! **The gate's clock never runs backwards.** It remembers the latest Unix
+//! time it has seen (`last_seen`, saved in the snapshot) and judges every
+//! deadline and expiry by [`Gate::effective_now`], the later of that and
+//! the time it is given. So once it has seen a revoked invitation expire
+//! (and pruned it) or a callback grant run out, setting the clock back,
+//! within a run or across a restart, cannot make either usable again.
+//!
 //! The gate's state can be saved and restored, encrypted, through
 //! [`crate::wire::Responder::export_snapshot`] and the `restore_*`
 //! constructors (see [`crate::snapshot`]); the responder documents when a
@@ -108,6 +115,8 @@ pub struct Gate {
     /// Caller key -> (reference, deadline in Unix seconds).
     callbacks: HashMap<[u8; 32], ([u8; 32], u64)>,
     blocked: HashSet<[u8; 32]>,
+    /// The latest Unix time this gate has seen; its clock floor.
+    last_seen: u64,
 }
 
 impl Gate {
@@ -121,6 +130,7 @@ impl Gate {
             contacts: HashMap::new(),
             callbacks: HashMap::new(),
             blocked: HashSet::new(),
+            last_seen: 0,
         }
     }
 
@@ -133,7 +143,8 @@ impl Gate {
     /// valid holder key, and unexpired at `now`.
     pub(crate) fn record_invitation(&mut self, invitation: Invitation, now: Now) -> Result<(), ContactError> {
         let issuer = self.issuer.ok_or(ContactError::WrongIssuer)?;
-        invitation.verify(&issuer, &self.network, now.unix)?;
+        let now_secs = self.effective_now(now.unix);
+        invitation.verify(&issuer, &self.network, now_secs)?;
         if self.revoked.contains_key(&invitation.id) {
             return Err(ContactError::Revoked);
         }
@@ -204,6 +215,7 @@ impl Gate {
     /// invitations once expired, and callback grants past their deadline.
     /// Returns how many entries were dropped.
     pub fn prune(&mut self, now_secs: u64) -> usize {
+        let now_secs = self.effective_now(now_secs);
         let before = self.len();
         let keep = |expires_at: &mut u64| now_secs < expires_at.saturating_add(CLOCK_SKEW_SECS);
         self.honoured.retain(|_, e| keep(e));
@@ -211,6 +223,23 @@ impl Gate {
         self.issued.retain(|_, invitation| now_secs < invitation.expires_at);
         self.callbacks.retain(|_, (_, deadline)| now_secs < *deadline);
         before - self.len()
+    }
+
+    /// Move the clock floor up to `now_secs` if it is later, and return the
+    /// floor: the time every gate decision uses.
+    pub fn effective_now(&mut self, now_secs: u64) -> u64 {
+        self.last_seen = self.last_seen.max(now_secs);
+        self.last_seen
+    }
+
+    /// The latest Unix time this gate has seen.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen
+    }
+
+    /// The time a read-only check uses: never earlier than the floor.
+    fn floor(&self, now_secs: u64) -> u64 {
+        self.last_seen.max(now_secs)
     }
 
     fn len(&self) -> usize {
@@ -224,7 +253,9 @@ impl Gate {
     }
 
     /// May `caller`, naming `reference`, be answered at `now`?
+    /// Judged at the later of `now` and the gate's clock floor.
     pub fn authorise(&self, caller: &[u8; 32], reference: &[u8; 32], now: Now) -> Option<Grant> {
+        let now_secs = self.floor(now.unix);
         if self.blocked.contains(caller) {
             return None;
         }
@@ -232,7 +263,7 @@ impl Gate {
             return Some(Grant::Contact);
         }
         if let Some((expected, deadline)) = self.callbacks.get(caller) {
-            if expected == reference && now.unix < *deadline {
+            if expected == reference && now_secs < *deadline {
                 return Some(Grant::Callback);
             }
         }
@@ -240,7 +271,7 @@ impl Gate {
         let usable = &invitation.id == reference
             && invitation.network == self.network
             && invitation.purpose == Purpose::Contact
-            && now.unix < invitation.expires_at
+            && now_secs < invitation.expires_at
             && !self.honoured.contains_key(&invitation.id)
             && !self.revoked.contains_key(&invitation.id);
         usable.then_some(Grant::Invitation { id: invitation.id })
@@ -251,6 +282,7 @@ impl Gate {
     /// caller was blocked meanwhile, the invitation was honoured already or
     /// the callback deadline passed.
     pub(crate) fn commit(&mut self, caller: &[u8; 32], reference: &[u8; 32], grant: Grant, now: Now) -> bool {
+        let now = Now { unix: self.effective_now(now.unix), ..now };
         if self.authorise(caller, reference, now) != Some(grant) {
             return false;
         }
@@ -275,7 +307,7 @@ impl Gate {
 /// big-endian; every table is sorted by key, so equal gates encode equally.
 ///
 /// ```text
-/// version (1)  network (32)  issuer flag (1) [issuer (32)]
+/// version (1)  network (32)  issuer flag (1) [issuer (32)]  last_seen (8)
 /// issued:    u32 count, each an Invitation (Invitation::LEN bytes)
 /// honoured:  u32 count, each id (32) || expires_at (8)
 /// revoked:   u32 count, each id (32) || expires_at (8)
@@ -302,6 +334,7 @@ impl Gate {
             }
             None => out.push(0),
         }
+        out.extend_from_slice(&self.last_seen.to_be_bytes());
         count(&mut out, self.issued.len());
         for (_, invitation) in sorted(&self.issued) {
             out.extend_from_slice(&invitation.to_bytes());
@@ -350,6 +383,7 @@ impl Gate {
             _ => return Err(SnapshotError::Malformed),
         };
         let mut gate = Gate::new(*network, issuer);
+        gate.last_seen = r.u64()?;
         for _ in 0..r.count()? {
             let invitation = Invitation::from_bytes(r.take(Invitation::LEN)?).map_err(|_| SnapshotError::Malformed)?;
             if invitation.network != *network || gate.issued.insert(invitation.holder, invitation).is_some() {

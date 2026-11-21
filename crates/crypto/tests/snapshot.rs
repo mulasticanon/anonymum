@@ -59,7 +59,7 @@ fn a_restored_responder_keeps_contacts_blocks_callbacks_and_revocations() {
     side.record_invitation(frank_inv.clone(), now()).unwrap();
 
     // Restart: only the snapshot survives.
-    let saved = side.export_snapshot(&storage);
+    let saved = side.export_snapshot(&storage, now());
     drop(side);
     let mut restored: Responder<u32> = Responder::restore_identity(&bob, NET, &storage, &saved).unwrap();
     assert!(restored.gate().is_contact(&alice.public()));
@@ -67,9 +67,9 @@ fn a_restored_responder_keeps_contacts_blocks_callbacks_and_revocations() {
     assert!(restored.gate().is_revoked(&dave_inv.id));
     assert!(restored.gate().is_blocked(&eve.public()));
     // Equal state, and an equal snapshot plaintext (sealed under a new nonce).
-    let again = Responder::<u32>::restore_identity(&bob, NET, &storage, &restored.export_snapshot(&storage)).unwrap();
+    let again = Responder::<u32>::restore_identity(&bob, NET, &storage, &restored.export_snapshot(&storage, now())).unwrap();
     assert!(again.gate() == restored.gate());
-    assert_ne!(saved, restored.export_snapshot(&storage), "a fresh nonce every time");
+    assert_ne!(saved, restored.export_snapshot(&storage, now()), "a fresh nonce every time");
 
     // And it behaves the same: Alice calls as a contact, Frank uses his
     // invitation, Eve and Dave get nothing.
@@ -80,8 +80,8 @@ fn a_restored_responder_keeps_contacts_blocks_callbacks_and_revocations() {
 
     // A callback listener keeps its grant and deadline (Unix seconds).
     let carol = StaticKey::generate();
-    let listener: Responder<u32> = Responder::for_callback(&carol, NET, peer, [7; 32], NOW + 600).unwrap();
-    let saved = listener.export_snapshot(&storage);
+    let mut listener: Responder<u32> = Responder::for_callback(&carol, NET, peer, [7; 32], NOW + 600).unwrap();
+    let saved = listener.export_snapshot(&storage, now());
     let mut back: Responder<u32> = Responder::restore_callback(&carol, NET, &storage, &saved).unwrap();
     assert!(matches!(call(&mut back, bob.handshake_key(), carol.public(), [7; 32], 6, at(NOW + 599)), Ok(Grant::Callback)));
     // The gate's own deadline check (not only the pruning in front of it).
@@ -109,7 +109,7 @@ fn a_consumed_or_revoked_invitation_cannot_be_replayed_after_a_restore() {
     let dave_inv = invite(&bob, &dave, NOW + 3_600);
     side.record_invitation(dave_inv.clone(), now()).unwrap();
     side.remove_contact(dave.public());
-    let saved = side.export_snapshot(&storage);
+    let saved = side.export_snapshot(&storage, now());
 
     let mut restored: Responder<u32> = Responder::restore_identity(&bob, NET, &storage, &saved).unwrap();
     // Recording either invitation again does not make it usable.
@@ -136,7 +136,7 @@ fn persist_before_reply_a_crash_before_the_ack_leaves_the_invitation_unused() {
     let alice = StaticKey::generate();
     let inv = invite(&bob, &alice, NOW + 3_600);
     side.record_invitation(inv.clone(), now()).unwrap();
-    let before = side.export_snapshot(&storage);
+    let before = side.export_snapshot(&storage, now());
     // The invitation is committed in memory, then the process dies before
     // the new snapshot is written: no ACK was sent.
     assert!(call(&mut side, &alice, peer, inv.id, 1, now()).is_ok());
@@ -147,7 +147,7 @@ fn persist_before_reply_a_crash_before_the_ack_leaves_the_invitation_unused() {
     assert!(!restored.gate().is_honoured(&inv.id));
     assert_eq!(call(&mut restored, &alice, peer, inv.id, 2, now()).unwrap(), Grant::Invitation { id: inv.id });
     // Persisted this time (before the ACK): after another restart it is spent.
-    let after = restored.export_snapshot(&storage);
+    let after = restored.export_snapshot(&storage, now());
     let back: Responder<u32> = Responder::restore_identity(&bob, NET, &storage, &after).unwrap();
     assert!(back.gate().is_honoured(&inv.id));
 }
@@ -179,11 +179,14 @@ fn expired_revocations_are_pruned_after_expiry_plus_skew_and_unexpired_ones_stay
     side.record_invitation(frank_inv.clone(), at(edge)).unwrap();
     assert_eq!(side.gate().authorise(&frank.public(), &frank_inv.id, at(edge)), Some(Grant::Invitation { id: frank_inv.id }));
     assert_eq!(side.gate().authorise(&frank.public(), &frank_inv.id, at(edge + 10)), None, "expired");
+    let before = side.export_snapshot(&storage, at(edge + 10)).len();
     side.expire(at(edge + 10));
     assert_eq!(side.gate().authorise(&frank.public(), &frank_inv.id, at(edge)), None, "pruned, not just expired");
+    // Pruning frees the space: the snapshot no longer carries it.
+    assert_eq!(before - side.export_snapshot(&storage, at(edge + 10)).len(), Invitation::LEN);
     // Pruning is reflected in the snapshot, and the rest survives it.
     let restored: Responder<u32> =
-        Responder::restore_identity(&bob, NET, &storage, &side.export_snapshot(&storage)).unwrap();
+        Responder::restore_identity(&bob, NET, &storage, &side.export_snapshot(&storage, now())).unwrap();
     assert!(!restored.gate().is_revoked(&short_inv.id));
     assert!(restored.gate().is_revoked(&long_inv.id));
 }
@@ -210,7 +213,7 @@ fn bad_snapshots_fail_loudly() {
     let storage = StorageKey::generate();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
     side.block([3; 32]);
-    let saved = side.export_snapshot(&storage);
+    let saved = side.export_snapshot(&storage, now());
     let restore = |key: &StorageKey, network: Network, bytes: &[u8]| {
         Responder::<u32>::restore_identity(&bob, network, key, bytes).map(|_| ())
     };
@@ -232,10 +235,10 @@ fn bad_snapshots_fail_loudly() {
     assert_eq!(restore(&storage, NET, &[]), Err(SnapshotError::Truncated));
     // Another identity's snapshot, or a callback listener's, is refused.
     let other = ContactIdentity::generate();
-    let theirs = Responder::<u32>::for_identity(&other, NET).export_snapshot(&storage);
+    let theirs = Responder::<u32>::for_identity(&other, NET).export_snapshot(&storage, now());
     assert_eq!(restore(&storage, NET, &theirs), Err(SnapshotError::WrongIdentity));
-    let listener = Responder::<u32>::for_callback(&StaticKey::generate(), NET, [5; 32], [1; 32], NOW + 60).unwrap();
-    assert_eq!(restore(&storage, NET, &listener.export_snapshot(&storage)), Err(SnapshotError::WrongIdentity));
+    let mut listener = Responder::<u32>::for_callback(&StaticKey::generate(), NET, [5; 32], [1; 32], NOW + 60).unwrap();
+    assert_eq!(restore(&storage, NET, &listener.export_snapshot(&storage, now())), Err(SnapshotError::WrongIdentity));
     assert_eq!(
         Responder::<u32>::restore_callback(bob.handshake_key(), NET, &storage, &saved).map(|_| ()),
         Err(SnapshotError::WrongIdentity)
@@ -252,4 +255,73 @@ fn snapshots_are_written_atomically() {
     assert_eq!(std::fs::read(&path).unwrap(), b"second");
     assert!(!dir.join("gate.snapshot.tmp").exists(), "no temporary file left behind");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- the clock floor: time never runs backwards for the gate ----------------------
+
+#[test]
+fn a_pruned_invitation_stays_refused_when_the_clock_jumps_back_after_a_restore() {
+    let bob = ContactIdentity::generate();
+    let storage = StorageKey::generate();
+    let peer = bob.handshake_key().public();
+    let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
+    // Dave's invitation is revoked; Alice's is consumed and then she is
+    // removed. Both expire at NOW + 60.
+    let (dave, alice) = (StaticKey::generate(), StaticKey::generate());
+    let dave_inv = invite(&bob, &dave, NOW + 60);
+    side.record_invitation(dave_inv.clone(), now()).unwrap();
+    side.remove_contact(dave.public());
+    let alice_inv = invite(&bob, &alice, NOW + 60);
+    side.record_invitation(alice_inv.clone(), now()).unwrap();
+    call(&mut side, &alice, peer, alice_inv.id, 1, now()).unwrap();
+    side.remove_contact(alice.public());
+    // Time passes expiry plus skew: both ids are pruned. Saved and restored.
+    let later = NOW + 60 + CLOCK_SKEW_SECS;
+    side.expire(at(later));
+    assert!(!side.gate().is_revoked(&dave_inv.id) && !side.gate().is_honoured(&alice_inv.id), "pruned");
+    assert_eq!(side.gate().last_seen(), later, "pruning moved the floor up");
+    side.expire(at(NOW));
+    assert_eq!(side.gate().last_seen(), later, "and an earlier reading does not move it back");
+    let saved = side.export_snapshot(&storage, at(later));
+    let mut restored: Responder<u32> = Responder::restore_identity(&bob, NET, &storage, &saved).unwrap();
+    assert_eq!(restored.gate().last_seen(), later, "the floor survives the restart");
+    // The system clock now reads a time before the invitations expired.
+    let back = at(NOW + 30);
+    for (key, inv, tag) in [(&dave, &dave_inv, 2), (&alice, &alice_inv, 3)] {
+        assert_eq!(restored.record_invitation(inv.clone(), back), Err(ContactError::Expired), "judged at the floor");
+        assert!(matches!(call(&mut restored, key, peer, inv.id, tag, back), Err(WireError::Unauthorised)));
+    }
+    assert_eq!(restored.gate().last_seen(), later, "a backward clock does not lower the floor");
+}
+
+#[test]
+fn a_callback_grant_cannot_be_resurrected_by_a_backward_clock_across_a_restart() {
+    let bob = ContactIdentity::generate();
+    let storage = StorageKey::generate();
+    let carol = StaticKey::generate();
+    let peer = bob.handshake_key().public();
+    let mut listener: Responder<u32> = Responder::for_callback(&carol, NET, peer, [7; 32], NOW + 600).unwrap();
+    // Saved after the deadline has been seen, before anything pruned the
+    // grant, so the snapshot still contains it.
+    let saved = listener.export_snapshot(&storage, at(NOW + 605));
+    // Pruning at the floor frees the grant's space (caller, reference,
+    // deadline: 72 bytes) even with an earlier clock reading.
+    let mut pruned: Responder<u32> = Responder::restore_callback(&carol, NET, &storage, &saved).unwrap();
+    pruned.expire(at(NOW + 590));
+    assert_eq!(saved.len() - pruned.export_snapshot(&storage, at(NOW + 590)).len(), 32 + 32 + 8);
+    // Within the run the floor already refuses an earlier clock reading.
+    assert_eq!(listener.gate().authorise(&peer, &[7; 32], at(NOW + 590)), None);
+    // Across a restart, with the clock set back before the deadline.
+    let mut restored: Responder<u32> = Responder::restore_callback(&carol, NET, &storage, &saved).unwrap();
+    assert_eq!(restored.gate().last_seen(), NOW + 605);
+    assert_eq!(restored.gate().authorise(&peer, &[7; 32], at(NOW + 590)), None);
+    assert!(matches!(
+        call(&mut restored, bob.handshake_key(), carol.public(), [7; 32], 1, at(NOW + 590)),
+        Err(WireError::Unauthorised)
+    ));
+    // Control: a snapshot saved before the deadline was seen still answers.
+    let mut fresh: Responder<u32> = Responder::for_callback(&carol, NET, peer, [7; 32], NOW + 600).unwrap();
+    let early = fresh.export_snapshot(&storage, at(NOW + 500));
+    let mut back: Responder<u32> = Responder::restore_callback(&carol, NET, &storage, &early).unwrap();
+    assert!(matches!(call(&mut back, bob.handshake_key(), carol.public(), [7; 32], 2, at(NOW + 590)), Ok(Grant::Callback)));
 }
