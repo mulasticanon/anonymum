@@ -12,6 +12,17 @@
 //! unreviewed prototype (spec question 11). The rules, using `snow`'s public
 //! API only:
 //!
+//! * **Data frames use a Double Ratchet** ([`crate::ratchet`], unreviewed).
+//!   CONFIRM carries the caller's fresh 32-byte seed; ACK carries the
+//!   answerer's fresh seed and its first ratchet public key (refused if
+//!   small-order). Both sides derive the first root key from the two seeds
+//!   and the IK handshake hash. The answerer starts the ratchet ("Alice")
+//!   against the caller's static key, so it can send at once; the caller
+//!   takes the first ratchet step when the ACK arrives. Data frames that
+//!   reach the caller before the ACK are held ([`MAX_EARLY_DATA`]) and
+//!   opened afterwards ([`Initiator::take_early`]). The Noise session
+//!   carries only CONFIRM and ACK.
+//!
 //! * **Authorise before replying.** The responder reads the caller's key and
 //!   reference from HELLO and asks its [`Gate`]. An unauthorised caller gets
 //!   nothing: no WELCOME, no error, no frame of any kind. Every `Err` from
@@ -58,6 +69,11 @@
 //!   [`PENDING_TIMEOUT`] after it was answered; a session expires after
 //!   [`SESSION_IDLE_TIMEOUT`] without traffic; a callback grant expires at
 //!   the deadline it was given (Unix seconds, so it survives a restart).
+//! * **A session moves to a new reply handle only on fresh data.** A
+//!   repeated CONFIRM from a new handle is answered there but only marks the
+//!   handle as a candidate; the session moves when a data frame from it
+//!   opens in the ratchet. A replayed data frame does not open (its key was
+//!   erased) and changes nothing.
 //!   The first two use the injected monotonic clock, the third the injected
 //!   wall clock; all are checked on every operation.
 //!
@@ -96,12 +112,14 @@ use std::time::{Duration, Instant};
 
 use rand_core::{OsRng, RngCore};
 
-use crate::contact::{ContactError, ContactIdentity, Invitation, Network, StaticKey};
+use zeroize::Zeroizing;
+
+use crate::contact::{is_contributory_key, random_bytes, ContactError, ContactIdentity, Invitation, Network, StaticKey};
 use crate::gate::{Gate, Grant, Now};
+use crate::ratchet::{self, Ratchet, RatchetError, RatchetKey};
 use crate::snapshot::{self, SnapshotError, StorageKey};
 use crate::session::{
-    Handshake, Incoming, Session, SessionError, MAX_NOISE_MESSAGE, MAX_PLAINTEXT, MESSAGE1_LEN, MESSAGE2_LEN,
-    MIN_SEALED, NONCE_LEN, REFERENCE_LEN,
+    Handshake, Incoming, Session, SessionError, MAX_PLAINTEXT, MESSAGE1_LEN, MESSAGE2_LEN, MIN_SEALED, REFERENCE_LEN,
 };
 
 const HELLO: u8 = 1;
@@ -114,13 +132,23 @@ const ACK: u8 = 5;
 const HEADER_LEN: usize = 1 + 4 + 4;
 /// What the caller's confirmation and the answerer's ack carry, after their
 /// record type and the call id and attempt.
-const CONFIRM_MARKER: &[u8] = b"anonymum/confirm/v3";
-const ACK_MARKER: &[u8] = b"anonymum/acknowledge/v3";
+const CONFIRM_MARKER: &[u8] = b"anonymum/confirm/v4";
+const ACK_MARKER: &[u8] = b"anonymum/acknowledge/v4";
 /// Inner record: type byte, then call id and attempt for control records.
 const CONTROL_LEN: usize = 1 + 8;
+/// A fresh random seed each side contributes to the ratchet's root key.
+const SEED_LEN: usize = 32;
+/// CONFIRM's plaintext: control record, marker, the caller's seed.
+const CONFIRM_LEN: usize = CONTROL_LEN + CONFIRM_MARKER.len() + SEED_LEN;
+/// ACK's plaintext: control record, marker, the answerer's seed and its
+/// first ratchet public key.
+const ACK_LEN: usize = CONTROL_LEN + ACK_MARKER.len() + SEED_LEN + 32;
 
 /// The longest valid frame: a data frame carrying [`MAX_DATA`].
-pub const MAX_FRAME: usize = 1 + NONCE_LEN + MAX_NOISE_MESSAGE;
+pub const MAX_FRAME: usize = 1 + ratchet::MAX_MESSAGE;
+/// Most data frames a caller holds while it waits for the ACK (they cannot
+/// be opened before it: the ACK carries the answerer's ratchet seed).
+pub const MAX_EARLY_DATA: usize = 16;
 /// Largest message one data frame carries (one byte goes to the inner
 /// record type).
 pub const MAX_DATA: usize = MAX_PLAINTEXT - 1;
@@ -140,6 +168,8 @@ pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug)]
 pub enum WireError {
     Session(SessionError),
+    /// A data frame the Double Ratchet refused; nothing changed.
+    Ratchet(RatchetError),
     /// Empty frame or unknown type byte. Ignored; nothing changed.
     UnknownFrame,
     /// Wrong length for its type. Ignored; nothing changed.
@@ -198,22 +228,35 @@ fn control(kind: u8, at: Attempt, marker: &[u8]) -> Vec<u8> {
     [&[kind], at.label().as_slice(), marker].concat()
 }
 
-fn data_frame(session: &mut Session, plaintext: &[u8]) -> Result<Vec<u8>, WireError> {
+/// The plaintext of a CONFIRM: its control record and the caller's seed.
+fn confirm_record(at: Attempt, seed: &[u8; SEED_LEN]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new([control(CONFIRM, at, CONFIRM_MARKER).as_slice(), seed].concat())
+}
+
+/// The plaintext of an ACK: control record, the answerer's seed and its
+/// first ratchet public key.
+fn ack_record(at: Attempt, seed: &[u8; SEED_LEN], ratchet_key: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new([control(ACK, at, ACK_MARKER).as_slice(), seed, ratchet_key].concat())
+}
+
+/// A data frame: `DATA || ratchet message`, the inner record typed DATA.
+fn data_frame(ratchet: &mut Ratchet, plaintext: &[u8]) -> Result<Vec<u8>, WireError> {
     if plaintext.len() > MAX_DATA {
         return Err(SessionError::TooLarge.into());
     }
-    let sealed = session.seal(&[&[DATA], plaintext].concat())?;
+    let inner = Zeroizing::new([&[DATA], plaintext].concat());
+    let sealed = ratchet.encrypt(&inner).map_err(WireError::Ratchet)?;
     Ok([&[DATA], sealed.as_slice()].concat())
 }
 
-/// Open a data frame's body: the inner type must be DATA.
-fn open_data(session: &mut Session, body: &[u8]) -> Result<Vec<u8>, WireError> {
-    let mut plaintext = session.open_if(body, |p| p.first() == Some(&DATA)).map_err(|e| match e {
-        SessionError::Refused => WireError::Stale,
-        other => WireError::Session(other),
+/// Open a data frame's body with the ratchet: the inner type must be DATA.
+/// A refusal or failure changes nothing in the ratchet.
+fn open_data(ratchet: &mut Ratchet, body: &[u8]) -> Result<Vec<u8>, WireError> {
+    let plaintext = ratchet.decrypt_if(body, |p| p.first() == Some(&DATA)).map_err(|e| match e {
+        RatchetError::Refused => WireError::Stale,
+        other => WireError::Ratchet(other),
     })?;
-    plaintext.remove(0);
-    Ok(plaintext)
+    Ok(plaintext[1..].to_vec())
 }
 
 fn handshake_frame(kind: u8, at: Attempt, body: &[u8]) -> Vec<u8> {
@@ -237,12 +280,12 @@ fn parse(frame: &[u8]) -> Result<Frame<'_>, WireError> {
     let (&kind, body) = frame.split_first().ok_or(WireError::UnknownFrame)?;
     let body_len = match kind {
         DATA => {
-            return if body.len() < MIN_SEALED + 1 { Err(WireError::Malformed) } else { Ok(Frame::Data(body)) };
+            return if body.len() < ratchet::MIN_MESSAGE + 1 { Err(WireError::Malformed) } else { Ok(Frame::Data(body)) };
         }
         HELLO => MESSAGE1_LEN,
         WELCOME => MESSAGE2_LEN,
-        CONFIRM => MIN_SEALED + CONTROL_LEN + CONFIRM_MARKER.len(),
-        ACK => MIN_SEALED + CONTROL_LEN + ACK_MARKER.len(),
+        CONFIRM => MIN_SEALED + CONFIRM_LEN,
+        ACK => MIN_SEALED + ACK_LEN,
         _ => return Err(WireError::UnknownFrame),
     };
     if frame.len() != HEADER_LEN + body_len {
@@ -282,14 +325,17 @@ pub struct Initiator {
     policy: RetryPolicy,
     attempt: u32,
     state: State,
+    /// Messages that arrived before the ACK, opened once it came.
+    early: Vec<Vec<u8>>,
 }
 
 enum State {
     /// HELLO sent; waiting for WELCOME.
     Handshaking { handshake: Handshake, sent: Vec<u8>, resends: u32 },
-    /// CONFIRM sent; waiting for the answerer's ACK.
-    Confirming { session: Session, sent: Vec<u8>, resends: u32 },
-    Established(Session),
+    /// CONFIRM (carrying `seed`) sent; waiting for the answerer's ACK. Data
+    /// frames that arrive first are held in `held`, unopened.
+    Confirming { session: Session, seed: Zeroizing<[u8; SEED_LEN]>, sent: Vec<u8>, resends: u32, held: Vec<Vec<u8>> },
+    Established(Ratchet),
     /// The last attempt failed; the next starts after [`Initiator::wait`].
     Waiting,
     Failed,
@@ -299,10 +345,14 @@ enum State {
 pub enum InitiatorEvent {
     /// Send this frame to the peer (the CONFIRM).
     Send(Vec<u8>),
-    /// The answerer acknowledged; [`Initiator::seal`] is usable.
+    /// The answerer acknowledged; [`Initiator::seal`] is usable. Messages
+    /// that arrived before the ACK are in [`Initiator::take_early`].
     Established,
-    /// A message. If it arrived before the ACK, it established the session.
+    /// A message.
     Message(Vec<u8>),
+    /// A data frame arrived before the ACK. It is held (at most
+    /// [`MAX_EARLY_DATA`]) and opened when the ACK comes.
+    Held,
 }
 
 impl Initiator {
@@ -336,6 +386,7 @@ impl Initiator {
             policy,
             attempt: 0,
             state: State::Waiting,
+            early: Vec::new(),
         };
         let first = initiator.new_attempt()?;
         Ok((initiator, first))
@@ -362,6 +413,12 @@ impl Initiator {
 
     pub fn is_established(&self) -> bool {
         matches!(self.state, State::Established(_))
+    }
+
+    /// Messages that arrived before the ACK and opened once it came, in
+    /// arrival order. Each is returned once.
+    pub fn take_early(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.early)
     }
 
     /// The current attempt number (1 for the first).
@@ -407,9 +464,10 @@ impl Initiator {
                 }
                 match handshake.finish(body) {
                     Ok(mut session) => {
-                        let record = session.seal(&control(CONFIRM, current, CONFIRM_MARKER))?;
+                        let seed = Zeroizing::new(random_bytes());
+                        let record = session.seal(&confirm_record(current, &seed))?;
                         let sent = handshake_frame(CONFIRM, current, &record);
-                        self.state = State::Confirming { session, sent: sent.clone(), resends: 0 };
+                        self.state = State::Confirming { session, seed, sent: sent.clone(), resends: 0, held: Vec::new() };
                         Ok(InitiatorEvent::Send(sent))
                     }
                     Err(error) => {
@@ -418,30 +476,54 @@ impl Initiator {
                     }
                 }
             }
-            (Frame::Handshake { kind: ACK, at, body }, State::Confirming { mut session, sent, resends }) => {
+            (Frame::Handshake { kind: ACK, at, body }, State::Confirming { mut session, seed, sent, resends, held }) => {
+                // The answerer's seed and first ratchet key, inside the
+                // sealed ACK; a small-order ratchet key is refused before
+                // the record counts.
                 let expected = control(ACK, current, ACK_MARKER);
-                let acknowledged = at == current && session.open_if(body, |p| p == expected).is_ok();
-                if acknowledged {
-                    self.state = State::Established(session);
-                    Ok(InitiatorEvent::Established)
-                } else {
-                    self.state = State::Confirming { session, sent, resends };
-                    Err(WireError::Stale)
+                let keys_at = expected.len();
+                let opened = (at == current)
+                    .then(|| {
+                        session.open_if(body, |p| {
+                            p.len() == ACK_LEN
+                                && p.starts_with(&expected)
+                                && is_contributory_key(p[keys_at + SEED_LEN..].try_into().expect("32 bytes"))
+                        })
+                    })
+                    .and_then(Result::ok)
+                    .map(Zeroizing::new);
+                let Some(record) = opened else {
+                    self.state = State::Confirming { session, seed, sent, resends, held };
+                    return Err(WireError::Stale);
+                };
+                let seed_r: [u8; SEED_LEN] = record[keys_at..keys_at + SEED_LEN].try_into().expect("32 bytes");
+                let seed_r = Zeroizing::new(seed_r);
+                let dh_r0: [u8; 32] = record[keys_at + SEED_LEN..].try_into().expect("32 bytes");
+                let root = ratchet::root_from_handshake(&seed, &seed_r, session.handshake_hash());
+                // Our caller key is the ratchet key the answerer started
+                // from; the first step with its key happens now.
+                let own = RatchetKey::from_bytes(self.me.secret());
+                let mut ratchet =
+                    Ratchet::respond_to(&root, self.network, own, dh_r0).map_err(WireError::Ratchet)?;
+                for frame in held {
+                    if let Ok(plaintext) = open_data(&mut ratchet, &frame) {
+                        self.early.push(plaintext);
+                    }
                 }
+                self.state = State::Established(ratchet);
+                Ok(InitiatorEvent::Established)
             }
-            (Frame::Data(body), State::Confirming { mut session, sent, resends }) => match open_data(&mut session, body) {
-                Ok(plaintext) => {
-                    self.state = State::Established(session);
-                    Ok(InitiatorEvent::Message(plaintext))
+            (Frame::Data(body), State::Confirming { session, seed, sent, resends, mut held }) => {
+                let kept = held.len() < MAX_EARLY_DATA;
+                if kept {
+                    held.push(body.to_vec());
                 }
-                Err(error) => {
-                    self.state = State::Confirming { session, sent, resends };
-                    Err(error)
-                }
-            },
-            (Frame::Data(body), State::Established(mut session)) => {
-                let result = open_data(&mut session, body);
-                self.state = State::Established(session);
+                self.state = State::Confirming { session, seed, sent, resends, held };
+                if kept { Ok(InitiatorEvent::Held) } else { Err(WireError::Busy) }
+            }
+            (Frame::Data(body), State::Established(mut ratchet)) => {
+                let result = open_data(&mut ratchet, body);
+                self.state = State::Established(ratchet);
                 Ok(InitiatorEvent::Message(result?))
             }
             (Frame::Data(_), state) => {
@@ -456,8 +538,8 @@ impl Initiator {
     }
 
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, WireError> {
-        let State::Established(session) = &mut self.state else { return Err(WireError::NoSession) };
-        data_frame(session, plaintext)
+        let State::Established(ratchet) = &mut self.state else { return Err(WireError::NoSession) };
+        data_frame(ratchet, plaintext)
     }
 }
 
@@ -521,12 +603,14 @@ struct Pending {
 
 /// An established session, with the CONFIRM that finished it and our ACK,
 /// so a lost ACK can be resent, and the reply handle it currently uses.
+/// Data frames use the Double Ratchet; the Noise session is not kept.
 struct Live<T> {
     handle: T,
     at: Attempt,
     last: Vec<u8>,
     ack: Vec<u8>,
-    session: Session,
+    peer: [u8; 32],
+    ratchet: Ratchet,
     reference: [u8; REFERENCE_LEN],
     idle_deadline: Instant,
 }
@@ -749,9 +833,11 @@ impl<T: Hash + Eq + Clone> Responder<T> {
             None => (*self.candidates.get(&from).ok_or(WireError::NoSession)?, true),
         };
         let live = self.admitted(caller)?;
-        let plaintext = open_data(&mut live.session, body)?;
+        // Only a fresh frame that the ratchet opens counts; a replayed or
+        // forged one changes nothing, so it cannot move the session.
+        let plaintext = open_data(&mut live.ratchet, body)?;
         live.idle_deadline = now.mono + SESSION_IDLE_TIMEOUT;
-        let peer = live.session.peer();
+        let peer = live.peer;
         if moving {
             self.reroute(caller, from);
         }
@@ -848,9 +934,19 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         let pending = self.pending.get_mut(&key).expect("found above");
         // A transport message: a bad one is dropped; the attempt stays.
         let expected = control(CONFIRM, at, CONFIRM_MARKER);
-        if pending.session.open_if(body, |p| p == expected).is_err() {
-            return Err(WireError::Stale);
-        }
+        let record = match pending.session.open_if(body, |p| p.len() == CONFIRM_LEN && p.starts_with(&expected)) {
+            Ok(record) => Zeroizing::new(record),
+            Err(_) => return Err(WireError::Stale),
+        };
+        let seed_i: [u8; SEED_LEN] = record[expected.len()..].try_into().expect("32 bytes");
+        let seed_i = Zeroizing::new(seed_i);
+        // Our seed and first ratchet key; the ratchet starts from the
+        // caller's key (authenticated by the handshake).
+        let seed_r = Zeroizing::new(random_bytes());
+        let own = RatchetKey::generate();
+        let own_public = own.public();
+        let root = ratchet::root_from_handshake(&seed_i, &seed_r, pending.session.handshake_hash());
+        let ratchet = Ratchet::initiate_with(&root, self.gate.network(), own, peer).map_err(WireError::Ratchet)?;
         let mut pending = self.pending.remove(&key).expect("found above");
         if !self.gate.commit(&peer, &pending.reference, pending.grant, now) {
             return Err(WireError::Unauthorised); // blocked, used or expired meanwhile
@@ -871,14 +967,15 @@ impl<T: Hash + Eq + Clone> Responder<T> {
                 self.candidates.retain(|_, c| *c != other);
             }
         }
-        let ack = handshake_frame(ACK, at, &pending.session.seal(&control(ACK, at, ACK_MARKER))?);
+        let ack = handshake_frame(ACK, at, &pending.session.seal(&ack_record(at, &seed_r, &own_public))?);
         let grant = pending.grant;
         let live = Live {
             handle: from,
             at,
             last: incoming.to_vec(),
             ack: ack.clone(),
-            session: pending.session,
+            peer,
+            ratchet,
             reference: pending.reference,
             idle_deadline: now.mono + SESSION_IDLE_TIMEOUT,
         };
@@ -889,7 +986,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     pub fn seal(&mut self, to: &T, plaintext: &[u8], now: Now) -> Result<Vec<u8>, WireError> {
         self.expire(now);
         let live = self.live(to)?;
-        let frame = data_frame(&mut live.session, plaintext)?;
+        let frame = data_frame(&mut live.ratchet, plaintext)?;
         live.idle_deadline = now.mono + SESSION_IDLE_TIMEOUT;
         Ok(frame)
     }
@@ -982,10 +1079,49 @@ mod tests {
         // Seal a DATA-typed record of CONFIRM size in the caller's session.
         let State::Confirming { session, .. } = &mut call.state else { panic!() };
         let mut inner = vec![DATA];
-        inner.resize(CONTROL_LEN + CONFIRM_MARKER.len(), 0x55);
+        inner.resize(CONFIRM_LEN, 0x55);
         let forged = [&confirm[..HEADER_LEN], session.seal(&inner).unwrap().as_slice()].concat();
         assert_eq!(forged.len(), confirm.len());
         assert!(matches!(side.handle(1, &forged, now()), Err(WireError::Stale)));
         assert!(matches!(side.handle(1, &confirm, now()), Ok(ResponderEvent::Established { .. })));
+    }
+
+    #[test]
+    fn an_ack_with_a_small_order_ratchet_key_is_refused_and_the_real_one_still_counts() {
+        let (mut side, mut call, hello) = setup();
+        let w = welcome(&mut side, &hello);
+        let InitiatorEvent::Send(confirm) = call.handle(&w).unwrap() else { panic!() };
+        let at = Attempt { call: call.call, number: 1 };
+        // An ACK sealed in Bob's own pending session (so it authenticates),
+        // naming a small-order first ratchet key.
+        for weak in crate::contact::tests::SMALL_ORDER {
+            let pending = side.pending.get_mut(&(1, at.call)).unwrap();
+            let forged = handshake_frame(ACK, at, &pending.session.seal(&ack_record(at, &[7; SEED_LEN], &weak)).unwrap());
+            assert!(matches!(call.handle(&forged), Err(WireError::Stale)));
+            assert!(!call.is_established());
+        }
+        let ResponderEvent::Established { reply, .. } = side.handle(1, &confirm, now()).unwrap() else { panic!() };
+        assert_eq!(call.handle(&reply).unwrap(), InitiatorEvent::Established);
+        let frame = call.seal(b"x").unwrap();
+        assert!(matches!(side.handle(1, &frame, now()), Ok(ResponderEvent::Message { .. })));
+    }
+
+    #[test]
+    fn both_sides_derive_the_same_first_root_key_from_both_seeds_and_the_transcript() {
+        let (mut side, mut call, hello) = setup();
+        let w = welcome(&mut side, &hello);
+        let InitiatorEvent::Send(confirm) = call.handle(&w).unwrap() else { panic!() };
+        let State::Confirming { session, seed, .. } = &call.state else { panic!() };
+        let hash = *session.handshake_hash();
+        let pending = side.pending.get(&(1, call.call)).unwrap();
+        assert_eq!(&hash, pending.session.handshake_hash(), "one transcript hash on both sides");
+        let seed = **seed;
+        let ResponderEvent::Established { reply, .. } = side.handle(1, &confirm, now()).unwrap() else { panic!() };
+        // A different seed or transcript gives a different root.
+        let base = ratchet::root_from_handshake(&seed, &[1; 32], &hash);
+        assert_ne!(*base, *ratchet::root_from_handshake(&[0; 32], &[1; 32], &hash));
+        assert_ne!(*base, *ratchet::root_from_handshake(&seed, &[2; 32], &hash));
+        assert_ne!(*base, *ratchet::root_from_handshake(&seed, &[1; 32], &[0; 32]));
+        assert_eq!(call.handle(&reply).unwrap(), InitiatorEvent::Established);
     }
 }

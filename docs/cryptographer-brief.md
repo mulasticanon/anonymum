@@ -138,6 +138,33 @@ composition and whether it answers questions 11 and 12:
   carries the caller's static key and a 32-byte reference (invitation id,
   relationship or accepted request) inside the encrypted payload; the
   answerer reads both before writing anything.
+- `ratchet.rs` (2026-11-21, **unreviewed prototype**): a Double Ratchet
+  after the Signal specification for every data frame, from primitives
+  already in the workspace. `KDF_RK` and `KDF_CK` are keyed BLAKE2s-256
+  with the labels `anonymum/dr-rk/v1` and `anonymum/dr-ck/v1` and an
+  output index byte (in place of HKDF and HMAC); the AEAD is
+  ChaCha20-Poly1305 under each one-time message key with a zero nonce and
+  associated data `anonymum/dr-msg/v1 || network || header`. The 40-byte
+  header (ratchet key, previous chain length, message number) is
+  authenticated, **not encrypted** (no header-encryption variant). Every
+  received ratchet key is checked for small order before any agreement; a
+  message that fails changes no state (all changes are staged and
+  committed after it opens); at most 256 keys are skipped per chain step
+  and 1,024 kept (oldest erased); a used skipped key is erased at once.
+  Bootstrap from IK: CONFIRM carries the caller's fresh 32-byte seed, ACK
+  the answerer's fresh seed and first ratchet public key; both derive
+  `root_0 = MAC_{"anonymum/dr-root/v1"}(seed_i || seed_r || h)` with `h`
+  the IK handshake hash (`snow`'s public `get_handshake_hash`). The
+  answerer starts the ratchet ("Alice") against the **caller's static IK
+  key** as the first remote ratchet key, so it can send at once; the caller
+  takes its first DH step on the ACK. Data that overtakes the ACK is held
+  (at most 16 frames) and opened afterwards. **For you:** (1) is using the
+  caller's static key as the initial ratchet key acceptable (it is scoped
+  to one relationship or request; the first root key is independent of it)?
+  (2) Is keyed BLAKE2s an acceptable KDF in place of HKDF/HMAC? (3) Is the
+  unencrypted header acceptable inside the mixnet's own encryption (it
+  shows the ratchet key and counters to whoever sees the frame)? (4) The
+  skip caps and the eviction policy.
 - `gate.rs` and `wire.rs`: the answerer replies only to an authorised key
   (an unused invitation it issued, an existing contact, or the expected
   callback), never blocked; anyone else gets no frame at all. Grants are
@@ -173,7 +200,8 @@ composition and whether it answers questions 11 and 12:
   slots that must be indistinguishable from real ones (slot sizes now
   proposed: two 200-byte coin slots and one 1,787-byte stranger slot, I24;
   dummies now prototyped, below);
-  post-quantum key exchange and ratcheting as long-term questions; and
+  post-quantum key exchange and ratcheting as long-term questions (the
+  ratchet is now prototyped, above); and
   the host Ed25519 check (ZIP 215 via `ed25519-zebra`) accepting small-order
   invite keys that `verify_strict` refuses.
 - **Wallet and network behaviour rules W1-W6** (spec section 2b, issues
@@ -279,8 +307,10 @@ composition and whether it answers questions 11 and 12:
   IK's weaker caller privacy if the answerer's handshake key leaks; notes
   (Noise X) get forward secrecy only from inbox rotation (a seized device
   reads notes to the epochs it still holds: up to a week plus 26 hours); the ephemeral key in a note is
-  a raw X25519 point (question 12); forward secrecy per session only; no
-  post-quantum key exchange; nothing audited. Questions raised while
+  a raw X25519 point (question 12); per-message forward secrecy and
+  post-compromise security only through the unreviewed Double Ratchet
+  prototype (`ratchet.rs`, above); no post-quantum key exchange; nothing
+  audited. Questions raised while
   building it are I15-I27 in the issues file.
 
 ### D. How the pieces compose at the network layer

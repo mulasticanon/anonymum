@@ -8,7 +8,7 @@ use anonymum_crypto::wire::{
     Initiator, InitiatorEvent, Limits, Responder, ResponderEvent, RetryPolicy, WireError, MAX_DATA, MAX_FRAME,
     MAX_PENDING, MAX_PENDING_PER_CALLER, MAX_SESSIONS, PENDING_TIMEOUT, SESSION_IDLE_TIMEOUT,
 };
-use anonymum_crypto::{ContactIdentity, Grant, Network, Now, Purpose, SessionError, StaticKey};
+use anonymum_crypto::{ContactIdentity, Grant, Network, Now, Purpose, RatchetError, SessionError, StaticKey};
 
 const NET: Network = [9; 32];
 const UNIX: u64 = 1_000;
@@ -140,7 +140,7 @@ fn responder_keeps_callers_apart() {
     let mut from_carol = establish(&carol, &mut bob, 2);
     let a = from_alice.seal(b"from alice").unwrap();
     let c = from_carol.seal(b"from carol").unwrap();
-    assert!(matches!(bob.handle(1, &c), Err(WireError::Session(_))));
+    assert!(matches!(bob.handle(1, &c), Err(WireError::Ratchet(_))));
     assert!(matches!(bob.handle(1, &a), Ok(ResponderEvent::Message { .. })));
     assert!(matches!(bob.handle(2, &c), Ok(ResponderEvent::Message { .. })));
 }
@@ -514,17 +514,21 @@ fn a_record_cannot_change_type_and_a_refused_one_keeps_its_counter() {
     let (mut call, hello) = bob.call(&alice, POLICY);
     let welcome = reply(bob.handle(1, &hello).unwrap());
     let confirm = send(call.handle(&welcome).unwrap());
-    let _lost_ack = established(bob.handle(1, &confirm).unwrap(), &alice);
+    let lost_ack = established(bob.handle(1, &confirm).unwrap(), &alice);
 
-    // Bob's next DATA, sized like an ACK, relabelled as an ACK for Alice's
-    // current attempt: refused (its inner type is DATA), and the genuine
-    // DATA frame still delivers afterwards.
-    let data = bob.seal(1, &[0x55; 31]).unwrap();
+    // Bob's next DATA (a ratchet message), sized like an ACK, relabelled as
+    // an ACK for Alice's current attempt: refused (it does not open in the
+    // Noise session), and the genuine DATA frame is still held and opened
+    // once the ACK arrives.
+    let size = lost_ack.len() - 9 - 40 - 16 - 1;
+    let data = bob.seal(1, &vec![0x55; size]).unwrap();
     let as_ack = [&[5u8], &confirm[1..9], &data[1..]].concat();
-    assert_eq!(as_ack.len(), _lost_ack.len(), "same length as a real ACK");
+    assert_eq!(as_ack.len(), lost_ack.len(), "same length as a real ACK");
     assert!(matches!(call.handle(&as_ack), Err(WireError::Stale)));
     assert!(!call.is_established());
-    assert_eq!(call.handle(&data).unwrap(), InitiatorEvent::Message(vec![0x55; 31]));
+    assert_eq!(call.handle(&data).unwrap(), InitiatorEvent::Held, "data before the ACK is held");
+    assert_eq!(call.handle(&lost_ack).unwrap(), InitiatorEvent::Established);
+    assert_eq!(call.take_early(), vec![vec![0x55; size]]);
 
     talks(&mut call, &alice, &mut bob, 1);
 }
@@ -537,11 +541,15 @@ fn an_ack_relabelled_as_data_is_refused_and_still_counts_afterwards() {
     let welcome = reply(bob.handle(1, &hello).unwrap());
     let confirm = send(call.handle(&welcome).unwrap());
     let ack = established(bob.handle(1, &confirm).unwrap(), &alice);
-    // The ACK's body (a fresh, authentic record) as a DATA frame.
+    // The ACK's body (a fresh, authentic record) as a DATA frame: held
+    // (data cannot be opened before the ACK), then refused by the ratchet;
+    // the real ACK still counts.
     let as_data = [&[4u8], &ack[9..]].concat();
-    assert!(matches!(call.handle(&as_data), Err(WireError::Stale)));
+    assert_eq!(call.handle(&as_data).unwrap(), InitiatorEvent::Held);
     assert!(!call.is_established());
     assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established, "its counter was not used up");
+    assert!(call.take_early().is_empty(), "the relabelled ACK did not open as data");
+    assert!(call.handle(&as_data).is_err(), "nor does it after the ACK");
     talks(&mut call, &alice, &mut bob, 1);
 }
 
@@ -554,14 +562,11 @@ fn a_confirm_body_cannot_pose_as_data() {
     let confirm = send(call.handle(&welcome).unwrap());
     let ack = established(bob.handle(1, &confirm).unwrap(), &alice);
     assert_eq!(call.handle(&ack).unwrap(), InitiatorEvent::Established);
-    // Alice's CONFIRM, its body presented as a DATA frame: refused (its
-    // counter was already used when Bob committed it; its inner type is
-    // CONFIRM in any case), and Bob's session is unaffected.
+    // Alice's CONFIRM, its body presented as a DATA frame: refused (it is
+    // a Noise record, not a ratchet message), and Bob's session is
+    // unaffected.
     let as_data = [&[4u8], &confirm[9..]].concat();
-    assert!(matches!(
-        bob.handle(1, &as_data),
-        Err(WireError::Session(SessionError::Replay)) | Err(WireError::Stale)
-    ));
+    assert!(matches!(bob.handle(1, &as_data), Err(WireError::Ratchet(_)) | Err(WireError::Stale)));
     talks(&mut call, &alice, &mut bob, 1);
 }
 
@@ -789,7 +794,7 @@ fn a_replayed_confirm_or_data_frame_cannot_redirect_a_session() {
     assert!(matches!(bob.handle(1, &data), Ok(ResponderEvent::Message { .. })));
     // Someone replays both from handle 99.
     let _ = bob.handle(99, &confirm);
-    assert!(matches!(bob.handle(99, &data), Err(WireError::Session(SessionError::Replay))));
+    assert!(matches!(bob.handle(99, &data), Err(WireError::Ratchet(RatchetError::Replay))));
     assert!(bob.side.is_live(&1) && !bob.side.is_live(&99), "the session stays on Alice's handle");
     talks(&mut call, &alice, &mut bob, 1);
 }

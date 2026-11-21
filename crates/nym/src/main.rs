@@ -484,8 +484,9 @@ async fn stranger_side(
         "  Carol's throwaway let in Bob's key only ({:.0}s after coming back online; his call was held by her gateway).",
         started.elapsed().as_secs_f32()
     );
-    // Sent at once: a valid message also establishes the session for Bob if
-    // our ACK was lost.
+    // Sent at once. If it overtakes our ACK, Bob holds it until the ACK
+    // arrives (it cannot be opened before: the ACK carries our ratchet
+    // seed); if the ACK was lost, his resent CONFIRM gets it again below.
     let hello = format!("{my_long_lived} {}", to_hex(&me.signing_key()));
     throwaway.reply(tag, side.seal(&tag, hello.as_bytes(), Now::system())?).await?;
     let (_, plaintext, _) = next_delivery(&mut throwaway, &mut side, tag).await?;
@@ -734,8 +735,13 @@ async fn call(
                     net.send(to, confirm).await?;
                     deadline = deadline_for(&call);
                 }
-                Ok(InitiatorEvent::Established) => return Ok((call, None)),
+                Ok(InitiatorEvent::Established) => {
+                    // A message that overtook the ACK was held and opens now.
+                    let early = call.take_early().into_iter().next();
+                    return Ok((call, early));
+                }
                 Ok(InitiatorEvent::Message(text)) => return Ok((call, Some(text))),
+                Ok(InitiatorEvent::Held) => println!("  {}: a message arrived before the ACK; held", net.name),
                 Err(WireError::AttemptFailed(error)) => {
                     println!("  {}: attempt {} failed ({error}); a fresh one follows", net.name, call.attempt());
                     deadline = deadline_for(&call);

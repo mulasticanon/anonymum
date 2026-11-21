@@ -25,7 +25,9 @@
 //!
 //! Limits, stated plainly:
 //! * Unreviewed prototype of section 2a (questions 11 and 12).
-//! * Forward secrecy is per session, not per message. No double ratchet.
+//! * Forward secrecy here is per session. The wire layer uses these
+//!   sessions only for the handshake's CONFIRM and ACK; data frames use the
+//!   Double Ratchet ([`crate::ratchet`]), an unreviewed prototype.
 //! * No post-quantum key exchange yet.
 //! * Message length is visible to the transport. The mixnet's fixed-size
 //!   packets hide it on the wire.
@@ -138,7 +140,8 @@ impl Handshake {
         if n != 0 {
             return Err(SessionError::Malformed);
         }
-        Ok(Session::new(self.state.into_stateless_transport_mode()?, self.peer))
+        let hash = handshake_hash(&self.state)?;
+        Ok(Session::new(self.state.into_stateless_transport_mode()?, self.peer, hash))
     }
 }
 
@@ -189,22 +192,37 @@ impl Incoming {
         let mut message2 = vec![0u8; MESSAGE2_LEN];
         let n = self.state.write_message(&[], &mut message2)?;
         message2.truncate(n);
-        Ok((Session::new(self.state.into_stateless_transport_mode()?, self.caller), message2))
+        let hash = handshake_hash(&self.state)?;
+        Ok((Session::new(self.state.into_stateless_transport_mode()?, self.caller, hash), message2))
     }
+}
+
+/// The finished handshake's transcript hash (`snow`'s public
+/// `get_handshake_hash`; 32 bytes for BLAKE2s).
+fn handshake_hash(state: &HandshakeState) -> Result<[u8; 32], SessionError> {
+    state.get_handshake_hash().try_into().map_err(|_| SessionError::Malformed)
 }
 
 /// An established end-to-end encrypted session.
 pub struct Session {
     transport: StatelessTransportState,
     peer: [u8; 32],
+    handshake_hash: [u8; 32],
     next_send: u64,
     newest_received: Option<u64>,
     received: BTreeSet<u64>,
 }
 
 impl Session {
-    fn new(transport: StatelessTransportState, peer: [u8; 32]) -> Self {
-        Session { transport, peer, next_send: 0, newest_received: None, received: BTreeSet::new() }
+    fn new(transport: StatelessTransportState, peer: [u8; 32], handshake_hash: [u8; 32]) -> Self {
+        Session { transport, peer, handshake_hash, next_send: 0, newest_received: None, received: BTreeSet::new() }
+    }
+
+    /// The hash of the authenticated handshake transcript; equal on both
+    /// sides of one session. The wire layer binds the ratchet's first root
+    /// key to it.
+    pub(crate) fn handshake_hash(&self) -> &[u8; 32] {
+        &self.handshake_hash
     }
 
     /// The other end's authenticated static key.

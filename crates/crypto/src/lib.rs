@@ -9,6 +9,9 @@
 //! * [`wire`] — Noise IK sessions between contact keys, driven through
 //!   [`wire::Initiator`] and [`wire::Responder`] (the only way to answer). Nobody without one of the two private keys can read the
 //!   messages: no node, no developer.
+//! * [`ratchet`] — a Double Ratchet (Signal specification) for data frames,
+//!   seeded from the IK handshake: per-message forward secrecy and
+//!   post-compromise security. Unreviewed prototype.
 //! * [`seal_note`] / [`open_note`] — a stranger's fixed-size note, opened
 //!   with the recipient's inbox key alone.
 //! * [`InviteSecret`] / [`Ed25519Invites`] — the transparent chain's
@@ -23,6 +26,7 @@ pub mod gate;
 mod identity;
 mod invite;
 pub mod note;
+pub mod ratchet;
 pub mod snapshot;
 mod session;
 pub mod wire;
@@ -36,4 +40,5 @@ pub use snapshot::{write_atomically, SnapshotError, StorageKey, GATE_SNAPSHOT_VE
 pub use identity::Identity;
 pub use invite::{Ed25519Invites, InviteSecret};
 pub use note::{dummy_note, open_note, seal_note, ContactNote, NoteError};
+pub use ratchet::{Ratchet, RatchetError, RatchetKey};
 pub use session::{Session, SessionError, MAX_PLAINTEXT, REFERENCE_LEN};

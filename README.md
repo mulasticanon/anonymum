@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; encrypted, versioned snapshots of grant state (one device); weekly inbox key rotation; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, note format and snapshot have not been reviewed.** | 127 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; a Double Ratchet (Signal specification) for data frames, seeded from the IK handshake; encrypted, versioned snapshots of grant state (one device); weekly inbox key rotation; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, ratchet, note format and snapshot have not been reviewed.** | 154 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, random (never all-zero) dummy slots, a versioned recovery copy, escrows that lock a fee ceiling (surplus returned privately, a top-up if the fee rises above it), and one-time refund keys per escrow. | 83 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -249,12 +249,13 @@ reviewed.
 | Reverse rendezvous for strangers | Sealed fixed-size notes built and tested; the full flow ran live, including once end to end through the dev chain (`e2e.mjs`). Retry rules live in `anonymum_crypto::wire`; the demo binary drives them |
 | Invites | Real Ed25519 signatures, bound to opener, recipient and the chain's genesis hash (v2 messages; the messaging-key binding also names the account) |
 | End-to-end encryption | Noise IK (X25519, ChaCha20-Poly1305, BLAKE2s) between contact keys, never wallet keys. The answering side reads the caller's key inside message 1 and replies only to a caller it authorised (invitation, contact, expected callback); anyone else gets nothing. **Unreviewed prototype** (spec questions 11 and 12) |
-| Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose) |
+| Per-message forward secrecy, self-healing after compromise | Double Ratchet (Signal specification; X25519, keyed BLAKE2s, ChaCha20-Poly1305) for every data frame, seeded from both sides' fresh seeds and the IK handshake hash. Tested for turn-arounds, reordering, replay, forward secrecy, post-compromise recovery and skip limits. Header not encrypted. **Unreviewed prototype** |
+| Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose; the ratchet caches up to 1,024 skipped keys, at most 256 per step) |
 | Mixnet transport | Nym SDK; replies go through single-use reply blocks, so the recipient never learns the caller's network location. Ran once live; no automated test |
 | The chain itself | Rules run as a Substrate pallet on a local single-node dev chain (manual seal, 6 s blocks). No real network, consensus or validators yet |
 | Shielded payments | Specified (`docs/shielded-spec-v0.md`, draft for review) and modelled in plain Rust (`crates/shielded-model`, rules only, not private). No circuit or pallet yet; the channel table is still public |
 | Node staking and rewards | Pool accumulates; payout not started |
-| Post-quantum key exchange, per-message forward secrecy | Not started |
+| Post-quantum key exchange in sessions | Not started |
 
 ## Design decisions taken
 
@@ -347,8 +348,10 @@ reviewed.
   as an encrypted snapshot and must be written before each reply that
   follows a change (one device only; the demo does not persist it). There
   is no multi-device guarantee.
-- Forward secrecy is per session, not per message. Sessions should be
-  renewed often; a double ratchet would do this automatically.
+- Per-message forward secrecy and post-compromise security rest on an
+  unreviewed Double Ratchet prototype. Its header (ratchet key and
+  counters) is authenticated but not encrypted, and the caller's static
+  key serves as the first ratchet key on the answerer's side.
 - Reading an IK first message costs the answerer two key agreements before
   it can refuse. Answered handshakes are capped, but strangers' calls need a
   proper cost.
@@ -366,5 +369,6 @@ reviewed.
    with real transactions. Not done: benchmarked weights, a real network
    with consensus, our own node binary.
 5. Shielded channel opening, so the chain no longer reveals the contact graph.
-6. Double ratchet and post-quantum key exchange.
+6. Double ratchet (prototyped 2026-11-21, unreviewed) and post-quantum key
+   exchange.
 7. Node staking, reward payout, fee simulation, external audit.
