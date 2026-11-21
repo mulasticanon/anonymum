@@ -90,10 +90,11 @@
 use std::fmt;
 
 use anonymum_core::crypto::SealedNote;
+use rand_core::{OsRng, RngCore};
 use snow::Builder;
 
 use crate::contact::{
-    is_contributory_key, pq_encapsulate, CardSummary, ContactCard, ContactError, ContactIdentity, InboxEpoch,
+    is_contributory_key, pq_encapsulate, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, InboxEpoch,
     Network, PQ_CIPHERTEXT_LEN,
 };
 
@@ -272,6 +273,37 @@ pub fn seal_note(
         &recipient_card.inbox_key,
         &payload(&sender_card.summary(), route, intro),
     )
+}
+
+/// A dummy for an unused stranger-note slot (spec W4, audit MED-03): a real
+/// v5 note, sealed through [`seal_note`] from one fresh throwaway contact
+/// identity to another, with a random admission commitment, a random route
+/// and an empty intro. Every secret is dropped on return, so nobody, its
+/// maker included, can open it.
+///
+/// Why not random bytes: the note's first Noise field is an X25519
+/// ephemeral public key, whose top bit is always 0 and which always lies on
+/// Curve25519 rather than its twist, and whose ML-KEM ciphertext has its own
+/// structure. Uniform random bytes fail those tests about half the time per
+/// note, so a slot of random bytes would mark itself as a dummy. A note made
+/// the real way is, as far as we know, computationally indistinguishable
+/// from a real one (unreviewed). `now_secs` dates the throwaway cards.
+pub fn dummy_note(network: &[u8; 32], now_secs: u64) -> [u8; SEALED_NOTE_LEN] {
+    let recipient = ContactIdentity::generate_at(now_secs);
+    let sender = ContactIdentity::generate_at(now_secs);
+    let mut route = [0u8; ROUTE_LEN];
+    OsRng.fill_bytes(&mut route);
+    let note = seal_note(
+        network,
+        &recipient.card(*network, 0),
+        &sender,
+        &sender.card(*network, 0),
+        &route,
+        "",
+        &random_bytes(),
+    )
+    .expect("a fresh card on its own network always seals");
+    note.0.try_into().expect("seal_note returns SEALED_NOTE_LEN bytes")
 }
 
 /// Try to open a note on `network` with `me`'s inbox keys (X25519 and

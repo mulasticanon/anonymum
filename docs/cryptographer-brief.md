@@ -167,9 +167,10 @@ composition and whether it answers questions 11 and 12:
 - **Also for you** (issues file, "AI-written audit of 3f7092d"): no
   forward secrecy for notes sealed to a long-lived inbox key (inbox key
   rotation, now prototyped as weekly epochs, above); no delay between claim finality and
-  the callback; dummy payload slots that must be indistinguishable from
-  real ones (slot sizes now proposed: two 200-byte coin slots and one
-  1,787-byte stranger slot, I24);
+  the callback (now a uniform 30-300 s in the demo, below); dummy payload
+  slots that must be indistinguishable from real ones (slot sizes now
+  proposed: two 200-byte coin slots and one 1,787-byte stranger slot, I24;
+  dummies now prototyped, below);
   post-quantum key exchange and ratcheting as long-term questions; and
   the host Ed25519 check (ZIP 215 via `ed25519-zebra`) accepting small-order
   invite keys that `verify_strict` refuses.
@@ -226,6 +227,17 @@ composition and whether it answers questions 11 and 12:
   wiping on drop enough on the devices we target (swap, backups, the
   operating system's own copies), and should the handshake key rotate too
   (it is long-lived, so the callback still has no forward secrecy)?
+- **Dummy payloads and callback timing** (issues file, "Dummy payloads
+  and callback timing", audit MED-03; 2026-11-21, unreviewed): an unused
+  stranger slot holds `dummy_note()`, a real v5 note between two throwaway
+  identities whose secrets are dropped, because random bytes fail the
+  X25519 ephemeral key's top-bit and on-curve tests. Unused 200-byte coin
+  slots hold fresh random bytes, taken to match a ChaCha20-Poly1305
+  ciphertext. The recipient's callback waits a uniform 30-300 s. **For
+  you:** is the whole dummy note (ML-KEM ciphertext and Noise ciphertexts
+  too) indistinguishable from a real one, are random bytes right for coin
+  slots once their real format is fixed, and what delay distribution
+  (and for refunds and change) would you want?
 - **Two open items on the proof binding** (recorded 2026-11-21, yours to
   decide): (1) `stranger_note_hash` should be computed *outside* the
   circuit with an ordinary hash (BLAKE2s, as the model uses, or SHA-256)

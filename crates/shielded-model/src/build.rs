@@ -6,6 +6,7 @@
 use crate::chain::*;
 use crate::hash::{h, Hash};
 use crate::objects::*;
+use rand_core::{OsRng, RngCore};
 
 #[derive(Clone)]
 pub struct TxBuilder {
@@ -13,7 +14,8 @@ pub struct TxBuilder {
     inputs: Vec<InputWitness>,
     outputs: Vec<OutputWitness>,
     admission: Option<AdmissionRecord>,
-    payloads: [Vec<u8>; N_PAY],
+    /// Slots the caller filled; the rest get dummies at [`TxBuilder::build`].
+    payloads: [Option<Vec<u8>>; N_PAY],
     /// Makes dummy secrets and blindings distinct per transaction. A real
     /// wallet would use fresh randomness.
     salt: Hash,
@@ -26,7 +28,7 @@ impl TxBuilder {
             inputs: Vec::new(),
             outputs: Vec::new(),
             admission: None,
-            payloads: std::array::from_fn(|i| vec![0; PAYLOAD_LENS[i]]),
+            payloads: Default::default(),
             salt: h("builder/salt", &[salt]),
         }
     }
@@ -51,8 +53,20 @@ impl TxBuilder {
     }
 
     pub fn payload(mut self, slot: usize, bytes: Vec<u8>) -> Self {
-        self.payloads[slot] = bytes;
+        self.payloads[slot] = Some(bytes);
         self
+    }
+
+    /// A dummy for the stranger-note slot when this transaction carries no
+    /// note. Production wallets MUST pass `anonymum_crypto::dummy_note()`
+    /// here: a real v5 note between throwaway keys. Without it the slot is
+    /// filled with random bytes, which this model accepts but which an
+    /// observer can tell apart from a real note (the note's X25519
+    /// ephemeral key always has its top bit clear and lies on the curve,
+    /// not the twist; random bytes fail that about half the time, spec W4,
+    /// audit MED-03). The model does not depend on `anonymum-crypto`.
+    pub fn dummy_stranger_note(self, note: [u8; STRANGER_NOTE_LEN]) -> Self {
+        self.payload(STRANGER_SLOT, note.to_vec())
     }
 
     fn derived(&self, what: &str, index: usize) -> Hash {
@@ -75,6 +89,17 @@ impl TxBuilder {
         let admission = self.admission.unwrap_or_else(|| AdmissionRecord::empty(self.derived("admission", 0)));
         let nullifiers = std::array::from_fn(|i| nullifier_of(&inputs[i]));
         let commitments = std::array::from_fn(|i| outputs[i].note().commitment());
+        // Unused slots never stay blank (audit M2, MED-03): a coin slot gets
+        // fresh random bytes, which look like a ChaCha20-Poly1305 ciphertext
+        // of the same length; the stranger slot gets random bytes unless
+        // the caller passed a real dummy note (see `dummy_stranger_note`).
+        let payloads: [Vec<u8>; N_PAY] = std::array::from_fn(|i| {
+            self.payloads[i].clone().unwrap_or_else(|| {
+                let mut bytes = vec![0u8; PAYLOAD_LENS[i]];
+                OsRng.fill_bytes(&mut bytes);
+                bytes
+            })
+        });
         let not_before = p.window_start(block_time);
         let public = PublicTx {
             chain_id: p.chain_id,
@@ -83,8 +108,8 @@ impl TxBuilder {
             nullifiers,
             commitments,
             admission: admission.commitment(),
-            stranger_note_hash: stranger_note_hash(&self.payloads[STRANGER_SLOT]),
-            payloads: self.payloads,
+            stranger_note_hash: stranger_note_hash(&payloads[STRANGER_SLOT]),
+            payloads,
             not_before,
             not_after: not_before + p.window,
             base_fee: p.base_fee,

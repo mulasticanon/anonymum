@@ -11,3 +11,11 @@ publish = false
 # adding this crate cannot move any other dependency.
 blake2 = "=0.10.6"
 chacha20poly1305 = "=0.10.1"
+# Already in the lockfile; fresh random bytes for unused payload slots.
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+
+[dev-dependencies]
+# Only for the end-to-end test that fills the stranger slot with a real
+# dummy note; the model itself never depends on it.
+anonymum-core = { path = "../core" }
+anonymum-crypto = { path = "../crypto" }

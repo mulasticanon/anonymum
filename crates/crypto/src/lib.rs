@@ -35,5 +35,5 @@ pub use gate::{Gate, Grant, Now, CLOCK_SKEW_SECS};
 pub use snapshot::{write_atomically, SnapshotError, StorageKey, GATE_SNAPSHOT_VERSION};
 pub use identity::Identity;
 pub use invite::{Ed25519Invites, InviteSecret};
-pub use note::{open_note, seal_note, ContactNote, NoteError};
+pub use note::{dummy_note, open_note, seal_note, ContactNote, NoteError};
 pub use session::{Session, SessionError, MAX_PLAINTEXT, REFERENCE_LEN};

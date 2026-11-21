@@ -19,3 +19,8 @@ blake2 = "0.10.6"
 # AEAD for the encrypted gate snapshot; the same pinned version the
 # shielded model already uses (no lockfile change).
 chacha20poly1305 = "=0.10.1"
+
+[dev-dependencies]
+# Already in the lockfile (via x25519-dalek); used only by tests to check
+# that a note's ephemeral key lies on Curve25519.
+curve25519-dalek = "=4.1.3"

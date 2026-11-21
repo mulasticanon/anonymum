@@ -35,6 +35,8 @@
 //! stays offline (default 60). Set ANONYMUM_DROP_FIRST_ACK=1 to make Bob drop
 //! the first acknowledgement he sends, to watch Alice recover.
 
+mod jitter;
+use jitter::CallbackJitter;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,7 +188,7 @@ fn main() -> Result<(), AnyError> {
         .map_err(|_| "main thread panicked")?
 }
 
-async fn run() -> Result<(), AnyError> {
+async fn run(jitter: CallbackJitter) -> Result<(), AnyError> {
     let clock = Instant::now();
     let offline = Duration::from_secs(
         std::env::var("ANONYMUM_OFFLINE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60),
@@ -356,7 +358,7 @@ async fn run() -> Result<(), AnyError> {
     let mut eve_net = Endpoint::connect("eve").await?;
     let started = Instant::now();
     let reply_to = Recipient::try_from_bytes(opened.route)?;
-    let bob_calls = recipient_side(&mut bob_net, &bob, &opened);
+    let bob_calls = recipient_side(&mut bob_net, &bob, &opened, jitter);
     let eve_calls = async {
         let eve_key = StaticKey::generate();
         let result = call(&mut eve_net, &eve_key, opened.callback(), opened.admission, reply_to, SHORT_POLICY).await;
@@ -412,9 +414,19 @@ async fn run() -> Result<(), AnyError> {
 /// Noise X authenticated), the route to call it
 /// at, the request reference to name, and the sender's contact key the
 /// stranger must present. Calls (retrying), checks the presented contact
-/// key, and swaps long-lived routes. Returns the stranger's route.
-async fn recipient_side(net: &mut Endpoint, me: &ContactIdentity, note: &ContactNote) -> Result<Recipient, AnyError> {
+/// key, and swaps long-lived routes. Returns the stranger's route. Waits a
+/// random delay drawn from `jitter` before calling, so the call does not
+/// leave the instant the acceptance is final (audit MED-03, review H6).
+async fn recipient_side(
+    net: &mut Endpoint,
+    me: &ContactIdentity,
+    note: &ContactNote,
+    jitter: CallbackJitter,
+) -> Result<Recipient, AnyError> {
     let route = Recipient::try_from_bytes(note.route)?;
+    let delay = jitter.sample();
+    println!("  Bob: waiting {:.0}s before calling back (jitter {:?} to {:?}).", delay.as_secs_f32(), jitter.min(), jitter.max());
+    tokio::time::sleep(delay).await;
     let my_route = net.address();
     let (mut call, early) =
         call(net, me.handshake_key(), note.callback(), note.admission, route, RENDEZVOUS_POLICY).await?;
@@ -511,7 +523,11 @@ async fn stranger_side(
 //                                    Carol's process: answer Bob's callback
 //   anonymum-nym callback --bob F --note HEX --created SECS
 //                                    Bob's process: open the note himself
-//                                    and call back
+//                                    and call back, after a random delay
+//
+// The demo and `callback` wait a random 30-300 s before the callback;
+// `--no-jitter` skips the wait (local runs), `--jitter MIN-MAX` sets the
+// range in seconds (at most 300).
 //
 // Wallet files hold the private keys in hex. DEV ONLY: they are plain files
 // for this test, not encrypted storage.
@@ -519,14 +535,16 @@ async fn stranger_side(
 async fn dispatch() -> Result<(), AnyError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest = args.get(1..).unwrap_or(&[]);
+    let jitter = CallbackJitter::from_args(&args)?;
     match args.first().map(String::as_str) {
-        None | Some("demo") => run().await,
+        None | Some("demo") => run(jitter).await,
+        Some(flag) if flag.starts_with("--") => run(jitter).await,
         Some("wallet") => cmd_wallet(rest),
         Some("throwaway") => cmd_throwaway(rest).await,
         Some("seal") => cmd_seal(rest),
         Some("open") => cmd_open(rest),
         Some("answer") => cmd_answer(rest).await,
-        Some("callback") => cmd_callback(rest).await,
+        Some("callback") => cmd_callback(rest, jitter).await,
         Some(other) => Err(format!("unknown command {other:?}").into()),
     }
 }
@@ -671,13 +689,13 @@ async fn cmd_answer(args: &[String]) -> Result<(), AnyError> {
 /// Bob's process: his own wallet file and the note bytes as read from the
 /// chain. The callback key, route and request reference come only from the
 /// note he decrypts.
-async fn cmd_callback(args: &[String]) -> Result<(), AnyError> {
+async fn cmd_callback(args: &[String], jitter: CallbackJitter) -> Result<(), AnyError> {
     let bob = load_contact(flag(args, "--bob")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
     let created: u64 = flag(args, "--created")?.parse()?;
     let opened = open_note(&bob, &NETWORK, &note, created, now_secs())?;
     let mut bob_net = Endpoint::connect("bob").await?;
-    let learned = recipient_side(&mut bob_net, &bob, &opened).await?;
+    let learned = recipient_side(&mut bob_net, &bob, &opened, jitter).await?;
     println!("mine={}", bob_net.address());
     bob_net.client.disconnect().await;
     println!("learned={learned}");

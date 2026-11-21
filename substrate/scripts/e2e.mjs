@@ -175,7 +175,7 @@ try {
   const noteFromChain = onChain.note.toHex().slice(2);
   const carolRun = process_('carol', ['answer', '--carol', join(carolDir, 'carol.wallet'), '--keep', keepFile,
     '--dir', throwawayDir, '--card', bob.card]);
-  const bobRun = process_('bob', ['callback', '--bob', join(bobDir, 'bob.wallet'), '--note', noteFromChain, '--created', createdAt]);
+  const bobRun = process_('bob', ['callback', '--bob', join(bobDir, 'bob.wallet'), '--note', noteFromChain, '--created', createdAt, '--no-jitter']);
   const [carolEnd, bobEnd] = await Promise.all([carolRun, bobRun]);
   check(carolEnd.code === 0 && carolEnd.fields.answer === 'ok', "Carol's process let in only Bob's callback and finished");
   check(bobEnd.code === 0 && bobEnd.fields.callback === 'ok', "Bob's process called back from the note alone and checked Carol's contact key");

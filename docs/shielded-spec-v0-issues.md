@@ -115,10 +115,10 @@ always refundable").
 | H3 | Noise XX gives a reusable wallet credential to any initiating peer | Addressed in the prototype, unreviewed; spec questions 11 and 12 |
 | H4 | The sealed note's prologue needs the stranger's address before decrypting | Addressed in the prototype, unreviewed; spec questions 11 and 12 |
 | H5 | A resolver knows the deterministic refund; spend privacy and recovery need in-circuit guarantees | **Open cryptographic gate.** The model enforces the exact refund fields; it cannot show proof properties |
-| H6 | Wallet-specific fetches, immediate callbacks and a small population can reveal correspondents | **Open deployment gate** |
+| H6 | Wallet-specific fetches, immediate callbacks and a small population can reveal correspondents | **Open deployment gate.** Immediate callbacks: the demo now waits a random 30-300 s before calling back (2026-11-21, MED-03 below); wallet-specific fetches and the small population remain |
 | H7 | Circuit completeness, verifier validation, key privacy, setup and mobile proving are unproven | **Open release gate** |
 | M1 | Wallet matched the expected refund commitment anywhere in history | **Fixed in the model** (and v0.6): the wallet finds the finalised transaction that consumed the escrow's nullifier, matches the refund among its outputs only, and reports separately whether it is unspent. Tested with an identical decoy commitment made earlier |
-| M2 | All-zero padding payloads; receipts and invites replayable across devices | **Open.** The model still pads with zeros; receipt and invitation idempotency is not modelled |
+| M2 | All-zero padding payloads; receipts and invites replayable across devices | **Padding fixed in the model (2026-11-21, MED-03 below):** unused coin slots get fresh random bytes, the stranger slot a caller-supplied real dummy note (random bytes if none). Receipt and invitation idempotency across devices is still not modelled |
 | M3 | Invalid handshake traffic could consume pending state | Malformed-frame regression covered in the prototype; production retry design open, pending the handshake pattern chosen under spec question 11 |
 | M4 | A cumulative fee sink double-counts once operator funds are live; deadlines narrow candidates | **Open.** Applies before operator payouts or migrations |
 
@@ -278,7 +278,7 @@ Status after the fixes of 2026-11-20:
 | A3 (MED-02) | Unchecked pallet arithmetic | **Fixed.** `Percent::mul_floor` for the fee split; checked adds for the expiry height and the id and sequence counters, returning `ArithmeticError::Overflow` and charging nothing. Tested at each boundary |
 | A4 (HIGH-02) | Sessions keyed by reply handle and unbounded; one caller could fill the pending table | **Fixed.** Candidate handles are capped at one per caller (a newer one replaces it) and are dropped with a caller evicted from a handle (tested: a CONFIRM replayed from 200 handles leaves one). Live sessions are keyed by the caller's authenticated key (one each) with a route table from reply handle to caller. Caps with named defaults: `MAX_PENDING` 1,024, `MAX_PENDING_PER_CALLER` 4, `MAX_SESSIONS` 1,024 (`Limits`). A repeated CONFIRM from a new handle gets the cached ACK there, but the session moves only when a fresh data frame from that handle decrypts, so a replayed CONFIRM cannot redirect replies. At the session cap a new caller is refused before its CONFIRM is opened and nothing is committed. Tests for each |
 | A5 (MED-01) | Unchecked send counter | **Fixed.** `Session::seal` uses nonces up to `u64::MAX - 1` and then refuses (`Exhausted`); Noise reserves only `u64::MAX`, so it cannot wrap. No rekeying |
-| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21; CRIT-02's forward-secrecy half prototyped on 2026-11-21 (inbox key rotation); see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
+| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21; CRIT-02's forward-secrecy half prototyped on 2026-11-21 (inbox key rotation); MED-03 (dummy payloads, callback timing) addressed on 2026-11-21; see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
 | A7 (LOW-01) | Replace the random-secret key check with a list of small-order points | **Not done, by decision**: no hand-written list of bad points; the check stays on `x25519-dalek`'s `was_contributory` |
 
 **Where the audit is wrong or overstated (my reading, for the owner).**
@@ -306,10 +306,13 @@ Status after the fixes of 2026-11-20:
 - **No delay between claim finality and the callback.** The recipient
   calls the throwaway route as soon as the acceptance is final, so the
   timing links the chain event to the mixnet traffic. Random delay or batched
-  callbacks are candidates.
+  callbacks are candidates. *Random delay prototyped 2026-11-21 (MED-03 at
+  the end of this file).*
 - **Dummy payload slots must be indistinguishable from real ones.** The
   model pads with zeros (review M2). Slot sizes are now proposed (I24: the
   1,787-byte stranger slot holds a v5 note exactly); dummy content is W4.
+  *Done in the model and the crypto crate 2026-11-21 (MED-03 at the end of
+  this file).*
 - **Post-quantum key exchange and ratcheting** remain long-term questions:
   no per-message forward secrecy (no double ratchet) and no post-quantum
   key agreement in sessions. Notes have a hybrid ML-KEM-768 layer since
@@ -323,9 +326,9 @@ them. All proposed and unreviewed.
 | # | Rule | Status |
 |---|---|---|
 | W1 | Never query a node about a specific nullifier, commitment, admission record, request or block of interest: sync what every wallet syncs, or fetch over the mixnet | **Proposed, unreviewed.** The prototype breaks it by design: `e2e.mjs`, `smoke.mjs` and the demo read specific requests, keys and block timestamps from a local node to check results |
-| W2 | Random delay before a callback after a claim is final; before a sender refund after expiry (never the first eligible block); no spending of an Open's change in the next block | **Proposed, unreviewed.** Distributions are a question for the cryptographer. The demo calls back at once |
+| W2 | Random delay before a callback after a claim is final; before a sender refund after expiry (never the first eligible block); no spending of an Open's change in the next block | **Proposed, unreviewed.** Distributions are a question for the cryptographer. The demo's callback waits a uniform 30-300 s since 2026-11-21 (`--no-jitter` for local runs); refund and change delays are not implemented |
 | W3 | Every transaction carries one admission commitment; the empty record in Transfer, Claim, Decline and Sender refund has a fresh, secret, uniformly random blinding, so its commitment is indistinguishable from a real one | **Proposed, unreviewed; zero fields enforced 2026-11-20.** The model rejects a non-empty record in those branches at no charge (`Reject::NonEmptyAdmission`, tests in `slots_and_pruning.rs`). The blinding is still salt-derived in the model: see below |
-| W4 | A dummy payload slot holds a real Noise X note from a fresh random key to a fresh random key, not random bytes | **Proposed, unreviewed.** Preferred option for I23 |
+| W4 | A dummy payload slot holds a real Noise X note from a fresh random key to a fresh random key, not random bytes | **Prototyped 2026-11-21, unreviewed:** `anonymum_crypto::dummy_note`; the model's builder takes it through `dummy_stranger_note` (MED-03 at the end of this file) |
 | W5 | Transfers, invited requests and stranger escrows share one pool and one fee structure | **Proposed, unreviewed.** Consistent with O3 and the spec's single circuit |
 | W6 | Open questions (below) | **Recorded** |
 
@@ -582,4 +585,59 @@ note. Now (`anonymum-crypto::contact`):
   first); the handshake key does not rotate, so callbacks still have no
   forward secrecy; the stored identity format is not yet encrypted by this
   crate (the demo writes it in the clear to a dev wallet file).
+
+## Dummy payloads and callback timing: audit MED-03, review M2 and H6 (2026-11-21, unreviewed)
+
+MED-03 said that all-zero dummy slots let anyone sort transactions by
+type, and that an immediate callback ties the mixnet burst to the
+acceptance block.
+- *Dummy stranger notes* (`anonymum_crypto::dummy_note(network,
+  now_secs)`, spec W4): a real v5 note made through `seal_note` from one
+  fresh throwaway contact identity to another, with a random admission
+  commitment, a random 96-byte route and an empty intro; every secret is
+  dropped, so nobody can open it. Random bytes would not do: the note's
+  X25519 ephemeral key always has a clear top bit and lies on Curve25519
+  rather than its twist (and the ML-KEM ciphertext has structure of its
+  own), which uniform bytes fail about three times in four. Tests
+  (`tests/dummy.rs`): exact length, no blank field, fresh per call; no
+  identity opens one; its ephemeral key passes the curve test
+  (`curve25519-dalek`'s `to_edwards`, a dev-dependency already in the
+  lockfile) like a real note's, while random strings fail it. Whether the
+  rest of the note (ML-KEM ciphertext, Noise ciphertexts) is equally
+  indistinguishable is believed, not shown: question for the cryptographer.
+- *Model slots* (`crates/shielded-model/src/build.rs`): no slot defaults to
+  zeros any more. An unused coin slot (200 bytes) gets fresh random bytes
+  (`rand_core` 0.6.4 with `getrandom`, already in the lockfile), the same
+  distribution as a ChaCha20-Poly1305 ciphertext of that length. An
+  unused stranger slot takes the caller's dummy
+  (`TxBuilder::dummy_stranger_note`); without one it gets random bytes,
+  which the model accepts but production wallets must not rely on: they
+  MUST pass `dummy_note()`. The model has no runtime dependency on
+  `anonymum-crypto` (a dev-dependency for one end-to-end test). Tests
+  (`tests/dummy_slots.rs`): Transfer, Claim, Decline and Sender refund as
+  built have no all-zero or low-variety slot; dummies are fresh per
+  transaction; each branch is accepted, its stranger note is pruned after
+  24 hours, and the logged digest still equals the bound one; a real
+  `dummy_note` passes through unchanged. A caller can still pass an
+  all-zero slot explicitly; the chain cannot refuse it without refusing
+  some real ciphertext.
+- *Callback jitter* (`crates/nym/src/jitter.rs`, W2): before Bob calls back
+  after reading a stranger's note he waits a delay drawn uniformly
+  (rejection sampling over the operating system's randomness, millisecond
+  steps) from 30-300 s by default; `--jitter MIN-MAX` sets the range in
+  seconds (at most 300, so the demo stranger's 600-second wait still
+  covers the call and its retries) and `--no-jitter` waits nothing, for
+  local runs (`e2e.mjs` passes it). Unit tests check the default, both
+  ends of the range, the rejection of biased values, zero-delay mode and
+  bad arguments; they run with `cargo test -p anonymum-nym`, which CI
+  does not run (CI type-checks them with `--all-targets`). A delay of
+  minutes blurs the link in a busy network, not in a small one, and the
+  distribution is a placeholder for the cryptographer (W2).
+- *Mutation checks:* 14 deliberate breaks (random-byte, all-zero or fixed
+  dummy notes; zero or partly zero slots; the caller's dummy ignored; the
+  hash over another slot; no rejection sampling; an off-by-one range;
+  wrong defaults; missing argument checks), each caught.
+- *Not done:* refund and change-spending delays (W2); the demo itself
+  builds no shielded transactions, so nothing yet passes `dummy_note`
+  outside tests.
 
