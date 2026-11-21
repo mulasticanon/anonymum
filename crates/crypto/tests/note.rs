@@ -86,7 +86,7 @@ fn a_note_for_another_recipient_does_not_open() {
     let signing = bob.signing_secret_bytes();
     let (handshake, inbox, pq, not_before, not_after) = bob.active().to_secret_bytes();
     let as_inbox = KeyEpoch::from_secret_bytes(inbox, handshake, pq, not_before, not_after).unwrap();
-    let swapped = ContactIdentity::from_parts(*signing, as_inbox, None);
+    let swapped = ContactIdentity::from_parts(*signing, as_inbox, None, 1);
     assert!(matches!(open_note(&swapped, &NET, &note, NOW, NOW), Err(NoteError::Noise(_))));
 }
 

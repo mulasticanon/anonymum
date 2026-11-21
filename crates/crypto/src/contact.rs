@@ -72,9 +72,11 @@ pub enum ContactError {
     /// A new handshake key that is blocked or already belongs to another
     /// contact or grant.
     KeyInUse,
-    /// A rollover card whose `not_after` is not later than the bound
-    /// card's: an old card replayed, or a second card for the same epoch.
+    /// A rollover card whose `seq` is not greater than the bound card's: an
+    /// old card replayed, or the bound card again.
     StaleCard,
+    /// The card sequence number cannot be incremented any further.
+    SeqExhausted,
     /// An ML-KEM-768 encapsulation key that does not decode (FIPS 203 check).
     BadPqKey,
 }
@@ -171,15 +173,18 @@ pub fn epoch_start(now_secs: u64) -> u64 {
     now_secs - now_secs % EPOCH_LEN
 }
 
-/// Storage format of a contact identity. Version 2 (2026-11-21) keeps a
-/// handshake key in each epoch; version 1 kept one long-lived handshake key
-/// and is still read (see [`ContactIdentity::from_secret_bytes`]).
-const IDENTITY_VERSION: u8 = 2;
+/// Storage format of a contact identity. Version 3 (2026-11-21) adds the
+/// card sequence number; version 2 keeps a handshake key in each epoch;
+/// version 1 kept one long-lived handshake key. Versions 1 and 2 are still
+/// read (see [`ContactIdentity::from_secret_bytes`]).
+const IDENTITY_VERSION: u8 = 3;
+const IDENTITY_V2: u8 = 2;
 const IDENTITY_V1: u8 = 1;
 const EPOCH_BYTES: usize = 32 + 32 + PQ_SEED_LEN + 8 + 8;
 const EPOCH_BYTES_V1: usize = 32 + PQ_SEED_LEN + 8 + 8;
-/// The longest stored identity: both epochs.
-const IDENTITY_MAX_LEN: usize = 1 + 32 + EPOCH_BYTES + 1 + EPOCH_BYTES;
+/// The longest stored identity: both epochs and the card sequence number.
+const IDENTITY_MAX_LEN: usize = IDENTITY_MAX_LEN_V2 + 8;
+const IDENTITY_MAX_LEN_V2: usize = 1 + 32 + EPOCH_BYTES + 1 + EPOCH_BYTES;
 const IDENTITY_MAX_LEN_V1: usize = 1 + 64 + EPOCH_BYTES_V1 + 1 + EPOCH_BYTES_V1;
 
 /// One epoch's keys: the X25519 handshake key, the X25519 inbox key and the
@@ -326,17 +331,52 @@ pub struct ContactIdentity {
     signing: SigningKey,
     active: KeyEpoch,
     draining: Option<KeyEpoch>,
+    /// The sequence number the next card carries. Starts at a random
+    /// non-zero `u32`, so it does not reveal the identity's age, and goes up
+    /// by one on every rotation.
+    card_seq: u64,
+}
+
+/// A random non-zero `u32`, as a `u64`: a fresh identity's first card
+/// sequence number.
+fn fresh_card_seq() -> u64 {
+    loop {
+        let seq = OsRng.next_u32();
+        if seq != 0 {
+            return seq as u64;
+        }
+    }
+}
+
+/// The card sequence number for an identity stored before cards had one: a
+/// non-zero `u32` hashed from its public signing key. It is deterministic so
+/// that loading the same old file twice cannot give two different values,
+/// one of which would look like a rollback to contacts.
+fn migrated_card_seq(signing_key: &[u8; 32]) -> u64 {
+    let hash = Blake2s256::new().chain_update(b"anonymum/card-seq-migration/v1").chain_update(signing_key).finalize();
+    u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]).max(1) as u64
 }
 
 impl ContactIdentity {
     /// A new identity whose first key epoch holds `now_secs`.
     pub fn generate_at(now_secs: u64) -> Self {
-        ContactIdentity { signing: SigningKey::generate(&mut OsRng), active: KeyEpoch::generate_at(now_secs), draining: None }
+        ContactIdentity {
+            signing: SigningKey::generate(&mut OsRng),
+            active: KeyEpoch::generate_at(now_secs),
+            draining: None,
+            card_seq: fresh_card_seq(),
+        }
     }
 
-    /// Restore from the signing secret and the epoch ring.
-    pub fn from_parts(signing: [u8; 32], active: KeyEpoch, draining: Option<KeyEpoch>) -> Self {
-        ContactIdentity { signing: SigningKey::from_bytes(&signing), active, draining }
+    /// Restore from the signing secret, the epoch ring and the card
+    /// sequence number.
+    pub fn from_parts(signing: [u8; 32], active: KeyEpoch, draining: Option<KeyEpoch>, card_seq: u64) -> Self {
+        ContactIdentity { signing: SigningKey::from_bytes(&signing), active, draining, card_seq }
+    }
+
+    /// The sequence number this identity's cards carry now.
+    pub fn card_seq(&self) -> u64 {
+        self.card_seq
     }
 
     /// The signing secret, for encrypted storage (the epochs are stored
@@ -346,8 +386,9 @@ impl ContactIdentity {
     }
 
     /// Everything, for encrypted storage, in one versioned encoding
-    /// (version 2): `version (1) || signing (32) || active epoch || draining
-    /// flag (1) [|| draining epoch]`, an epoch being `handshake (32) || inbox
+    /// (version 3): `version (1) || signing (32) || active epoch || draining
+    /// flag (1) [|| draining epoch] || card_seq (8)`, an epoch being
+    /// `handshake (32) || inbox
     /// (32) || post-quantum seed (64) || not_before (8) || not_after (8)`,
     /// integers big-endian. Handle with care: the buffer is wiped when
     /// dropped.
@@ -367,6 +408,7 @@ impl ContactIdentity {
             epoch(d);
         }
         out.insert(1 + 32 + EPOCH_BYTES, self.draining.is_some() as u8);
+        out.extend_from_slice(&self.card_seq.to_be_bytes());
         out
     }
 
@@ -378,10 +420,15 @@ impl ContactIdentity {
     /// cards published, so existing contacts keep reaching it. The next
     /// [`Self::rotate_epoch`] gives the new epoch a fresh handshake key, and
     /// the old one is gone once both epochs that held it are purged.
+    ///
+    /// Versions 1 and 2 have no card sequence number; they get a stable one
+    /// derived from the public signing key. Save the identity afterwards so
+    /// later rotations are not lost.
     pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, ContactError> {
         let version = *bytes.first().ok_or(ContactError::Malformed)?;
         let (v1, epoch_len, max_len) = match version {
             IDENTITY_VERSION => (false, EPOCH_BYTES, IDENTITY_MAX_LEN),
+            IDENTITY_V2 => (false, EPOCH_BYTES, IDENTITY_MAX_LEN_V2),
             IDENTITY_V1 => (true, EPOCH_BYTES_V1, IDENTITY_MAX_LEN_V1),
             _ => return Err(ContactError::Malformed),
         };
@@ -391,7 +438,7 @@ impl ContactIdentity {
             return Err(ContactError::Malformed);
         }
         let expected = match bytes[flag_at] {
-            0 => flag_at + 1,
+            0 => flag_at + 1 + if version == IDENTITY_VERSION { 8 } else { 0 },
             1 => max_len,
             _ => return Err(ContactError::Malformed),
         };
@@ -414,7 +461,12 @@ impl ContactIdentity {
         let signing = Zeroizing::new(take::<32>(bytes, &mut 1));
         let active = epoch(first_epoch_at)?;
         let draining = if bytes[flag_at] == 1 { Some(epoch(flag_at + 1)?) } else { None };
-        Ok(Self::from_parts(*signing, active, draining))
+        let card_seq = if version == IDENTITY_VERSION {
+            u64::from_be_bytes(take(bytes, &mut (bytes.len() - 8)))
+        } else {
+            migrated_card_seq(&SigningKey::from_bytes(&signing).verifying_key().to_bytes())
+        };
+        Ok(Self::from_parts(*signing, active, draining, card_seq))
     }
 
     /// The epoch whose keys the card publishes.
@@ -430,12 +482,22 @@ impl ContactIdentity {
     /// Start a new key epoch for `now_secs`: fresh handshake, inbox and
     /// post-quantum inbox keys. The active epoch becomes the draining one,
     /// and an older draining epoch is dropped at once (its secrets wiped),
-    /// whatever its grace left. Publish a new card after, and send it to
-    /// contacts so they roll their record of the handshake key forward.
-    pub fn rotate_epoch(&mut self, now_secs: u64) {
+    /// whatever its grace left. The card sequence number goes up by one,
+    /// also for a second rotation inside one weekly epoch, so an emergency
+    /// rotation's card is newer to contacts at once. Publish a new card
+    /// after, and send it to contacts so they roll their record of the
+    /// handshake key forward. Persist the identity before publishing: a
+    /// restored older copy would issue sequence numbers contacts refuse.
+    ///
+    /// Fails with [`ContactError::SeqExhausted`], changing nothing, if the
+    /// sequence number cannot go up.
+    pub fn rotate_epoch(&mut self, now_secs: u64) -> Result<(), ContactError> {
+        let next_seq = self.card_seq.checked_add(1).ok_or(ContactError::SeqExhausted)?;
         let previous = std::mem::replace(&mut self.active, KeyEpoch::generate_at(now_secs));
         let oldest = self.draining.replace(previous);
         drop(oldest);
+        self.card_seq = next_seq;
+        Ok(())
     }
 
     /// Drop the draining epoch (wiping its handshake, inbox and post-quantum
@@ -509,6 +571,7 @@ impl ContactIdentity {
             price,
             not_before,
             not_after,
+            seq: self.card_seq,
             signature: [0; 64],
         };
         card.signature = self.sign(&card.summary().signed_bytes());
@@ -541,10 +604,11 @@ fn take<const N: usize>(bytes: &[u8], at: &mut usize) -> [u8; N] {
 // ---- contact card ------------------------------------------------------------
 
 /// What a user hands out or lists publicly, signed by the contact signing key.
-/// Valid on one network only (issue I20). Format v3: the signature covers a
+/// Valid on one network only (issue I20). Format v4: the signature covers a
 /// 32-byte hash of the post-quantum inbox key ([`pq_key_hash`]), not the
 /// 1,184 bytes themselves, so a note can carry the hash and the recipient
-/// can still check the card.
+/// can still check the card, and a sequence number `seq` that goes up with
+/// every key rotation, so contacts can refuse an older card.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ContactCard {
     pub network: Network,
@@ -555,6 +619,7 @@ pub struct ContactCard {
     pub price: Amount,
     pub not_before: u64,
     pub not_after: u64,
+    pub seq: u64,
     pub signature: [u8; 64],
 }
 
@@ -570,13 +635,14 @@ pub struct CardSummary {
     pub price: Amount,
     pub not_before: u64,
     pub not_after: u64,
+    pub seq: u64,
     pub signature: [u8; 64],
 }
 
 impl CardSummary {
-    /// The bytes the card's signature covers (card format v3).
+    /// The bytes the card's signature covers (card format v4).
     pub(crate) fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = b"anonymum/contact-card/v3".to_vec();
+        let mut out = b"anonymum/contact-card/v4".to_vec();
         out.extend_from_slice(&self.network);
         out.extend_from_slice(&self.signing_key);
         out.extend_from_slice(&self.handshake_key);
@@ -585,6 +651,7 @@ impl CardSummary {
         out.extend_from_slice(&self.price.to_be_bytes());
         out.extend_from_slice(&self.not_before.to_be_bytes());
         out.extend_from_slice(&self.not_after.to_be_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
         out
     }
 
@@ -611,8 +678,8 @@ impl CardSummary {
 
 impl ContactCard {
     /// Serialised length: network, three X25519 keys, the ML-KEM-768 key,
-    /// price, validity and signature.
-    pub const LEN: usize = 32 + 32 * 3 + PQ_KEY_LEN + 16 + 8 + 8 + 64;
+    /// price, validity, sequence number and signature.
+    pub const LEN: usize = 32 + 32 * 3 + PQ_KEY_LEN + 16 + 8 + 8 + 8 + 64;
 
     /// The signed content with the post-quantum key hashed.
     pub fn summary(&self) -> CardSummary {
@@ -625,6 +692,7 @@ impl ContactCard {
             price: self.price,
             not_before: self.not_before,
             not_after: self.not_after,
+            seq: self.seq,
             signature: self.signature,
         }
     }
@@ -647,6 +715,7 @@ impl ContactCard {
         out.extend_from_slice(&self.price.to_be_bytes());
         out.extend_from_slice(&self.not_before.to_be_bytes());
         out.extend_from_slice(&self.not_after.to_be_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
         out.extend_from_slice(&self.signature);
         out
     }
@@ -665,6 +734,7 @@ impl ContactCard {
             price: u128::from_be_bytes(take(bytes, at)),
             not_before: u64::from_be_bytes(take(bytes, at)),
             not_after: u64::from_be_bytes(take(bytes, at)),
+            seq: u64::from_be_bytes(take(bytes, at)),
             signature: take(bytes, at),
         })
     }

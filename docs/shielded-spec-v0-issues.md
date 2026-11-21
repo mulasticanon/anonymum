@@ -865,3 +865,41 @@ stayed readable by whoever later took the answerer's device. Now
   caught on the first run. The old design (both sides ratcheting from the
   static key, which still interoperates) was run against the thief test
   separately.
+
+## Signed card sequence number (2026-11-21, unreviewed)
+
+Resolves consequence (1) of the section above: an emergency rotation inside
+one weekly epoch now reaches contacts at once.
+
+- *Card:* format v4 (`anonymum/contact-card/v4`, 1,416 bytes) signs
+  `seq: u64`. A fresh identity starts at a random non-zero `u32`, which
+  does not reveal its age; `rotate_epoch` adds one with `checked_add` and
+  fails with `SeqExhausted`, changing nothing, at the limit.
+- *Note:* the embedded card carries `seq`, so the note grows from 1,787 to
+  1,795 bytes (core, pallet, shielded model, scripts; runtime
+  `spec_version` 7). The note's own version stays 5: the length and the
+  card signature's domain both differ from the 1,787-byte layout, so the
+  two cannot be confused. 1,787-byte notes are refused.
+- *Gate:* `roll_contact_key` requires `new_card.seq > bound seq`, replacing
+  the `not_after` comparison; the card must still verify at `now`.
+- *Storage:* identity format 3 stores `seq`. Versions 1 and 2 load with a
+  stable value hashed from the public signing key, so loading the same old
+  file twice cannot look like a rollback. Gate snapshot format 4 stores
+  `seq`; versions 1 to 3 load with no mark (0), and a version 3 `not_after`
+  is dropped because it is not a sequence number.
+- *Consequences, for the owner and the cryptographer:* (1) restoring an
+  identity from an older backup reissues sequence numbers contacts refuse
+  (`StaleCard`) until rotations pass the highest one they saw, so the
+  identity must be persisted before a rotated card is published. (2) The
+  gap between two cards shows a contact how many rotations happened,
+  including emergency ones. (3) A binding from a snapshot older than
+  version 4 accepts any validly signed v4 card on its first rollover.
+  (4) The check is only as good as the signing key: its holder can sign any
+  `seq`, including `u64::MAX`, which would stop that contact's later
+  rollovers.
+- *Tests:* 8 new (crypto 190): random non-zero start, +1 per rotation,
+  overflow, signed and serialised `seq`, version 2 and 3 loads, two
+  emergency rotations in one week, older and same-`seq` cards refused with
+  the gate unchanged, and the note carrying `seq` under the card signature.
+- *Mutation checks:* 32 deliberate breaks of the new rules, all caught.
+  `smoke.mjs`, `e2e.mjs` and the live demo were not rerun.

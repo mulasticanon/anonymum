@@ -47,15 +47,15 @@
 //!   [`crate::contact::DRAIN_GRACE`]) they are gone from the device.
 //!   Unreviewed.
 //!
-//! # Field layout (fixed, [`SEALED_NOTE_LEN`] = 1,787 bytes)
+//! # Field layout (fixed, [`SEALED_NOTE_LEN`] = 1,795 bytes)
 //!
 //! ```text
 //! admission commitment                  32
 //! ML-KEM-768 ciphertext               1088
-//! Noise Xpsk0 message                  667
+//! Noise Xpsk0 message                  675
 //!   e (ephemeral public key)            32
 //!   s (sender handshake key) + tag      48
-//!   payload (571) + tag                587
+//!   payload (579) + tag                595
 //! ```
 //!
 //! The payload, all inside the ciphertext:
@@ -69,10 +69,11 @@
 //!     97   16  price, u128 big-endian                (card)
 //!    113    8  card not_before, u64 big-endian       (card)
 //!    121    8  card not_after, u64 big-endian        (card)
-//!    129   64  card signature                        (card)
-//!    193   96  throwaway route (a Nym Recipient)
-//!    289    2  intro length, u16 big-endian
-//!    291  280  intro, UTF-8, zero-padded
+//!    129    8  card seq, u64 big-endian              (card)
+//!    137   64  card signature                        (card)
+//!    201   96  throwaway route (a Nym Recipient)
+//!    297    2  intro length, u16 big-endian
+//!    299  280  intro, UTF-8, zero-padded
 //! ```
 //!
 //! The card's handshake key is the authenticated Noise static and its
@@ -108,8 +109,8 @@ pub const ROUTE_LEN: usize = 96;
 pub const INTRO_MAX_BYTES: usize = 280;
 pub const ADMISSION_LEN: usize = 32;
 /// The card fields the note carries: signing key, inbox key, hash of the
-/// post-quantum key, price, validity and signature.
-const CARD_LEN: usize = 32 + 32 + 32 + 16 + 8 + 8 + 64;
+/// post-quantum key, price, validity, sequence number and signature.
+const CARD_LEN: usize = 32 + 32 + 32 + 16 + 8 + 8 + 8 + 64;
 const ROUTE_AT: usize = 1 + CARD_LEN;
 const LEN_AT: usize = ROUTE_AT + ROUTE_LEN;
 const PAYLOAD_LEN: usize = LEN_AT + 2 + INTRO_MAX_BYTES;
@@ -120,7 +121,7 @@ const ENVELOPE_AT: usize = ADMISSION_LEN + PQ_CIPHERTEXT_LEN;
 /// The whole note field.
 pub const SEALED_NOTE_LEN: usize = ENVELOPE_AT + ENVELOPE_LEN;
 const _: () = assert!(SEALED_NOTE_LEN == anonymum_core::SEALED_NOTE_LEN, "the chain checks this length");
-const _: () = assert!(SEALED_NOTE_LEN == 1_787 && ENVELOPE_LEN == 667);
+const _: () = assert!(SEALED_NOTE_LEN == 1_795 && ENVELOPE_LEN == 675);
 
 /// What the recipient reads after opening a note.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -198,7 +199,8 @@ fn payload(card: &CardSummary, route: &[u8; ROUTE_LEN], intro: &[u8]) -> Vec<u8>
     out[97..113].copy_from_slice(&card.price.to_be_bytes());
     out[113..121].copy_from_slice(&card.not_before.to_be_bytes());
     out[121..129].copy_from_slice(&card.not_after.to_be_bytes());
-    out[129..193].copy_from_slice(&card.signature);
+    out[129..137].copy_from_slice(&card.seq.to_be_bytes());
+    out[137..201].copy_from_slice(&card.signature);
     out[ROUTE_AT..LEN_AT].copy_from_slice(route);
     out[LEN_AT..LEN_AT + 2].copy_from_slice(&(intro.len() as u16).to_be_bytes());
     out[LEN_AT + 2..LEN_AT + 2 + intro.len()].copy_from_slice(intro);
@@ -376,7 +378,8 @@ fn open_with(
         price: u128::from_be_bytes(body[97..113].try_into().expect("16 bytes")),
         not_before: u64::from_be_bytes(body[113..121].try_into().expect("8 bytes")),
         not_after: u64::from_be_bytes(body[121..129].try_into().expect("8 bytes")),
-        signature: body[129..193].try_into().expect("64 bytes"),
+        seq: u64::from_be_bytes(body[129..137].try_into().expect("8 bytes")),
+        signature: body[137..201].try_into().expect("64 bytes"),
     };
     card.verify(network, created_at).map_err(NoteError::BadCard)?;
     let intro_len = u16::from_be_bytes([body[LEN_AT], body[LEN_AT + 1]]) as usize;
@@ -674,8 +677,23 @@ mod tests {
         let signing = bob.signing_secret_bytes();
         let (handshake, inbox, _, not_before, not_after) = bob.active().to_secret_bytes();
         let other_pq = KeyEpoch::from_secret_bytes(handshake, inbox, [0x42; 64], not_before, not_after).unwrap();
-        let half_bob = ContactIdentity::from_parts(*signing, other_pq, None);
+        let half_bob = ContactIdentity::from_parts(*signing, other_pq, None, bob.card_seq());
         assert!(matches!(open_note(&half_bob, &NET, &seal(&bob, &carol, "hi"), NOW, NOW), Err(NoteError::Noise(_))));
+    }
+
+    #[test]
+    fn the_note_carries_the_cards_seq_under_its_signature() {
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
+        let honest = card_of(&carol).summary();
+        let opened = open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&honest, &ROUTE, b"hi")), NOW, NOW).unwrap();
+        assert_eq!(opened.card.seq, carol.card_seq());
+        assert_eq!(opened.card, honest);
+        // A seq changed inside the encrypted payload breaks the card signature.
+        let raised = CardSummary { seq: honest.seq + 1, ..honest };
+        assert!(matches!(
+            open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&raised, &ROUTE, b"hi")), NOW, NOW),
+            Err(NoteError::BadCard(ContactError::BadSignature))
+        ));
     }
 
     #[test]

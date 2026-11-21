@@ -40,9 +40,12 @@ use zeroize::Zeroizing;
 
 use crate::contact::Network;
 
-/// The current snapshot format: 3 since 2026-11-21 (a bound contact also
-/// carries its card's `not_after`, for forward-only rollover).
-pub const GATE_SNAPSHOT_VERSION: u8 = 3;
+/// The current snapshot format: 4 since 2026-11-21 (a bound contact carries
+/// its card's signed `seq`, for forward-only rollover).
+pub const GATE_SNAPSHOT_VERSION: u8 = 4;
+/// A bound contact carried its card's `not_after`; still read (the value is
+/// dropped).
+pub const GATE_SNAPSHOT_V3: u8 = 3;
 /// Signing keys and rollover state, no card `not_after`; still read.
 pub const GATE_SNAPSHOT_V2: u8 = 2;
 /// Contacts without signing keys; still read.
@@ -130,7 +133,7 @@ pub(crate) fn seal(key: &StorageKey, network: &Network, plaintext: &[u8]) -> Vec
 /// match the clear one.
 pub(crate) fn open(key: &StorageKey, network: &Network, snapshot: &[u8]) -> Result<Zeroizing<Vec<u8>>, SnapshotError> {
     let version = *snapshot.first().ok_or(SnapshotError::Truncated)?;
-    if ![GATE_SNAPSHOT_VERSION, GATE_SNAPSHOT_V2, GATE_SNAPSHOT_V1].contains(&version) {
+    if ![GATE_SNAPSHOT_VERSION, GATE_SNAPSHOT_V3, GATE_SNAPSHOT_V2, GATE_SNAPSHOT_V1].contains(&version) {
         return Err(SnapshotError::UnsupportedVersion(version));
     }
     if snapshot.len() < MIN_SNAPSHOT_LEN {
@@ -246,14 +249,28 @@ mod tests {
     }
 
     #[test]
-    fn a_version_2_snapshot_loads_with_no_recorded_card_expiry() {
+    fn a_version_2_snapshot_loads_with_no_recorded_card_seq() {
         let signer = [3u8; 32];
         let contact = [&[3u8][..], &signer, &77u64.to_be_bytes()].concat();
         let callback = [&[1u8][..], &signer].concat();
         let gate = open_plain(GATE_SNAPSHOT_V2, &one_of_each(GATE_SNAPSHOT_V2, &contact, &callback)).unwrap();
         assert_eq!(gate.signer_of(&[7; 32]), Some(signer));
-        assert_eq!(gate.card_not_after(&[7; 32]), Some(0));
-        assert_eq!(gate.card_not_after(&[9; 32]), Some(0));
+        assert_eq!(gate.card_seq(&[7; 32]), Some(0));
+        assert_eq!(gate.card_seq(&[9; 32]), Some(0));
+        let again = gate.encode();
+        assert_eq!(again[0], GATE_SNAPSHOT_VERSION);
+        assert_eq!(Gate::decode(&again, &NET).unwrap(), gate);
+    }
+
+    #[test]
+    fn a_version_3_snapshot_drops_its_not_after_and_is_rewritten_as_the_current_one() {
+        let signer = [3u8; 32];
+        let contact = [&[3u8][..], &signer, &500u64.to_be_bytes(), &77u64.to_be_bytes()].concat();
+        let callback = [&[1u8][..], &signer, &600u64.to_be_bytes()].concat();
+        let gate = open_plain(GATE_SNAPSHOT_V3, &one_of_each(GATE_SNAPSHOT_V3, &contact, &callback)).unwrap();
+        assert_eq!(gate.signer_of(&[7; 32]), Some(signer));
+        assert_eq!(gate.card_seq(&[7; 32]), Some(0), "a not_after is not a sequence number");
+        assert_eq!(gate.card_seq(&[9; 32]), Some(0));
         let again = gate.encode();
         assert_eq!(again[0], GATE_SNAPSHOT_VERSION);
         assert_eq!(Gate::decode(&again, &NET).unwrap(), gate);
@@ -268,10 +285,10 @@ mod tests {
         let gate = with(&both, &callback).unwrap();
         assert_eq!(gate.signer_of(&[7; 32]), Some(signer));
         assert_eq!(gate.signer_of(&[9; 32]), Some(signer));
-        assert_eq!(gate.card_not_after(&[7; 32]), Some(500));
-        assert_eq!(gate.card_not_after(&[9; 32]), Some(600));
+        assert_eq!(gate.card_seq(&[7; 32]), Some(500));
+        assert_eq!(gate.card_seq(&[9; 32]), Some(600));
         assert_eq!(gate.encode(), one_of_each(GATE_SNAPSHOT_VERSION, &both, &callback));
-        // A signer without its card's expiry is cut short.
+        // A signer without its card's seq is cut short.
         assert_eq!(with(&[&[1u8][..], &signer].concat(), &[0]).err(), Some(SnapshotError::Malformed));
         // Unknown bits, or a flag promising bytes that are not there.
         assert_eq!(with(&[4], &[0]).err(), Some(SnapshotError::Malformed));

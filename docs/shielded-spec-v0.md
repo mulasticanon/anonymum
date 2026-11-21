@@ -152,7 +152,7 @@ one block in six on a 6-second chain.
 **P10. Encrypted payload slots (sizes proposed 2026-11-20, unreviewed).**
 Every transaction carries exactly three slots, the same in every branch:
 two *coin-note* slots of 200 bytes (a note's delivery data, or the
-sender's recovery copy) and one *stranger-note* slot of 1,787 bytes, sized
+sender's recovery copy) and one *stranger-note* slot of 1,795 bytes, sized
 for the hybrid post-quantum note (format v5: admission commitment 32,
 ML-KEM-768 ciphertext 1,088, Noise Xpsk0 message 667). A slot with nothing
 to carry holds a dummy of the same shape (W4). The stranger-note slot is
@@ -178,7 +178,7 @@ whatever the payment proofs hide. Rules:
    The keys have separate roles and none is a wallet key. The signature
    covers a 32-byte hash of the post-quantum key
    (`BLAKE2s("anonymum/pq-inbox-key/v1" || key)`), not the key itself, so
-   a note can carry the hash in place of the key. Prototype card: 1,408
+   a note can carry the hash in place of the key. Prototype card: 1,416
    bytes. The handshake key has no post-quantum counterpart: post-quantum
    callbacks are to be negotiated off-chain later.
 3. **Handshake: answer only authorised callers.** (Rewritten in v0.7.
@@ -233,7 +233,7 @@ whatever the payment proofs hide. Rules:
      post-quantum inbox key (ML-KEM-768); the ciphertext is bound into the
      Noise prologue and the shared secret is the Noise pre-shared key
      (`Noise_Xpsk0`). Reading a note needs both inbox secrets. Sender
-     authentication stays classical (X25519). The note field is 1,787
+     authentication stays classical (X25519). The note field is 1,795
      bytes.
    - **The cost.** Anyone holding the recipient's X25519 inbox secret can
      make a note that opens as if from any sender whose card they have
@@ -320,7 +320,7 @@ No transaction type gets a separate pool, tree or fee.
 
 **W6. Open questions** (recorded, not decided): hybrid post-quantum key
 exchange for handshakes and callbacks (for notes it is now prototyped:
-format v5, one ML-KEM-768 key per card, 1,408-byte cards and 1,787-byte
+format v5, one ML-KEM-768 key per card, 1,416-byte cards and 1,795-byte
 notes), and whether the note's construction is right, before the note
 format is frozen; inbox and handshake key rotation and how a rotated key
 is still recognised as the same contact; a persistently connected wallet

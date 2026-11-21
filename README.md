@@ -16,9 +16,9 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; a Double Ratchet (Signal specification) for data frames, seeded from the IK handshake; encrypted, versioned snapshots of grant state (one device); weekly rotation of the handshake and inbox keys together, with contact key rollover from a card signed by the same key; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, ratchet, note format and snapshot have not been reviewed.** | 182 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; a Double Ratchet (Signal specification) for data frames, seeded from the IK handshake; encrypted, versioned snapshots of grant state (one device); weekly rotation of the handshake and inbox keys together, with contact key rollover from a card signed by the same key; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, ratchet, note format and snapshot have not been reviewed.** | 190 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
-| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, random (never all-zero) dummy slots, a versioned recovery copy, escrows that lock a fee ceiling (surplus returned privately, a top-up if the fee rises above it), and one-time refund keys per escrow. | 83 tests, including adversarial cases and a randomised conservation test |
+| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,795 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, random (never all-zero) dummy slots, a versioned recovery copy, escrows that lock a fee ceiling (surplus returned privately, a top-up if the fee rises above it), and one-time refund keys per escrow. | 83 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
@@ -115,6 +115,10 @@ bytes with one ML-KEM-768 key; runtime `spec_version` 6; 2026-11-20):
 back from chain state, opened it with his two inbox secrets, and called
 Carol's handshake key over the live Nym mixnet. The live demo was not
 rerun.
+
+The signed card sequence number (2026-11-21) makes cards 1,416 bytes and
+notes 1,795 bytes (runtime `spec_version` 7). The unit tests cover it;
+`smoke.mjs`, `e2e.mjs` and the live demo have **not** been rerun with it.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -296,12 +300,12 @@ reviewed.
 9. **No mixnet address is ever published.** Each user has a contact identity
    separate from the wallet: a signing key, a handshake key, an inbox key
    and a post-quantum inbox key (ML-KEM-768), listed on a signed contact
-   card (with network, price and validity; 1,408 bytes). A stranger's
+   card (with network, price, validity and a signed sequence number; 1,416 bytes). A stranger's
    request carries a note sealed to both inbox keys (an ML-KEM-768
    ciphertext whose shared secret keys one Noise Xpsk0 message from the
    stranger's contact handshake key): the stranger's card (its
    post-quantum key as a hash), a throwaway route and an intro of at most
-   280 bytes, padded so every note is 1,787 bytes. It opens with the inbox
+   280 bytes, padded so every note is 1,795 bytes. It opens with the inbox
    secrets alone (no sender hint) and is bound to the network, the
    request's admission commitment and its ML-KEM ciphertext. Sender
    authentication is classical (X25519) only. The recipient is
@@ -353,10 +357,10 @@ reviewed.
 - Per-message forward secrecy and post-compromise security rest on an
   unreviewed Double Ratchet prototype. Its header (ratchet key and
   counters) is authenticated but not encrypted.
-- Contact key rollover is forward-only by the card's `not_after`, so a
-  second rotation inside one weekly epoch cannot reach contacts until the
-  next epoch's card (an emergency rotation would need a card sequence
-  number). Unreviewed.
+- Contact key rollover is forward-only by a signed card sequence number,
+  so an emergency rotation inside one weekly epoch reaches contacts at
+  once. Restoring an identity from an older backup reissues numbers
+  contacts refuse until rotations pass them. Unreviewed.
 - Reading an IK first message costs the answerer two key agreements before
   it can refuse. Answered handshakes are capped, but strangers' calls need a
   proper cost.

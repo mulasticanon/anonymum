@@ -199,7 +199,7 @@ composition and whether it answers questions 11 and 12:
   rotation, now prototyped as weekly epochs, above); no delay between claim finality and
   the callback (now a uniform 30-300 s in the demo, below); dummy payload
   slots that must be indistinguishable from real ones (slot sizes now
-  proposed: two 200-byte coin slots and one 1,787-byte stranger slot, I24;
+  proposed: two 200-byte coin slots and one 1,795-byte stranger slot, I24;
   dummies now prototyped, below);
   post-quantum key exchange and ratcheting as long-term questions (the
   ratchet is now prototyped, above); and
@@ -219,7 +219,7 @@ composition and whether it answers questions 11 and 12:
   the code); message retrieval at scale.
 - **Payload slots, pruning and the hybrid note** (issues file I28, I29;
   2026-11-20, unreviewed): every transaction has two 200-byte coin slots
-  and one 1,787-byte stranger slot; the stranger slot is pruned 24 hours
+  and one 1,795-byte stranger slot; the stranger slot is pruned 24 hours
   after its window starts. Each transaction keeps a permanent 32-byte hash
   of its stranger slot, which the proof binds to instead of the bytes, so
   proofs stay checkable after pruning (I28, resolved in the model; which
@@ -227,7 +227,7 @@ composition and whether it answers questions 11 and 12:
   version byte for its layout and key derivation. The note is
   now hybrid: ML-KEM-768 ciphertext in the Noise prologue and its shared
   secret as the psk of `Noise_Xpsk0` (`ml-kem` 0.3.3); one ML-KEM key per
-  card, signed through its BLAKE2s hash (card 1,408 bytes). Sender
+  card, signed through its BLAKE2s hash (card 1,416 bytes). Sender
   authentication stays classical. Is this the right hybrid?
 - **Durable grant state** (issues file, R8 and MED-04; 2026-11-21,
   unreviewed): a responder's gate can be saved as a ChaCha20-Poly1305
@@ -271,14 +271,17 @@ composition and whether it answers questions 11 and 12:
   from a fresh card signed by the same contact signing key
   (`roll_contact_key`), keeping the old key admitted for 26 h. **Resolved
   2026-11-21 (implemented, still unreviewed):** rollover is forward-only:
-  the new card's `not_after` must be later than the bound card's
-  (`StaleCard`), so a replayed older card cannot move a contact back.
-  Consequences: a second rotation inside one weekly epoch yields a card
-  with the same `not_after`, which contacts refuse until the next epoch
-  (an emergency mid-week rotation would need a card sequence number); and
-  a binding loaded from a version 2 snapshot has no recorded expiry, so its
-  first rollover is not checked. Stored identity format 2 and gate snapshot
-  format 3; older versions are still read.
+  the new card's signed `seq` must be greater than the bound card's
+  (`StaleCard`), so a replayed older card cannot move a contact back, even
+  from the same week. `seq` starts at a random non-zero `u32` and rises by
+  one on every rotation, so an emergency mid-week rotation reaches contacts
+  at once (card format v4, 1,416 bytes; note 1,795 bytes). Consequences:
+  restoring an identity from an older backup reissues sequence numbers
+  contacts refuse until it passes them; the gap between two cards shows a
+  contact how many rotations happened; and a binding loaded from a gate
+  snapshot older than version 4 has no recorded `seq`, so its first
+  rollover accepts any validly signed v4 card. Stored identity format 3 and
+  gate snapshot format 4; older versions are still read.
   **For you:** is trial decryption of message 1 with two static keys
   acceptable (it adds a timing difference between a HELLO to the active
   and to the draining key, and a decryption attempt for a HELLO to
@@ -313,7 +316,7 @@ composition and whether it answers questions 11 and 12:
 - **Two open items on the proof binding** (recorded 2026-11-21, yours to
   decide): (1) `stranger_note_hash` should be computed *outside* the
   circuit with an ordinary hash (BLAKE2s, as the model uses, or SHA-256)
-  and enter the proof only as a public input, so the 1,787 slot bytes are
+  and enter the proof only as a public input, so the 1,795 slot bytes are
   never hashed in-circuit; which hash, and who computes it (the chain on
   inclusion, the verifier, or both). (2) Everything the proof must commit
   to (nullifiers, commitments, the two coin slots, `stranger_note_hash`,

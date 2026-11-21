@@ -100,7 +100,7 @@ fn every_branch_has_the_same_payload_shape() {
         ("sender refund", refund_tx(&w, Branch::SenderRefund, &escrow, pos, p.canceller, "r").0),
     ];
     assert_eq!(PAYLOAD_LENS, [COIN_PAYLOAD_LEN, COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN]);
-    assert_eq!((COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN), (200, 1_787));
+    assert_eq!((COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN), (200, 1_795));
     for (name, public) in &shapes {
         let lens: Vec<usize> = public.payloads.iter().map(Vec::len).collect();
         assert_eq!(lens, PAYLOAD_LENS.to_vec(), "{name}");

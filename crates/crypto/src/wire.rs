@@ -893,7 +893,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     /// Move a contact to the handshake key on `card`, a fresh card from the
     /// same signing key: the card must verify for this network at `now`,
     /// its signing key must be the one recorded for a current contact, and
-    /// its `not_after` must be later than the bound card's
+    /// its `seq` must be greater than the bound card's
     /// ([`ContactError::StaleCard`] otherwise, nothing changed), so an older
     /// card that is still valid cannot move a contact back to an older key.
     /// The contact's grant moves to the new key; the old key stays admitted
@@ -1288,7 +1288,7 @@ mod tests {
     #[test]
     fn a_hello_the_active_key_opened_from_a_weak_caller_is_not_retried_with_the_draining_key() {
         let mut bob = ContactIdentity::generate_at(0);
-        bob.rotate_epoch(crate::contact::EPOCH_LEN);
+        bob.rotate_epoch(crate::contact::EPOCH_LEN).unwrap();
         let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
         let at = Attempt { call: 7, number: 1 };
         let when = Now { unix: crate::contact::EPOCH_LEN + 60, mono: Instant::now() };

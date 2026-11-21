@@ -64,7 +64,7 @@ fn a_note_to_the_previous_epoch_opens_during_the_grace_window() {
     assert!(opens(&bob, &note, created, T0));
 
     let next = epoch_start(T0) + EPOCH_LEN;
-    bob.rotate_epoch(next + 60);
+    bob.rotate_epoch(next + 60).unwrap();
     let new_card = bob.card(NET, 1);
     assert_ne!(new_card.inbox_key, old_card.inbox_key, "the card publishes the new epoch");
     assert_ne!(new_card.pq_inbox_key, old_card.pq_inbox_key);
@@ -96,7 +96,7 @@ fn purging_the_previous_epoch_makes_its_notes_unreadable() {
     let (mut bob, carol) = (ContactIdentity::generate_at(T0), ContactIdentity::generate_at(T0));
     let old_card = bob.card(NET, 1);
     let note = seal_to(&old_card, &carol);
-    bob.rotate_epoch(epoch_start(T0) + EPOCH_LEN);
+    bob.rotate_epoch(epoch_start(T0) + EPOCH_LEN).unwrap();
     let deadline = old_card.not_after + DRAIN_GRACE;
 
     assert!(!bob.purge_expired(deadline - 1), "kept until the grace is over");
@@ -120,9 +120,9 @@ fn purging_the_previous_epoch_makes_its_notes_unreadable() {
 fn rotating_twice_drops_the_oldest_epoch() {
     let (mut bob, carol) = (ContactIdentity::generate_at(T0), ContactIdentity::generate_at(T0));
     let first = seal_to(&bob.card(NET, 1), &carol);
-    bob.rotate_epoch(T0);
+    bob.rotate_epoch(T0).unwrap();
     let second = seal_to(&bob.card(NET, 1), &carol);
-    bob.rotate_epoch(T0);
+    bob.rotate_epoch(T0).unwrap();
     let third = seal_to(&bob.card(NET, 1), &carol);
 
     assert!(!opens(&bob, &first, T0, T0), "the first epoch is gone, its grace notwithstanding");
@@ -142,7 +142,7 @@ fn a_fresh_card_opens_at_the_floored_start_of_its_creation_window() {
     let boundary = epoch_start(T0) + EPOCH_LEN;
     // Carol makes (or rotates to) her identity seconds after an epoch starts.
     let mut carol = ContactIdentity::generate_at(T0);
-    carol.rotate_epoch(boundary + 5);
+    carol.rotate_epoch(boundary + 5).unwrap();
     let card = carol.card(NET, 1);
     assert_eq!(card.not_before, boundary - CLOCK_GRID_BACKDATE);
     let note = seal_to(&bob.card(NET, 1), &carol);
@@ -166,9 +166,9 @@ fn a_fresh_card_opens_at_the_floored_start_of_its_creation_window() {
 fn the_stored_identity_is_strict() {
     let mut bob = ContactIdentity::generate_at(T0);
     let one = bob.to_secret_bytes().to_vec();
-    bob.rotate_epoch(T0 + EPOCH_LEN);
+    bob.rotate_epoch(T0 + EPOCH_LEN).unwrap();
     let two = bob.to_secret_bytes().to_vec();
-    assert_eq!((one.len(), two.len()), (178, 322));
+    assert_eq!((one.len(), two.len()), (186, 330));
     let back = ContactIdentity::from_secret_bytes(&two).unwrap();
     assert_eq!(back.card(NET, 1), bob.card(NET, 1));
     assert_eq!(back.draining().unwrap().to_secret_bytes(), bob.draining().unwrap().to_secret_bytes());
@@ -179,9 +179,8 @@ fn the_stored_identity_is_strict() {
         ContactIdentity::from_secret_bytes(&b).err()
     };
     let flag = 1 + 32 + 144;
-    assert_eq!(bad(&|b| b[0] = 3, &one), Some(ContactError::Malformed), "version");
-    // Version 1 has another layout (a one-epoch buffer happens to have the
-    // same length in both versions; the version byte tells them apart).
+    assert_eq!(bad(&|b| b[0] = 9, &one), Some(ContactError::Malformed), "version");
+    // Version 1 has another layout; the version byte tells them apart.
     assert_eq!(bad(&|b| b[0] = 1, &two), Some(ContactError::Malformed), "version 1 has another layout");
     assert_eq!(bad(&|b| b[flag] = 2, &one), Some(ContactError::Malformed), "flag");
     assert_eq!(bad(&|b| b[flag] = 1, &one), Some(ContactError::Malformed), "flag says two, one present");

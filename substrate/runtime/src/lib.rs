@@ -104,7 +104,9 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 5: contact requests live 24 h (D2), not 48 h.
 	// 6: contact notes grow to 1,787 bytes (format v5: ML-KEM-768 ciphertext
 	// plus Noise Xpsk0, hybrid post-quantum); 667-byte notes are refused.
-	spec_version: 6,
+	// 7: contact notes grow to 1,795 bytes (the embedded card carries a signed
+	// sequence number, card format v4); 1,787-byte notes are refused.
+	spec_version: 7,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,

@@ -29,7 +29,7 @@ pub const COIN_PAYLOAD_LEN: usize = 200;
 /// ciphertext 1,088, Noise Xpsk0 message 667). Every transaction carries
 /// one; it is pruned 24 hours after its window starts.
 pub const STRANGER_SLOT: usize = 2;
-pub const STRANGER_NOTE_LEN: usize = 1_787;
+pub const STRANGER_NOTE_LEN: usize = 1_795;
 /// Exact length of each slot, in order.
 pub const PAYLOAD_LENS: [usize; N_PAY] = [COIN_PAYLOAD_LEN, COIN_PAYLOAD_LEN, STRANGER_NOTE_LEN];
 

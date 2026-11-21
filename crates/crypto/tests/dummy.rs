@@ -30,7 +30,7 @@ fn real_note() -> Vec<u8> {
 #[test]
 fn a_dummy_note_has_the_exact_length_and_is_fresh_each_time() {
     let notes: Vec<[u8; SEALED_NOTE_LEN]> = (0..4).map(|_| dummy_note(&NET, NOW)).collect();
-    assert_eq!(SEALED_NOTE_LEN, 1_787);
+    assert_eq!(SEALED_NOTE_LEN, 1_795);
     for (i, note) in notes.iter().enumerate() {
         assert_eq!(note.len(), real_note().len());
         assert!(note.iter().any(|b| *b != 0), "not all zero");

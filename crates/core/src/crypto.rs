@@ -64,7 +64,7 @@ pub fn key_binding_message(genesis: &[u8; 32], account: &Address, key: &Messagin
 /// Exact length of a note field, format v5 (hybrid post-quantum, 2026-11-20):
 /// admission commitment (32) + ML-KEM-768 ciphertext (1,088) + Noise Xpsk0
 /// message (667). Was 667 (v4), 587 (v3) and 427 before.
-pub const SEALED_NOTE_LEN: usize = 1_787;
+pub const SEALED_NOTE_LEN: usize = 1_795;
 
 /// An encrypted contact note. Opaque to the chain apart from its length.
 #[derive(Clone, PartialEq, Eq, Debug)]

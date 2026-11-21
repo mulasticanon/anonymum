@@ -63,9 +63,10 @@
 //! new key. The old key stays admitted for [`DRAIN_GRACE`] after the
 //! rollover, so a call made before the contact switched still completes,
 //! and is then pruned with its sessions. A card from any other signing key
-//! is refused. Rollover only moves forward: the new card's `not_after` must
-//! be later than the bound card's, so an older card that is still valid
-//! cannot move a contact back to an older key. Unreviewed.
+//! is refused. Rollover only moves forward: the new card's signed `seq` must
+//! be greater than the bound card's, so an older card that is still valid
+//! cannot move a contact back to an older key, while a second rotation
+//! inside one weekly epoch still reaches contacts. Unreviewed.
 //!
 //! The gate's state can be saved and restored, encrypted, through
 //! [`crate::wire::Responder::export_snapshot`] and the `restore_*`
@@ -77,7 +78,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::contact::{check_key, ContactCard, ContactError, Invitation, Network, Purpose, DRAIN_GRACE};
-use crate::snapshot::{SnapshotError, GATE_SNAPSHOT_V1, GATE_SNAPSHOT_V2, GATE_SNAPSHOT_VERSION};
+use crate::snapshot::{SnapshotError, GATE_SNAPSHOT_V1, GATE_SNAPSHOT_V2, GATE_SNAPSHOT_V3, GATE_SNAPSHOT_VERSION};
 
 /// How long past an invitation's expiry its revoked or consumed id is still
 /// kept, in case this machine's clock steps backwards.
@@ -112,14 +113,14 @@ pub enum Grant {
 }
 
 /// A contact: the reference its calls must name, the contact signing key
-/// it was bound to (if any) with that card's `not_after` (0 if unknown: a
-/// binding loaded from an older snapshot), and, for a key it has rolled
+/// it was bound to (if any) with that card's `seq` (0 if unknown: a binding
+/// loaded from an older snapshot), and, for a key it has rolled
 /// away from, when that key stops being admitted (Unix seconds).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Contact {
     reference: [u8; 32],
     signer: Option<[u8; 32]>,
-    card_not_after: u64,
+    card_seq: u64,
     retire_at: Option<u64>,
 }
 
@@ -136,13 +137,13 @@ impl Contact {
 }
 
 /// An expected callback: reference, deadline (Unix seconds) and the
-/// caller's contact signing key and card `not_after`, if bound.
+/// caller's contact signing key and card `seq`, if bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Callback {
     reference: [u8; 32],
     deadline: u64,
     signer: Option<[u8; 32]>,
-    card_not_after: u64,
+    card_seq: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -212,7 +213,7 @@ impl Gate {
         deadline: u64,
     ) -> Result<(), ContactError> {
         check_key(&caller)?;
-        self.callbacks.insert(caller, Callback { reference, deadline, signer: None, card_not_after: 0 });
+        self.callbacks.insert(caller, Callback { reference, deadline, signer: None, card_seq: 0 });
         Ok(())
     }
 
@@ -232,9 +233,9 @@ impl Gate {
         if elsewhere {
             return Err(ContactError::KeyInUse);
         }
-        let (slot, not_after) = match (self.contacts.get_mut(&key), self.callbacks.get_mut(&key)) {
-            (Some(contact), _) if contact.current() => (&mut contact.signer, &mut contact.card_not_after),
-            (_, Some(callback)) => (&mut callback.signer, &mut callback.card_not_after),
+        let (slot, seq) = match (self.contacts.get_mut(&key), self.callbacks.get_mut(&key)) {
+            (Some(contact), _) if contact.current() => (&mut contact.signer, &mut contact.card_seq),
+            (_, Some(callback)) => (&mut callback.signer, &mut callback.card_seq),
             _ => return Err(ContactError::UnknownContact),
         };
         match slot {
@@ -242,7 +243,7 @@ impl Gate {
             _ => {
                 *slot = Some(signer);
                 // Binding again with an older card never lowers the mark.
-                *not_after = (*not_after).max(card.not_after);
+                *seq = (*seq).max(card.seq);
                 Ok(())
             }
         }
@@ -250,9 +251,10 @@ impl Gate {
 
     /// Move the current contact bound to `card`'s signing key to the card's
     /// handshake key (a key rollover). The card must verify at `now` and
-    /// end later than the bound card ([`ContactError::StaleCard`] otherwise).
+    /// its `seq` must exceed the bound card's ([`ContactError::StaleCard`]
+    /// otherwise).
     /// The old key is kept, retiring, for [`DRAIN_GRACE`]. Returns the old
-    /// key. A later card for the same key only moves the mark forward.
+    /// key. A newer card for the same key only moves the mark forward.
     pub(crate) fn roll_key(&mut self, card: &ContactCard, now: Now) -> Result<[u8; 32], ContactError> {
         let now_secs = self.effective_now(now.unix);
         card.verify(&self.network, now_secs)?;
@@ -265,12 +267,12 @@ impl Gate {
         if self.blocked.contains(&old) {
             return Err(ContactError::UnknownContact);
         }
-        if card.not_after <= contact.card_not_after {
+        if card.seq <= contact.card_seq {
             return Err(ContactError::StaleCard);
         }
         let new = card.handshake_key;
         if new == old {
-            self.contacts.insert(old, Contact { card_not_after: card.not_after, ..contact });
+            self.contacts.insert(old, Contact { card_seq: card.seq, ..contact });
             return Ok(old);
         }
         let taken = self.blocked.contains(&new)
@@ -280,7 +282,7 @@ impl Gate {
         if taken {
             return Err(ContactError::KeyInUse);
         }
-        self.contacts.insert(new, Contact { retire_at: None, card_not_after: card.not_after, ..contact });
+        self.contacts.insert(new, Contact { retire_at: None, card_seq: card.seq, ..contact });
         self.contacts.insert(old, Contact { retire_at: Some(now_secs.saturating_add(DRAIN_GRACE)), ..contact });
         Ok(old)
     }
@@ -300,13 +302,13 @@ impl Gate {
         std::mem::take(&mut self.retired)
     }
 
-    /// The `not_after` of the card bound to `caller`, if it is known to
-    /// the gate (0 for a binding loaded from an older snapshot).
-    pub fn card_not_after(&self, caller: &[u8; 32]) -> Option<u64> {
+    /// The `seq` of the card bound to `caller`, if it is known to the gate
+    /// (0 for a binding loaded from an older snapshot).
+    pub fn card_seq(&self, caller: &[u8; 32]) -> Option<u64> {
         self.contacts
             .get(caller)
-            .map(|c| c.card_not_after)
-            .or_else(|| self.callbacks.get(caller).map(|c| c.card_not_after))
+            .map(|c| c.card_seq)
+            .or_else(|| self.callbacks.get(caller).map(|c| c.card_seq))
     }
 
     /// The contact signing key bound to `caller`, if any.
@@ -445,24 +447,24 @@ impl Gate {
         if self.authorise(caller, reference, now) != Some(grant) {
             return false;
         }
-        let (signer, card_not_after) = match grant {
+        let (signer, card_seq) = match grant {
             Grant::Invitation { id } => {
                 let expires_at = self.issued.remove(caller).map_or(u64::MAX, |i| i.expires_at);
                 self.honoured.insert(id, expires_at);
                 (None, 0)
             }
-            Grant::Callback => self.callbacks.remove(caller).map_or((None, 0), |c| (c.signer, c.card_not_after)),
+            Grant::Callback => self.callbacks.remove(caller).map_or((None, 0), |c| (c.signer, c.card_seq)),
             // An existing contact (current or retiring) stays as it is.
             Grant::Contact => return true,
         };
-        self.contacts.insert(*caller, Contact { reference: *reference, signer, card_not_after, retire_at: None });
+        self.contacts.insert(*caller, Contact { reference: *reference, signer, card_seq, retire_at: None });
         true
     }
 }
 
 // ---- snapshot encoding -------------------------------------------------------
 
-/// The plaintext of a gate snapshot, format version 3 (2026-11-21). All
+/// The plaintext of a gate snapshot, format version 4 (2026-11-21). All
 /// integers are big-endian; every table is sorted by key, so equal gates
 /// encode equally.
 ///
@@ -472,17 +474,18 @@ impl Gate {
 /// honoured:  u32 count, each id (32) || expires_at (8)
 /// revoked:   u32 count, each id (32) || expires_at (8)
 /// contacts:  u32 count, each caller (32) || reference (32) || flags (1)
-///            [|| signer (32) || card_not_after (8) if bit 0]
+///            [|| signer (32) || card_seq (8) if bit 0]
 ///            [|| retire_at (8) if bit 1]
 /// callbacks: u32 count, each caller (32) || reference (32) || deadline (8)
-///            || flags (1) [|| signer (32) || card_not_after (8) if bit 0]
+///            || flags (1) [|| signer (32) || card_seq (8) if bit 0]
 /// blocked:   u32 count, each caller (32)
 /// ```
 ///
-/// Version 2 had no `card_not_after`, version 1 no flags (so no signers or
-/// retiring keys); both are still read. A binding from version 2 has no
-/// known card expiry (0), so its first rollover cannot be checked against
-/// one. Unknown flag bits are refused.
+/// Version 3 stored the bound card's `not_after` where `card_seq` now is,
+/// version 2 had neither, version 1 no flags (so no signers or retiring
+/// keys); all are still read. A binding from an older version has no known
+/// sequence number (0), so its first rollover accepts any validly signed v4
+/// card; a v3 card no longer verifies. Unknown flag bits are refused.
 impl Gate {
     pub(crate) fn encode(&self) -> Vec<u8> {
         fn sorted<K: Ord + Copy, V>(map: &HashMap<K, V>) -> Vec<(K, &V)> {
@@ -521,7 +524,7 @@ impl Gate {
             out.push(contact.signer.is_some() as u8 | (contact.retire_at.is_some() as u8) << 1);
             if let Some(signer) = contact.signer {
                 out.extend_from_slice(&signer);
-                out.extend_from_slice(&contact.card_not_after.to_be_bytes());
+                out.extend_from_slice(&contact.card_seq.to_be_bytes());
             }
             if let Some(end) = contact.retire_at {
                 out.extend_from_slice(&end.to_be_bytes());
@@ -535,7 +538,7 @@ impl Gate {
             out.push(callback.signer.is_some() as u8);
             if let Some(signer) = callback.signer {
                 out.extend_from_slice(&signer);
-                out.extend_from_slice(&callback.card_not_after.to_be_bytes());
+                out.extend_from_slice(&callback.card_seq.to_be_bytes());
             }
         }
         let mut blocked: Vec<&[u8; 32]> = self.blocked.iter().collect();
@@ -552,11 +555,10 @@ impl Gate {
     pub(crate) fn decode(bytes: &[u8], network: &Network) -> Result<Gate, SnapshotError> {
         let mut r = Reader { bytes, at: 0 };
         let version = r.u8()?;
-        if ![GATE_SNAPSHOT_VERSION, GATE_SNAPSHOT_V2, GATE_SNAPSHOT_V1].contains(&version) {
+        if ![GATE_SNAPSHOT_VERSION, GATE_SNAPSHOT_V3, GATE_SNAPSHOT_V2, GATE_SNAPSHOT_V1].contains(&version) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let v1 = version == GATE_SNAPSHOT_V1;
-        let has_expiry = version == GATE_SNAPSHOT_VERSION;
         if &r.array::<32>()? != network {
             return Err(SnapshotError::WrongNetwork);
         }
@@ -588,9 +590,9 @@ impl Gate {
                 return Err(SnapshotError::Malformed);
             }
             let signer = if flags & 1 != 0 { Some(r.array::<32>()?) } else { None };
-            let card_not_after = if flags & 1 != 0 && has_expiry { r.u64()? } else { 0 };
+            let card_seq = if flags & 1 != 0 { r.bound_card_seq(version)? } else { 0 };
             let retire_at = if flags & 2 != 0 { Some(r.u64()?) } else { None };
-            if gate.contacts.insert(caller, Contact { reference, signer, card_not_after, retire_at }).is_some() {
+            if gate.contacts.insert(caller, Contact { reference, signer, card_seq, retire_at }).is_some() {
                 return Err(SnapshotError::Malformed);
             }
         }
@@ -601,8 +603,8 @@ impl Gate {
                 return Err(SnapshotError::Malformed);
             }
             let signer = if flags & 1 != 0 { Some(r.array::<32>()?) } else { None };
-            let card_not_after = if flags & 1 != 0 && has_expiry { r.u64()? } else { 0 };
-            if gate.callbacks.insert(caller, Callback { reference, deadline, signer, card_not_after }).is_some() {
+            let card_seq = if flags & 1 != 0 { r.bound_card_seq(version)? } else { 0 };
+            if gate.callbacks.insert(caller, Callback { reference, deadline, signer, card_seq }).is_some() {
                 return Err(SnapshotError::Malformed);
             }
         }
@@ -642,6 +644,16 @@ impl<'a> Reader<'a> {
     }
     fn u64(&mut self) -> Result<u64, SnapshotError> {
         Ok(u64::from_be_bytes(self.array()?))
+    }
+    /// The mark stored with a binding: a `seq` in the current version. A
+    /// version 3 `not_after` is read past and dropped (it is not a sequence
+    /// number); older versions store nothing.
+    fn bound_card_seq(&mut self, version: u8) -> Result<u64, SnapshotError> {
+        match version {
+            GATE_SNAPSHOT_VERSION => self.u64(),
+            GATE_SNAPSHOT_V3 => self.u64().map(|_| 0),
+            _ => Ok(0),
+        }
     }
     fn count(&mut self) -> Result<u32, SnapshotError> {
         Ok(u32::from_be_bytes(self.array()?))

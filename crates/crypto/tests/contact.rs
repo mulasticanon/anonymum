@@ -80,7 +80,7 @@ fn a_card_holds_three_contact_keys_and_no_wallet_key() {
 fn a_card_carries_one_post_quantum_inbox_key_covered_by_its_signature() {
     let bob = ContactIdentity::generate_at(NOW);
     let card = bob.card_within(NET, 5, 10, 20);
-    assert_eq!((ContactCard::LEN, card.to_bytes().len()), (1_408, 1_408));
+    assert_eq!((ContactCard::LEN, card.to_bytes().len()), (1_416, 1_416));
     assert_eq!(card.pq_inbox_key, bob.pq_inbox_key());
     assert_eq!(card.summary().pq_inbox_hash, anonymum_crypto::contact::pq_key_hash(&bob.pq_inbox_key()));
     // Another valid ML-KEM key swapped in: the signature (over its hash) fails.

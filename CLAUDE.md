@@ -46,12 +46,12 @@ Windows machine (see the update below).
 | Crate | Contents | Verified |
 |---|---|---|
 | `crates/core` (`anonymum-core`) | Chain rules as a deterministic state machine: invites, paid contact requests with sealed notes, escrow, channels, blocks, invite-only, messaging keys, fee split, 24 h request expiry, client-side inbox admission, token-bucket rate limit, storage deposits. Zero dependencies. | 63 tests, run by CI on Linux and Windows |
-| `crates/crypto` (`anonymum-crypto`) | `Identity` (wallet: Ed25519 address + X25519 key bound to it, for the transparent chain only), `InviteSecret` / `Ed25519Invites` (chain invites); spec v0.7 section 2a prototype: `contact` (`ContactIdentity` with signing, handshake and inbox keys; `ContactCard`; `Invitation` to a holder key; `StaticKey` caller keys), `gate` (`Gate`: authorise before replying, commit on confirmation; changed only through the responder), crate-private Noise IK handshake types, `note` (stranger's note opened with the inbox key alone, bound to network and admission commitment), `wire` (HELLO / WELCOME / CONFIRM / ACK; unauthorised callers get nothing; call id and attempt in the IK prologue; inner record types; atomic revocation; deadlines with an injected `Now`). Received X25519 keys checked with `was_contributory`; block and remove cancel the key's unused invitation and callback grant too; sessions keyed by caller key with caps (`Limits`, one candidate handle per caller); send counter cannot wrap; `snapshot` (encrypted, versioned gate snapshots with `StorageKey`, persist-before-reply; deadlines and revocations in Unix seconds, pruned at expiry + `CLOCK_SKEW_SECS`; a persisted clock floor `last_seen` stops a clock set back from reviving them); key rotation (`KeyEpoch`: handshake + inbox + ML-KEM seed in a two-slot ring of active + draining on a weekly grid, `rotate_epoch`, `purge_expired`, `DRAIN_GRACE` 26 h; `open_note` takes the opener's clock; identity storage v2, still reads v1); `dummy_note` (a real v5 note between throwaway identities, for unused stranger slots). Unreviewed. | 182 tests, run by CI on Linux and Windows |
+| `crates/crypto` (`anonymum-crypto`) | `Identity` (wallet: Ed25519 address + X25519 key bound to it, for the transparent chain only), `InviteSecret` / `Ed25519Invites` (chain invites); spec v0.7 section 2a prototype: `contact` (`ContactIdentity` with signing, handshake and inbox keys; `ContactCard`; `Invitation` to a holder key; `StaticKey` caller keys), `gate` (`Gate`: authorise before replying, commit on confirmation; changed only through the responder), crate-private Noise IK handshake types, `note` (stranger's note opened with the inbox key alone, bound to network and admission commitment), `wire` (HELLO / WELCOME / CONFIRM / ACK; unauthorised callers get nothing; call id and attempt in the IK prologue; inner record types; atomic revocation; deadlines with an injected `Now`). Received X25519 keys checked with `was_contributory`; block and remove cancel the key's unused invitation and callback grant too; sessions keyed by caller key with caps (`Limits`, one candidate handle per caller); send counter cannot wrap; `snapshot` (encrypted, versioned gate snapshots with `StorageKey`, persist-before-reply; deadlines and revocations in Unix seconds, pruned at expiry + `CLOCK_SKEW_SECS`; a persisted clock floor `last_seen` stops a clock set back from reviving them); key rotation (`KeyEpoch`: handshake + inbox + ML-KEM seed in a two-slot ring of active + draining on a weekly grid, `rotate_epoch`, `purge_expired`, `DRAIN_GRACE` 26 h; `open_note` takes the opener's clock; identity storage v2, still reads v1); `dummy_note` (a real v5 note between throwaway identities, for unused stranger slots). Unreviewed. | 190 tests, run by CI on Linux and Windows |
 | `substrate/pallets/anonymum` (`pallet-anonymum`) | FRAME port of `chain.rs` (Polkadot SDK `polkadot-stable2609-2`, umbrella crate `=2609.3.0`). Own workspace and `Cargo.lock` in `substrate/`. | 64 tests (rule tests matching the core crate's + FRAME checks); CI workflow `substrate.yml` |
 | `substrate/runtime` (`anonymum-runtime`) | Minimal template runtime + the pallet; compiled to WebAssembly. | Ran on a local `polkadot-omni-node` dev chain in WSL2; `substrate/scripts/smoke.mjs` passed (manual) |
 | `crates/shielded-model` (`anonymum-shielded-model`) | Reference model of `docs/shielded-spec-v0.md`: notes with blinding, admission records, grid-stamped leaves, position-bound and dummy nullifiers, every section 4 branch (v0.5: one sender refund at any time; refunds derived from seed and escrow position), `Chain::submit`, a recovering wallet (recovery copy carries its nonce and the key paths of the refund and cancel keys; refunds found via the consuming transaction). Unused payload slots get random bytes, or a caller-supplied dummy stranger note (`dummy_stranger_note`; production passes `anonymum_crypto::dummy_note`). HIGH-03 (2026-11-21): escrows lock `fee_reserve >= F` (default `2 F`), the surplus returns to `refund_to` in a derived note on every outcome (a claim's own surplus note), a fee above the reserve is paid by a top-up note (`TxBuilder::resolution`, `Chain::set_base_fee`); the wallet gives each escrow a one-time refund key (`next_escrow_keys`, `prepare_escrow`). Rules only: no proofs, not private. Deps: `blake2`, `chacha20poly1305`, `rand_core` (pinned, already in the lockfile). | 83 tests (section 5 properties, randomised conservation, 5b acceptance, slots and pruning, fee changes); every rule mutation-checked |
 | `crates/crypto` ratchet (2026-11-21) | `ratchet` (`Ratchet`, `RatchetKey`): Double Ratchet after the Signal spec for every DATA frame. `KDF_RK`/`KDF_CK` keyed BLAKE2s (`anonymum/dr-rk/v1`, `anonymum/dr-ck/v1`), ChaCha20-Poly1305 with the one-time key and zero nonce, AAD `anonymum/dr-msg/v1 \|\| network \|\| header`; 40-byte header not encrypted; received ratchet keys checked with `is_contributory_key`; failures change nothing (staged state); `MAX_SKIP_PER_STEP` 256, `MAX_TOTAL_SKIPPED` 1,024 (oldest evicted). Bootstrap in `wire`: CONFIRM carries seed_i + an ephemeral ratchet key `dh_i0`, ACK seed_r + the answerer's first ratchet key (both checked); root = keyed BLAKE2s (`anonymum/dr-root/v1`) of seed_i, seed_r and the IK handshake hash; the answerer starts against `dh_i0` so it may send first (the static IK key is not in the ratchet); data before the ACK is held (`MAX_EARLY_DATA` 16, `Initiator::take_early`, `InitiatorEvent::Held`). Markers v5. Unreviewed. | 22 tests in `tests/ratchet.rs` + 5 unit tests (counted in the crypto total); every new rule mutation-checked |
-| `crates/crypto` handshake rotation (2026-11-21) | The handshake key lives in each `KeyEpoch`, so it rotates with the inbox keys. `Responder` holds active + draining handshake keys (`for_identity`, `for_callback_identity`, `restore_*`, `refresh_keys`): a HELLO is read with the active key, and with the draining key only on a Noise decryption failure and only before `not_after + DRAIN_GRACE` (gate clock floor; dropped then). Gate contacts carry an optional signing key and retire time (`bind_contact_card`, `roll_contact_key`: a fresh card from the same signing key moves the grant to the new key; the old key stays admitted 26 h, then pruned with its sessions; block/remove follow both keys; forward-only: the new card's `not_after` must exceed the bound card's, else `StaleCard`). Gate snapshot v3, still reads v1 and v2. Unreviewed. | 21 tests in `tests/handshake_rotation.rs` + unit tests (counted in the crypto total); every new rule mutation-checked |
+| `crates/crypto` handshake rotation (2026-11-21) | The handshake key lives in each `KeyEpoch`, so it rotates with the inbox keys. `Responder` holds active + draining handshake keys (`for_identity`, `for_callback_identity`, `restore_*`, `refresh_keys`): a HELLO is read with the active key, and with the draining key only on a Noise decryption failure and only before `not_after + DRAIN_GRACE` (gate clock floor; dropped then). Gate contacts carry an optional signing key and retire time (`bind_contact_card`, `roll_contact_key`: a fresh card from the same signing key moves the grant to the new key; the old key stays admitted 26 h, then pruned with its sessions; block/remove follow both keys; forward-only: the new card's signed `seq` must exceed the bound card's, else `StaleCard`). Gate snapshot v4, still reads v1 to v3. Unreviewed. | 21 tests in `tests/handshake_rotation.rs` + unit tests (counted in the crypto total); every new rule mutation-checked |
 | `crates/nym` (`anonymum-nym`) | Binary: Alice (invite), Carol (stranger, reverse rendezvous with a persisted throwaway client and retrying caller), Dave (dropped); the callback after a stranger's note waits a random 30-300 s (`jitter.rs`; `--no-jitter` / `--jitter MIN-MAX`, 5 unit tests run with `cargo test -p anonymum-nym`); subcommands `wallet`/`throwaway`/`seal`/`open`/`talk` for `substrate/scripts/e2e.mjs`. | Manual live runs on Windows, see README |
 
 **Update 2026-11-18, local Windows session:** Rust 1.100 (MSVC) installed;
@@ -170,7 +170,7 @@ tests for every rule and failure path (failed transactions change nothing;
   `mock_binding` in core tests). A key may be replaced; notes sealed to the
   old key can no longer be opened.
 - `Tx::RequestContact` carries `note: SealedNote`. The chain checks only its
-  length (`SEALED_NOTE_LEN` = 1,787 since 2026-11-20; 667, 587 and 427
+  length (`SEALED_NOTE_LEN` = 1,795 since 2026-11-21; 1,787, 667, 587 and 427
   before; core and pallet). Format v5 (`anonymum-crypto::note`, hybrid
   post-quantum, deniable, I27/I29): admission commitment (32) ||
   ML-KEM-768 ciphertext to the recipient card's `pq_inbox_key` (1,088) ||
@@ -181,7 +181,7 @@ tests for every rule and failure path (failed transactions change nothing;
   as its 32-byte hash, 96-byte route, u16 intro length, intro padded to
   280; no signature over the contact. Opens with the two inbox secrets
   alone; `ContactNote::card` is a `CardSummary`. The callback goes to the
-  sender's handshake key (no separate callback key). Cards (v3, 1,408
+  sender's handshake key (no separate callback key). Cards (v4 with a signed `seq`, 1,416
   bytes) carry one ML-KEM-768 key and sign its BLAKE2s hash; contact
   identities have four secrets (the fourth is a 64-byte ML-KEM seed; the
   demo's wallet file line was `contact_pq`; since 2026-11-21 the whole
@@ -198,7 +198,7 @@ tests for every rule and failure path (failed transactions change nothing;
 **C. Request expiry, 24 hours since 2026-11-20 (D2; 48 hours before).**
 `Params::request_ttl_secs` (86,400) and `block_time_ms` (6,000);
 `request_ttl_blocks()` rounds up (14,400). The runtime's `RequestTtlMillis`
-matches (spec_version 5).
+matches (spec_version 5 then; 7 since the 1,795-byte note).
 
 **Gateway retention, checked:** `nym-node` deletes stored messages after
 `stale_messages.max_age`, default 24 h (operator-configurable). So the
@@ -386,7 +386,7 @@ hiding amounts and activity:
   submit it;
 - either side cancelling at any time becomes "first finalised wins";
 - blocking cannot be enforced by the chain once contact state is private;
-- the stranger's note (427 bytes then) did not fit a post-quantum key exchange (it is 1,787 bytes with ML-KEM-768 since 2026-11-20);
+- the stranger's note (427 bytes then) did not fit a post-quantum key exchange (it is 1,795 bytes with ML-KEM-768 and the card `seq`);
 - invites checked inside a proof probably need a circuit-friendly
   signature; Ed25519, used today, is costly inside a circuit.
 
@@ -399,7 +399,7 @@ for reference) differs from it, the spec wins. The research report gives
 background; section 15.1 gate 1 is what the spec's decisions answer.
 `crates/shielded-model` is a plain-Rust reference model of the spec's rules
 (no proofs, not private or secure; 83 tests). Since 2026-11-20 it has
-two 200-byte coin-note slots plus one 1,787-byte stranger-note slot per
+two 200-byte coin-note slots plus one 1,795-byte stranger-note slot per
 transaction, prunes stranger notes 24 h after their window starts
 (`Chain::prune_stranger_notes`; the proof binds to a permanent `stranger_note_hash`, I28), enforces the empty
 admission record's zero fields (W3, `Reject::NonEmptyAdmission`), and its
@@ -445,9 +445,10 @@ until the cryptographer has reviewed the spec.
   through epoch rotation (handshake and inbox keys together, weekly epochs,
   an old epoch dropped 26 h after it ends; 2026-11-21). Nothing rotates
   automatically yet, nothing sends a rotated card to contacts, and
-  invitation holder keys do not rotate. Rollover is forward-only by
-  `not_after`, so a second rotation inside one epoch cannot reach contacts
-  until the next epoch (needs a card sequence number).
+  invitation holder keys do not rotate. Rollover is forward-only by a
+  signed card `seq` (2026-11-21), so an emergency rotation reaches contacts
+  at once; restoring an identity from an older backup reissues numbers
+  contacts refuse until rotations pass them.
 - Gate state is durable on one device only (encrypted snapshot,
   persist-before-reply; 2026-11-21). One device per contact identity; the
   demo does not persist its gate.
