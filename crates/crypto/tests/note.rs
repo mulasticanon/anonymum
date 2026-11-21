@@ -3,7 +3,7 @@ const G: [u8; 32] = *b"anonymum-core-simulation-genesis";
 
 use anonymum_core::{Chain, Error, Event, MessagingKey, Params, SealedNote, Tx, COIN, SEALED_NOTE_LEN};
 use anonymum_crypto::note::{INTRO_MAX_BYTES, ROUTE_LEN};
-use anonymum_crypto::{open_note, seal_note, ContactCard, ContactIdentity, InboxEpoch, Ed25519Invites, Identity, NoteError};
+use anonymum_crypto::{open_note, seal_note, ContactCard, ContactIdentity, KeyEpoch, Ed25519Invites, Identity, NoteError};
 
 const ROUTE: [u8; ROUTE_LEN] = [7; ROUTE_LEN];
 const ADMISSION: [u8; 32] = [0xAD; 32];
@@ -83,10 +83,10 @@ fn a_note_for_another_recipient_does_not_open() {
     // Not the sender, not someone else, and not Bob's handshake key.
     assert!(matches!(open_note(&carol, &NET, &note, NOW, NOW), Err(NoteError::Noise(_))));
     assert!(matches!(open_note(&ContactIdentity::generate_at(NOW), &NET, &note, NOW, NOW), Err(NoteError::Noise(_))));
-    let (signing, handshake) = bob.root_secret_bytes();
-    let (inbox, pq, not_before, not_after) = bob.active().to_secret_bytes();
-    let as_inbox = InboxEpoch::from_secret_bytes(handshake, pq, not_before, not_after).unwrap();
-    let swapped = ContactIdentity::from_parts(signing, inbox, as_inbox, None);
+    let signing = bob.signing_secret_bytes();
+    let (handshake, inbox, pq, not_before, not_after) = bob.active().to_secret_bytes();
+    let as_inbox = KeyEpoch::from_secret_bytes(inbox, handshake, pq, not_before, not_after).unwrap();
+    let swapped = ContactIdentity::from_parts(*signing, as_inbox, None);
     assert!(matches!(open_note(&swapped, &NET, &note, NOW, NOW), Err(NoteError::Noise(_))));
 }
 

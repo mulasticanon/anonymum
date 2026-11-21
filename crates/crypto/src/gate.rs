@@ -54,6 +54,17 @@
 //! (and pruned it) or a callback grant run out, setting the clock back,
 //! within a run or across a restart, cannot make either usable again.
 //!
+//! # Key rollover
+//!
+//! A contact may be recorded with its contact signing key
+//! ([`crate::wire::Responder::bind_contact_card`]). When it rotates its
+//! handshake key it sends a fresh card from the same signing key;
+//! [`crate::wire::Responder::roll_contact_key`] then moves its grant to the
+//! new key. The old key stays admitted for [`DRAIN_GRACE`] after the
+//! rollover, so a call made before the contact switched still completes,
+//! and is then pruned with its sessions. A card from any other signing key
+//! is refused. Unreviewed.
+//!
 //! The gate's state can be saved and restored, encrypted, through
 //! [`crate::wire::Responder::export_snapshot`] and the `restore_*`
 //! constructors (see [`crate::snapshot`]); the responder documents when a
@@ -63,8 +74,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::contact::{check_key, ContactError, Invitation, Network, Purpose};
-use crate::snapshot::{SnapshotError, GATE_SNAPSHOT_VERSION};
+use crate::contact::{check_key, ContactCard, ContactError, Invitation, Network, Purpose, DRAIN_GRACE};
+use crate::snapshot::{SnapshotError, GATE_SNAPSHOT_V1, GATE_SNAPSHOT_VERSION};
 
 /// How long past an invitation's expiry its revoked or consumed id is still
 /// kept, in case this machine's clock steps backwards.
@@ -98,6 +109,37 @@ pub enum Grant {
     Callback,
 }
 
+/// A contact: the reference its calls must name, the contact signing key
+/// it was bound to (if any), and, for a key it has rolled away from, when
+/// that key stops being admitted (Unix seconds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Contact {
+    reference: [u8; 32],
+    signer: Option<[u8; 32]>,
+    retire_at: Option<u64>,
+}
+
+impl Contact {
+    fn current(&self) -> bool {
+        self.retire_at.is_none()
+    }
+
+    /// Admitted at `now_secs`: a current key, or a retiring one before its
+    /// time is up.
+    fn live_at(&self, now_secs: u64) -> bool {
+        self.retire_at.map_or(true, |end| now_secs < end)
+    }
+}
+
+/// An expected callback: reference, deadline (Unix seconds) and the
+/// caller's contact signing key, if bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Callback {
+    reference: [u8; 32],
+    deadline: u64,
+    signer: Option<[u8; 32]>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Gate {
     network: Network,
@@ -110,13 +152,15 @@ pub struct Gate {
     /// Invitations cancelled by a block or a removal, never usable again:
     /// id -> its expiry (Unix seconds).
     revoked: HashMap<[u8; 32], u64>,
-    /// Caller key -> the reference its calls must name.
-    contacts: HashMap<[u8; 32], [u8; 32]>,
-    /// Caller key -> (reference, deadline in Unix seconds).
-    callbacks: HashMap<[u8; 32], ([u8; 32], u64)>,
+    /// Caller key -> the contact it belongs to.
+    contacts: HashMap<[u8; 32], Contact>,
+    /// Caller key -> the callback it may make.
+    callbacks: HashMap<[u8; 32], Callback>,
     blocked: HashSet<[u8; 32]>,
     /// The latest Unix time this gate has seen; its clock floor.
     last_seen: u64,
+    /// Retiring keys pruned since the responder last asked (not persisted).
+    retired: Vec<[u8; 32]>,
 }
 
 impl Gate {
@@ -131,6 +175,7 @@ impl Gate {
             callbacks: HashMap::new(),
             blocked: HashSet::new(),
             last_seen: 0,
+            retired: Vec::new(),
         }
     }
 
@@ -162,8 +207,89 @@ impl Gate {
         deadline: u64,
     ) -> Result<(), ContactError> {
         check_key(&caller)?;
-        self.callbacks.insert(caller, (reference, deadline));
+        self.callbacks.insert(caller, Callback { reference, deadline, signer: None });
         Ok(())
+    }
+
+    /// Bind `card`'s signing key to the contact or expected callback held
+    /// by its handshake key. The card must verify at `now`; a key bound to
+    /// another signer, or a signer already bound to another current key, is
+    /// refused.
+    pub(crate) fn bind_signer(&mut self, card: &ContactCard, now: Now) -> Result<(), ContactError> {
+        let now_secs = self.effective_now(now.unix);
+        card.verify(&self.network, now_secs)?;
+        let (key, signer) = (card.handshake_key, card.signing_key);
+        if self.blocked.contains(&key) {
+            return Err(ContactError::KeyInUse);
+        }
+        let elsewhere = self.contacts.iter().any(|(k, c)| *k != key && c.current() && c.signer == Some(signer))
+            || self.callbacks.iter().any(|(k, c)| *k != key && c.signer == Some(signer));
+        if elsewhere {
+            return Err(ContactError::KeyInUse);
+        }
+        let slot = match (self.contacts.get_mut(&key), self.callbacks.get_mut(&key)) {
+            (Some(contact), _) if contact.current() => &mut contact.signer,
+            (_, Some(callback)) => &mut callback.signer,
+            _ => return Err(ContactError::UnknownContact),
+        };
+        match slot {
+            Some(bound) if *bound != signer => Err(ContactError::SignerMismatch),
+            _ => {
+                *slot = Some(signer);
+                Ok(())
+            }
+        }
+    }
+
+    /// Move the current contact bound to `card`'s signing key to the card's
+    /// handshake key (a key rollover). The card must verify at `now`. The
+    /// old key is kept, retiring, for [`DRAIN_GRACE`]. Returns the old key.
+    pub(crate) fn roll_key(&mut self, card: &ContactCard, now: Now) -> Result<[u8; 32], ContactError> {
+        let now_secs = self.effective_now(now.unix);
+        card.verify(&self.network, now_secs)?;
+        let (old, contact) = self
+            .contacts
+            .iter()
+            .find(|(_, c)| c.current() && c.signer == Some(card.signing_key))
+            .map(|(k, c)| (*k, *c))
+            .ok_or(ContactError::UnknownContact)?;
+        let new = card.handshake_key;
+        if new == old {
+            return Ok(old);
+        }
+        if self.blocked.contains(&old) {
+            return Err(ContactError::UnknownContact);
+        }
+        let taken = self.blocked.contains(&new)
+            || self.contacts.contains_key(&new)
+            || self.callbacks.contains_key(&new)
+            || self.issued.contains_key(&new);
+        if taken {
+            return Err(ContactError::KeyInUse);
+        }
+        self.contacts.insert(new, Contact { retire_at: None, ..contact });
+        self.contacts.insert(old, Contact { retire_at: Some(now_secs.saturating_add(DRAIN_GRACE)), ..contact });
+        Ok(old)
+    }
+
+    /// `caller` and every other key of the same bound contact (current or
+    /// retiring).
+    pub(crate) fn keys_of(&self, caller: &[u8; 32]) -> Vec<[u8; 32]> {
+        let mut out = vec![*caller];
+        if let Some(signer) = self.contacts.get(caller).and_then(|c| c.signer) {
+            out.extend(self.contacts.iter().filter(|(k, c)| *k != caller && c.signer == Some(signer)).map(|(k, _)| *k));
+        }
+        out
+    }
+
+    /// Retiring keys pruned since the last call.
+    pub(crate) fn take_retired(&mut self) -> Vec<[u8; 32]> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// The contact signing key bound to `caller`, if any.
+    pub fn signer_of(&self, caller: &[u8; 32]) -> Option<[u8; 32]> {
+        self.contacts.get(caller).and_then(|c| c.signer).or_else(|| self.callbacks.get(caller).and_then(|c| c.signer))
     }
 
     /// End the relationship with `caller` and cancel every grant it still
@@ -221,7 +347,15 @@ impl Gate {
         self.honoured.retain(|_, e| keep(e));
         self.revoked.retain(|_, e| keep(e));
         self.issued.retain(|_, invitation| now_secs < invitation.expires_at);
-        self.callbacks.retain(|_, (_, deadline)| now_secs < *deadline);
+        self.callbacks.retain(|_, c| now_secs < c.deadline);
+        let retired = &mut self.retired;
+        self.contacts.retain(|key, c| {
+            let keep = c.live_at(now_secs);
+            if !keep {
+                retired.push(*key);
+            }
+            keep
+        });
         before - self.len()
     }
 
@@ -243,13 +377,16 @@ impl Gate {
     }
 
     fn len(&self) -> usize {
-        self.honoured.len() + self.revoked.len() + self.issued.len() + self.callbacks.len()
+        self.honoured.len() + self.revoked.len() + self.issued.len() + self.callbacks.len() + self.contacts.len()
     }
 
     /// Is `caller` a current, unblocked contact for `reference`? Checked on
     /// every use of an established session.
+    /// A retiring key counts until its time is up (judged by the clock
+    /// floor; [`Gate::prune`] removes it then).
     pub fn admits(&self, caller: &[u8; 32], reference: &[u8; 32]) -> bool {
-        !self.blocked.contains(caller) && self.contacts.get(caller) == Some(reference)
+        !self.blocked.contains(caller)
+            && self.contacts.get(caller).is_some_and(|c| &c.reference == reference && c.live_at(self.last_seen))
     }
 
     /// May `caller`, naming `reference`, be answered at `now`?
@@ -259,11 +396,11 @@ impl Gate {
         if self.blocked.contains(caller) {
             return None;
         }
-        if self.contacts.get(caller) == Some(reference) {
+        if self.contacts.get(caller).is_some_and(|c| &c.reference == reference && c.live_at(now_secs)) {
             return Some(Grant::Contact);
         }
-        if let Some((expected, deadline)) = self.callbacks.get(caller) {
-            if expected == reference && now_secs < *deadline {
+        if let Some(callback) = self.callbacks.get(caller) {
+            if &callback.reference == reference && now_secs < callback.deadline {
                 return Some(Grant::Callback);
             }
         }
@@ -286,35 +423,41 @@ impl Gate {
         if self.authorise(caller, reference, now) != Some(grant) {
             return false;
         }
-        match grant {
+        let signer = match grant {
             Grant::Invitation { id } => {
                 let expires_at = self.issued.remove(caller).map_or(u64::MAX, |i| i.expires_at);
                 self.honoured.insert(id, expires_at);
+                None
             }
-            Grant::Callback => {
-                self.callbacks.remove(caller);
-            }
-            Grant::Contact => {}
-        }
-        self.contacts.insert(*caller, *reference);
+            Grant::Callback => self.callbacks.remove(caller).and_then(|c| c.signer),
+            // An existing contact (current or retiring) stays as it is.
+            Grant::Contact => return true,
+        };
+        self.contacts.insert(*caller, Contact { reference: *reference, signer, retire_at: None });
         true
     }
 }
 
 // ---- snapshot encoding -------------------------------------------------------
 
-/// The plaintext of a gate snapshot, format version 1. All integers are
-/// big-endian; every table is sorted by key, so equal gates encode equally.
+/// The plaintext of a gate snapshot, format version 2 (2026-11-21). All
+/// integers are big-endian; every table is sorted by key, so equal gates
+/// encode equally.
 ///
 /// ```text
 /// version (1)  network (32)  issuer flag (1) [issuer (32)]  last_seen (8)
 /// issued:    u32 count, each an Invitation (Invitation::LEN bytes)
 /// honoured:  u32 count, each id (32) || expires_at (8)
 /// revoked:   u32 count, each id (32) || expires_at (8)
-/// contacts:  u32 count, each caller (32) || reference (32)
+/// contacts:  u32 count, each caller (32) || reference (32) || flags (1)
+///            [|| signer (32) if bit 0] [|| retire_at (8) if bit 1]
 /// callbacks: u32 count, each caller (32) || reference (32) || deadline (8)
+///            || flags (1) [|| signer (32) if bit 0]
 /// blocked:   u32 count, each caller (32)
 /// ```
+///
+/// Version 1 had no flags (and so no signers or retiring keys); it is still
+/// read. Unknown flag bits are refused.
 impl Gate {
     pub(crate) fn encode(&self) -> Vec<u8> {
         fn sorted<K: Ord + Copy, V>(map: &HashMap<K, V>) -> Vec<(K, &V)> {
@@ -347,15 +490,26 @@ impl Gate {
             }
         }
         count(&mut out, self.contacts.len());
-        for (caller, reference) in sorted(&self.contacts) {
+        for (caller, contact) in sorted(&self.contacts) {
             out.extend_from_slice(&caller);
-            out.extend_from_slice(reference);
+            out.extend_from_slice(&contact.reference);
+            out.push(contact.signer.is_some() as u8 | (contact.retire_at.is_some() as u8) << 1);
+            if let Some(signer) = contact.signer {
+                out.extend_from_slice(&signer);
+            }
+            if let Some(end) = contact.retire_at {
+                out.extend_from_slice(&end.to_be_bytes());
+            }
         }
         count(&mut out, self.callbacks.len());
-        for (caller, (reference, deadline)) in sorted(&self.callbacks) {
+        for (caller, callback) in sorted(&self.callbacks) {
             out.extend_from_slice(&caller);
-            out.extend_from_slice(reference);
-            out.extend_from_slice(&deadline.to_be_bytes());
+            out.extend_from_slice(&callback.reference);
+            out.extend_from_slice(&callback.deadline.to_be_bytes());
+            out.push(callback.signer.is_some() as u8);
+            if let Some(signer) = callback.signer {
+                out.extend_from_slice(&signer);
+            }
         }
         let mut blocked: Vec<&[u8; 32]> = self.blocked.iter().collect();
         blocked.sort();
@@ -371,9 +525,10 @@ impl Gate {
     pub(crate) fn decode(bytes: &[u8], network: &Network) -> Result<Gate, SnapshotError> {
         let mut r = Reader { bytes, at: 0 };
         let version = r.u8()?;
-        if version != GATE_SNAPSHOT_VERSION {
+        if version != GATE_SNAPSHOT_VERSION && version != GATE_SNAPSHOT_V1 {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
+        let v1 = version == GATE_SNAPSHOT_V1;
         if &r.array::<32>()? != network {
             return Err(SnapshotError::WrongNetwork);
         }
@@ -400,13 +555,24 @@ impl Gate {
         }
         for _ in 0..r.count()? {
             let (caller, reference) = (r.array::<32>()?, r.array::<32>()?);
-            if gate.contacts.insert(caller, reference).is_some() {
+            let flags = if v1 { 0 } else { r.u8()? };
+            if flags & !0b11 != 0 {
+                return Err(SnapshotError::Malformed);
+            }
+            let signer = if flags & 1 != 0 { Some(r.array::<32>()?) } else { None };
+            let retire_at = if flags & 2 != 0 { Some(r.u64()?) } else { None };
+            if gate.contacts.insert(caller, Contact { reference, signer, retire_at }).is_some() {
                 return Err(SnapshotError::Malformed);
             }
         }
         for _ in 0..r.count()? {
             let (caller, reference, deadline) = (r.array::<32>()?, r.array::<32>()?, r.u64()?);
-            if gate.callbacks.insert(caller, (reference, deadline)).is_some() {
+            let flags = if v1 { 0 } else { r.u8()? };
+            if flags & !1 != 0 {
+                return Err(SnapshotError::Malformed);
+            }
+            let signer = if flags & 1 != 0 { Some(r.array::<32>()?) } else { None };
+            if gate.callbacks.insert(caller, Callback { reference, deadline, signer }).is_some() {
                 return Err(SnapshotError::Malformed);
             }
         }

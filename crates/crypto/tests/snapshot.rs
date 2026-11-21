@@ -226,8 +226,12 @@ fn bad_snapshots_fail_loudly() {
         assert_eq!(restore(&storage, NET, &tampered), Err(SnapshotError::Undecryptable), "byte {i}");
     }
     let mut versioned = saved.clone();
-    versioned[0] = 2;
-    assert_eq!(restore(&storage, NET, &versioned), Err(SnapshotError::UnsupportedVersion(2)));
+    versioned[0] = 3;
+    assert_eq!(restore(&storage, NET, &versioned), Err(SnapshotError::UnsupportedVersion(3)));
+    // The previous format's number on a current snapshot: the inner version
+    // byte no longer matches.
+    versioned[0] = 1;
+    assert_eq!(restore(&storage, NET, &versioned), Err(SnapshotError::Malformed));
     versioned[0] = 0;
     assert_eq!(restore(&storage, NET, &versioned), Err(SnapshotError::UnsupportedVersion(0)));
     assert_eq!(restore(&storage, NET, &saved[..saved.len() - 1]), Err(SnapshotError::Undecryptable), "cut short");
@@ -305,10 +309,10 @@ fn a_callback_grant_cannot_be_resurrected_by_a_backward_clock_across_a_restart()
     // grant, so the snapshot still contains it.
     let saved = listener.export_snapshot(&storage, at(NOW + 605));
     // Pruning at the floor frees the grant's space (caller, reference,
-    // deadline: 72 bytes) even with an earlier clock reading.
+    // deadline, flags: 73 bytes) even with an earlier clock reading.
     let mut pruned: Responder<u32> = Responder::restore_callback(&carol, NET, &storage, &saved).unwrap();
     pruned.expire(at(NOW + 590));
-    assert_eq!(saved.len() - pruned.export_snapshot(&storage, at(NOW + 590)).len(), 32 + 32 + 8);
+    assert_eq!(saved.len() - pruned.export_snapshot(&storage, at(NOW + 590)).len(), 32 + 32 + 8 + 1);
     // Within the run the floor already refuses an earlier clock reading.
     assert_eq!(listener.gate().authorise(&peer, &[7; 32], at(NOW + 590)), None);
     // Across a restart, with the clock set back before the deadline.

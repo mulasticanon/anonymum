@@ -255,8 +255,27 @@ composition and whether it answers questions 11 and 12:
   `zeroize` feature); copies inside `snow`'s handshake state during an
   open are outside our control. **For you:** is a week the right epoch, is
   wiping on drop enough on the devices we target (swap, backups, the
-  operating system's own copies), and should the handshake key rotate too
-  (it is long-lived, so the callback still has no forward secrecy)?
+  operating system's own copies)? The handshake key now rotates with the
+  epoch (next item).
+- **Handshake key rotation and contact rollover** (issues file, "Handshake
+  key rotation and contact key rollover"; 2026-11-21, unreviewed): the
+  handshake key is part of each epoch (`KeyEpoch`; `rotate_epoch`,
+  `purge_expired`), so only the signing key is long-lived. A responder
+  answers on the active key and, until the draining epoch's end plus 26 h,
+  the draining key; it falls back to the draining key only when the active
+  key fails to decrypt a HELLO (never after the gate refused one the active
+  key opened), and drops it at the grace end by its clock floor. After the
+  purge, a recorded IK message 1 to the old key (a HELLO or a stranger's
+  callback) no longer opens on the device. Contacts move to a rotated key
+  from a fresh card signed by the same contact signing key
+  (`roll_contact_key`), keeping the old key admitted for 26 h. Stored
+  identity format 2 and gate snapshot format 2; both still read version 1.
+  **For you:** is trial decryption of message 1 with two static keys
+  acceptable (it adds a timing difference between a HELLO to the active
+  and to the draining key, and a decryption attempt for a HELLO to
+  neither); is a card signature enough to move a contact to a new key
+  (anyone holding the signing key can redirect a contact, by design); and
+  should invitation holder keys rotate too (they do not)?
 - **Dummy payloads and callback timing** (issues file, "Dummy payloads
   and callback timing", audit MED-03; 2026-11-21, unreviewed): an unused
   stranger slot holds `dummy_note()`, a real v5 note between two throwaway
@@ -304,9 +323,10 @@ composition and whether it answers questions 11 and 12:
   keys inside `snow` are acceptable.
 - Known limits: IK's replayable message 1 (a still-authorised caller's
   recorded message 1 gets a reply: an availability signal, question 11);
-  IK's weaker caller privacy if the answerer's handshake key leaks; notes
-  (Noise X) get forward secrecy only from inbox rotation (a seized device
-  reads notes to the epochs it still holds: up to a week plus 26 hours); the ephemeral key in a note is
+  IK's weaker caller privacy if the answerer's handshake key leaks (now
+  bounded to the epochs a device still holds); notes
+  (Noise X) and IK message 1 get forward secrecy only from epoch rotation (a seized device
+  reads notes and first messages to the epochs it still holds: up to a week plus 26 hours); the ephemeral key in a note is
   a raw X25519 point (question 12); per-message forward secrecy and
   post-compromise security only through the unreviewed Double Ratchet
   prototype (`ratchet.rs`, above); no post-quantum key exchange; nothing

@@ -290,7 +290,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::contact::ContactIdentity;
     use crate::identity::Identity;
@@ -470,6 +470,25 @@ mod tests {
                 DefaultResolver.resolve_cipher(choice)
             }
         }
+    }
+
+    /// IK message 1 to `answerer` from the small-order caller key `weak`
+    /// (which `snow` accepts), for tests in other modules.
+    pub(crate) fn weak_message1(answerer: &[u8; 32], network: &Network, context: &[u8; 8], reference: &[u8; 32], weak: [u8; 32]) -> Vec<u8> {
+        let prologue = prologue(network, context);
+        let mut caller = snow::Builder::with_resolver(PATTERN.parse().unwrap(), Box::new(weak_static::Resolver(weak)))
+            .prologue(&prologue)
+            .unwrap()
+            .local_private_key(&weak_static::MARK)
+            .unwrap()
+            .remote_public_key(answerer)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut message1 = vec![0u8; MESSAGE1_LEN];
+        let n = caller.write_message(reference, &mut message1).unwrap();
+        message1.truncate(n);
+        message1
     }
 
     #[test]

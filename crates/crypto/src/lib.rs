@@ -32,7 +32,7 @@ mod session;
 pub mod wire;
 
 pub use contact::{
-    epoch_start, is_contributory_key, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, InboxEpoch,
+    epoch_start, is_contributory_key, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, KeyEpoch,
     Invitation, Network, Purpose, StaticKey, CLOCK_GRID_BACKDATE, DRAIN_GRACE, EPOCH_LEN,
 };
 pub use gate::{Gate, Grant, Now, CLOCK_SKEW_SECS};

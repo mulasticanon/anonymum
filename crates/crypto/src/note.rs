@@ -41,7 +41,7 @@
 //!   notes, and the callback's Noise IK handshake is classical too
 //!   (post-quantum callbacks are to be negotiated off-chain later).
 //! - Forward secrecy for notes comes only from rotating the inbox keys
-//!   ([`ContactIdentity::rotate_inbox`], weekly epochs): while an epoch's
+//!   ([`ContactIdentity::rotate_epoch`], weekly epochs): while an epoch's
 //!   two secrets are kept, anyone who takes them can read every recorded
 //!   note sealed to that epoch. Once the epoch is purged (its end plus
 //!   [`crate::contact::DRAIN_GRACE`]) they are gone from the device.
@@ -94,7 +94,7 @@ use rand_core::{OsRng, RngCore};
 use snow::Builder;
 
 use crate::contact::{
-    is_contributory_key, pq_encapsulate, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, InboxEpoch,
+    is_contributory_key, pq_encapsulate, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, KeyEpoch,
     Network, PQ_CIPHERTEXT_LEN,
 };
 
@@ -339,7 +339,7 @@ pub fn open_note(
 
 /// Open a note of the right length with one epoch's inbox keys.
 fn open_with(
-    me: &InboxEpoch,
+    me: &KeyEpoch,
     network: &Network,
     note: &SealedNote,
     created_at: u64,
@@ -671,10 +671,10 @@ mod tests {
         // Without Bob's ML-KEM secret the X25519 inbox secret is not enough
         // to read a note: someone holding the same X25519 key but another
         // ML-KEM key cannot open it.
-        let (signing, handshake) = bob.root_secret_bytes();
-        let (inbox, _, not_before, not_after) = bob.active().to_secret_bytes();
-        let other_pq = InboxEpoch::from_secret_bytes(inbox, [0x42; 64], not_before, not_after).unwrap();
-        let half_bob = ContactIdentity::from_parts(signing, handshake, other_pq, None);
+        let signing = bob.signing_secret_bytes();
+        let (handshake, inbox, _, not_before, not_after) = bob.active().to_secret_bytes();
+        let other_pq = KeyEpoch::from_secret_bytes(handshake, inbox, [0x42; 64], not_before, not_after).unwrap();
+        let half_bob = ContactIdentity::from_parts(*signing, other_pq, None);
         assert!(matches!(open_note(&half_bob, &NET, &seal(&bob, &carol, "hi"), NOW, NOW), Err(NoteError::Noise(_))));
     }
 

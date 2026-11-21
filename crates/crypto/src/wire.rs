@@ -23,6 +23,20 @@
 //!   opened afterwards ([`Initiator::take_early`]). The Noise session
 //!   carries only CONFIRM and ACK.
 //!
+//! * **Handshake keys rotate with the identity's epochs.** A responder
+//!   holds the active epoch's handshake key and, during the draining
+//!   epoch's grace ([`crate::contact::DRAIN_GRACE`] past its end), the
+//!   draining one. A HELLO is read with the active key first; the draining
+//!   key is tried only if that read fails as a Noise decryption error (so a
+//!   HELLO the active key opened but the gate refuses is never retried).
+//!   The draining key is dropped (wiped) once its grace ends, judged by the
+//!   gate's clock floor, or when [`Responder::refresh_keys`] is given an
+//!   identity that purged it; a recorded HELLO to it then fails. Unreviewed.
+//! * **Contacts roll their keys forward.** A contact recorded with its
+//!   signing key ([`Responder::bind_contact_card`]) can present a new card
+//!   from the same signing key ([`Responder::roll_contact_key`]); its grant
+//!   moves to the new handshake key, and the old key stays admitted for
+//!   [`crate::contact::DRAIN_GRACE`] so calls already in flight finish.
 //! * **Authorise before replying.** The responder reads the caller's key and
 //!   reference from HELLO and asks its [`Gate`]. An unauthorised caller gets
 //!   nothing: no WELCOME, no error, no frame of any kind. Every `Err` from
@@ -114,7 +128,9 @@ use rand_core::{OsRng, RngCore};
 
 use zeroize::Zeroizing;
 
-use crate::contact::{is_contributory_key, random_bytes, ContactError, ContactIdentity, Invitation, Network, StaticKey};
+use crate::contact::{
+    is_contributory_key, random_bytes, ContactCard, ContactError, ContactIdentity, Invitation, Network, StaticKey,
+};
 use crate::gate::{Gate, Grant, Now};
 use crate::ratchet::{self, Ratchet, RatchetError, RatchetKey};
 use crate::snapshot::{self, SnapshotError, StorageKey};
@@ -571,7 +587,7 @@ impl Default for Limits {
 /// is updated when the caller's transport handle changes (2026-11-20 audit
 /// HIGH-02).
 pub struct Responder<T> {
-    me: StaticKey,
+    keys: HandshakeKeys,
     gate: Gate,
     limits: Limits,
     /// Answered but unconfirmed handshakes, one per reply handle and call id.
@@ -586,6 +602,31 @@ pub struct Responder<T> {
     /// redirect anyone's replies, and replaying it from many handles cannot
     /// grow this table.
     candidates: HashMap<T, [u8; 32]>,
+}
+
+/// The handshake keys a responder answers on: the active one, and the
+/// draining one with the Unix time its grace ends.
+struct HandshakeKeys {
+    active: StaticKey,
+    draining: Option<(StaticKey, u64)>,
+}
+
+impl HandshakeKeys {
+    fn single(key: &StaticKey) -> Self {
+        HandshakeKeys { active: key.clone(), draining: None }
+    }
+
+    fn of(me: &ContactIdentity) -> Self {
+        HandshakeKeys {
+            active: me.handshake_key().clone(),
+            draining: me.draining().map(|d| (d.handshake_key().clone(), d.grace_end())),
+        }
+    }
+
+    /// The draining key, if its grace has not ended at `now_secs`.
+    fn draining_at(&self, now_secs: u64) -> Option<&StaticKey> {
+        self.draining.as_ref().filter(|(_, end)| now_secs < *end).map(|(key, _)| key)
+    }
 }
 
 /// An answered HELLO, with the frame that started it and our WELCOME. A
@@ -638,8 +679,13 @@ pub struct Expired<T> {
 impl<T: Hash + Eq + Clone> Responder<T> {
     /// A responder for a contact identity: callers reach its handshake key,
     /// and it may record invitations its signing key issued.
+    ///
+    /// It answers on the identity's active handshake key and, during its
+    /// grace, the draining one. After [`ContactIdentity::rotate_epoch`] or
+    /// [`ContactIdentity::purge_expired`], pass the identity to
+    /// [`Responder::refresh_keys`].
     pub fn for_identity(me: &ContactIdentity, network: Network) -> Self {
-        Self::build(me.handshake_key().clone(), Gate::new(network, Some(me.signing_key())))
+        Self::build(HandshakeKeys::of(me), Gate::new(network, Some(me.signing_key())))
     }
 
     /// A stranger's callback listener (reverse rendezvous): answers only
@@ -653,12 +699,48 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     ) -> Result<Self, ContactError> {
         let mut gate = Gate::new(network, None);
         gate.expect_callback(caller, reference, deadline)?;
-        Ok(Self::build(callback.clone(), gate))
+        Ok(Self::build(HandshakeKeys::single(callback), gate))
     }
 
-    fn build(me: StaticKey, gate: Gate) -> Self {
+    /// A stranger's callback listener on a contact identity's handshake
+    /// keys: as [`Responder::for_callback`], but it also answers on the
+    /// draining epoch's key during its grace. So a stranger who rotated
+    /// right after sealing a note (its card naming the old handshake key)
+    /// can still be called back, until that key is purged.
+    pub fn for_callback_identity(
+        me: &ContactIdentity,
+        network: Network,
+        caller: [u8; 32],
+        reference: [u8; REFERENCE_LEN],
+        deadline: u64,
+    ) -> Result<Self, ContactError> {
+        let mut gate = Gate::new(network, None);
+        gate.expect_callback(caller, reference, deadline)?;
+        Ok(Self::build(HandshakeKeys::of(me), gate))
+    }
+
+    /// Take the handshake keys of `me` again, after it rotated or purged
+    /// an epoch: a purged key is dropped (wiped) here. An identity
+    /// responder refuses another identity's keys.
+    pub fn refresh_keys(&mut self, me: &ContactIdentity) -> Result<(), ContactError> {
+        if self.gate.issuer().is_some_and(|issuer| issuer != me.signing_key()) {
+            return Err(ContactError::WrongIssuer);
+        }
+        self.keys = HandshakeKeys::of(me);
+        Ok(())
+    }
+
+    /// The handshake public keys this responder answers on now: the active
+    /// one and, during its grace, the draining one.
+    pub fn handshake_keys(&self) -> Vec<[u8; 32]> {
+        let mut out = vec![self.keys.active.public()];
+        out.extend(self.keys.draining_at(self.gate.last_seen()).map(StaticKey::public));
+        out
+    }
+
+    fn build(keys: HandshakeKeys, gate: Gate) -> Self {
         Responder {
-            me,
+            keys,
             gate,
             limits: Limits::default(),
             pending: HashMap::new(),
@@ -691,7 +773,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         if gate.issuer() != Some(me.signing_key()) {
             return Err(SnapshotError::WrongIdentity);
         }
-        Ok(Self::build(me.handshake_key().clone(), gate))
+        Ok(Self::build(HandshakeKeys::of(me), gate))
     }
 
     /// A callback listener restored from a snapshot it exported; as
@@ -706,7 +788,22 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         if gate.issuer().is_some() {
             return Err(SnapshotError::WrongIdentity);
         }
-        Ok(Self::build(callback.clone(), gate))
+        Ok(Self::build(HandshakeKeys::single(callback), gate))
+    }
+
+    /// A callback listener on a contact identity's handshake keys, restored
+    /// from a snapshot it exported (see [`Responder::for_callback_identity`]).
+    pub fn restore_callback_identity(
+        me: &ContactIdentity,
+        network: Network,
+        key: &StorageKey,
+        saved: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        let gate = Self::restore_gate(network, key, saved)?;
+        if gate.issuer().is_some() {
+            return Err(SnapshotError::WrongIdentity);
+        }
+        Ok(Self::build(HandshakeKeys::of(me), gate))
     }
 
     fn restore_gate(network: Network, key: &StorageKey, saved: &[u8]) -> Result<Gate, SnapshotError> {
@@ -739,9 +836,15 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     /// sessions, pending handshakes and cached replies are dropped and its
     /// unused invitation and outstanding callback grant are cancelled;
     /// unblocking restores none of them.
+    ///
+    /// A contact's other handshake keys known through a rollover (its
+    /// retiring key, or its current one when an old key is named) are
+    /// blocked with it.
     pub fn block(&mut self, caller: [u8; 32]) {
-        self.gate.block(caller);
-        self.drop_peer(&caller);
+        for key in self.gate.keys_of(&caller) {
+            self.gate.block(key);
+            self.drop_peer(&key);
+        }
     }
 
     pub fn unblock(&mut self, caller: &[u8; 32]) {
@@ -752,9 +855,32 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     /// contact, and in the same step its sessions, pending handshakes and
     /// cached replies are dropped and its unused invitation and outstanding
     /// callback grant are cancelled. Reopening needs a new invitation.
+    /// A contact's other handshake keys known through a rollover go too.
     pub fn remove_contact(&mut self, caller: [u8; 32]) {
-        self.gate.remove_contact(&caller);
-        self.drop_peer(&caller);
+        for key in self.gate.keys_of(&caller) {
+            self.gate.remove_contact(&key);
+            self.drop_peer(&key);
+        }
+    }
+
+    /// Record who a contact or an expected callback is: `card`'s signing
+    /// key, for the grant held by its handshake key. The card must verify
+    /// for this network at `now`. Needed before
+    /// [`Responder::roll_contact_key`] can move that contact to a new key.
+    /// Persist the gate afterwards.
+    pub fn bind_contact_card(&mut self, card: &ContactCard, now: Now) -> Result<(), ContactError> {
+        self.gate.bind_signer(card, now)
+    }
+
+    /// Move a contact to the handshake key on `card`, a fresh card from the
+    /// same signing key: the card must verify for this network at `now`
+    /// and its signing key must be the one recorded for a current contact.
+    /// The contact's grant moves to the new key; the old key stays admitted
+    /// for [`crate::contact::DRAIN_GRACE`] (so calls in flight finish) and
+    /// is then dropped with its sessions. Returns the old key. Persist the
+    /// gate before telling anyone.
+    pub fn roll_contact_key(&mut self, card: &ContactCard, now: Now) -> Result<[u8; 32], ContactError> {
+        self.gate.roll_key(card, now)
     }
 
     fn drop_peer(&mut self, caller: &[u8; 32]) {
@@ -770,6 +896,15 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     /// operation; drivers may also call it on a timer.
     pub fn expire(&mut self, now: Now) -> Expired<T> {
         self.gate.prune(now.unix);
+        // The draining handshake key goes once its grace has ended, by the
+        // gate's clock floor (a clock set back cannot bring it back).
+        if self.keys.draining_at(self.gate.last_seen()).is_none() {
+            self.keys.draining = None;
+        }
+        let gone_keys = self.gate.take_retired();
+        for key in &gone_keys {
+            self.drop_peer(key);
+        }
         let mut out = Expired { pending: Vec::new(), sessions: Vec::new() };
         self.pending.retain(|(from, _), p| {
             let keep = now.mono < p.deadline;
@@ -885,7 +1020,7 @@ impl<T: Hash + Eq + Clone> Responder<T> {
             }
             false
         };
-        let hello = Incoming::read(&self.me, &self.gate.network(), &at.label(), body)?;
+        let hello = self.read_hello(&at, body)?;
         let (caller, reference) = (hello.caller(), hello.reference());
         // The decision, before anything is written.
         let grant = self.gate.authorise(&caller, &reference, now).ok_or(WireError::Unauthorised)?;
@@ -907,6 +1042,21 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         };
         self.pending.insert(key, pending);
         Ok(ResponderEvent::Reply(reply))
+    }
+
+    /// Read a HELLO with the active handshake key; only if that fails to
+    /// decrypt, with the draining key during its grace. Any other outcome
+    /// of the active read (an opened HELLO, a weak caller key, a size
+    /// error) is final.
+    fn read_hello(&self, at: &Attempt, body: &[u8]) -> Result<Incoming, WireError> {
+        let network = self.gate.network();
+        match Incoming::read(&self.keys.active, &network, &at.label(), body) {
+            Err(SessionError::Noise(error)) => match self.keys.draining_at(self.gate.last_seen()) {
+                Some(draining) => Ok(Incoming::read(draining, &network, &at.label(), body)?),
+                None => Err(SessionError::Noise(error).into()),
+            },
+            result => Ok(result?),
+        }
     }
 
     fn confirm(&mut self, from: T, at: Attempt, body: &[u8], incoming: &[u8], now: Now) -> Result<ResponderEvent, WireError> {
@@ -1104,6 +1254,24 @@ mod tests {
         assert_eq!(call.handle(&reply).unwrap(), InitiatorEvent::Established);
         let frame = call.seal(b"x").unwrap();
         assert!(matches!(side.handle(1, &frame, now()), Ok(ResponderEvent::Message { .. })));
+    }
+
+    #[test]
+    fn a_hello_the_active_key_opened_from_a_weak_caller_is_not_retried_with_the_draining_key() {
+        let mut bob = ContactIdentity::generate_at(0);
+        bob.rotate_epoch(crate::contact::EPOCH_LEN);
+        let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
+        let at = Attempt { call: 7, number: 1 };
+        let when = Now { unix: crate::contact::EPOCH_LEN + 60, mono: Instant::now() };
+        for weak in crate::contact::tests::SMALL_ORDER {
+            for (tag, key) in [(1, bob.handshake_key().public()), (2, bob.draining().unwrap().handshake_key().public())] {
+                let m1 = crate::session::tests::weak_message1(&key, &NET, &at.label(), &[1; 32], weak);
+                let hello = handshake_frame(HELLO, at, &m1);
+                // Read by the key it was sent to and refused there: a retry
+                // with the other key would report a decryption failure.
+                assert!(matches!(side.handle(tag, &hello, when), Err(WireError::Session(SessionError::WeakKey))));
+            }
+        }
     }
 
     #[test]

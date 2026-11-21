@@ -547,7 +547,9 @@ contact identity, so whoever later took them could read every recorded
 note. Now (`anonymum-crypto::contact`):
 - *Stable root:* the signing key (who the contact is) and the handshake key
   are unchanged. Rotating the handshake key would break existing contacts'
-  calls; it is left for a separate change.
+  calls; it is left for a separate change. (Done since: see "Handshake key
+  rotation and contact key rollover" below; the names here are the
+  originals, now `KeyEpoch`, `rotate_epoch`, `purge_expired`.)
 - *Epochs on one grid:* `EPOCH_LEN` = 7 days; an epoch starts at a multiple
   of it (Unix seconds), so everyone's cards share the same boundaries and a
   card's validity does not say when its owner made or rotated it. A card
@@ -727,3 +729,102 @@ design; the spec records it as O9 and the new P4.
 - *Not checked:* that a circuit can express these rules cheaply, or that a
   two-input resolution (with a top-up) cannot be told apart from others by
   its proof (question 4); fee levels and the ceiling are placeholders.
+
+## Handshake key rotation and contact key rollover (2026-11-21, unreviewed)
+
+The inbox rotation above left the handshake key long-lived, so a recorded
+IK message 1 (an ordinary HELLO, or the callback after a stranger's note)
+stayed readable by whoever later took the answerer's device. Now
+(`anonymum-crypto::contact`, `wire`, `gate`):
+- *One ring for both:* the handshake key moved into the epoch, now
+  `KeyEpoch` (handshake, inbox, ML-KEM seed, validity; was `InboxEpoch`).
+  `rotate_epoch(now)` (was `rotate_inbox`) makes all three fresh;
+  `purge_expired(now)` (was `purge_expired_inbox`) drops and wipes all
+  three draining secrets once `now >= not_after + DRAIN_GRACE`. Only the
+  signing key is long-lived. The card publishes the active epoch's
+  handshake key; `handshake_key_for(public, now)` finds the active or
+  still-draining secret for a key a card named (a caller calling back with
+  the exact key it handed out).
+- *Storage format 2:* `version || signing (32) || active epoch || flag ||
+  [draining epoch]`, an epoch `handshake (32) || inbox (32) || seed (64) ||
+  not_before || not_after` (178 or 322 bytes), decoded strictly. **Version
+  1 is still read**: its single handshake key becomes the handshake key of
+  both stored epochs (which is what their cards published), so existing
+  contacts keep reaching it; it is written back as version 2, and the next
+  rotation gives the new epoch a fresh key. A one-epoch buffer has the
+  same length in both versions; the version byte tells them apart.
+- *Responder (H1):* holds the active key and, with its grace end, the
+  draining key (`Responder::for_identity`, `restore_identity`, the new
+  `for_callback_identity` / `restore_callback_identity`; `refresh_keys(&me)`
+  after a rotation or purge, refusing another identity's keys). A HELLO is
+  read with the active key; only a Noise decryption failure falls back to
+  the draining key, and only before its grace ends. A HELLO the active key
+  opened (refused by the gate, or a weak caller key) is final. The
+  draining key is dropped at the end of its grace by the responder itself,
+  judged by the gate's clock floor, so neither a clock set back nor a
+  refresh from an identity that has not purged yet brings it back. The
+  plain `for_callback(key, ...)` is unchanged (one key).
+- *Callback (H2):* a stranger who rotates right after sealing a note (the
+  note's card naming the old handshake key) is still called back through
+  `for_callback_identity` until the old epoch's grace ends; after the
+  purge a recorded callback message 1 no longer opens on her device.
+- *Rollover (H3):* the gate's contacts carry an optional contact signing
+  key and an optional retire time. `Responder::bind_contact_card(card)`
+  records the signing key for the contact or expected callback held by the
+  card's handshake key (card verified at `now`; a key bound to another
+  signer, or a signer already bound to another current key, or a blocked
+  key, is refused); a callback's binding is carried into the contact on
+  commit. `roll_contact_key(card)` verifies the card at `now`, finds the
+  current contact bound to its signing key, moves its grant to the card's
+  handshake key, and keeps the old key admitted for `DRAIN_GRACE` from the
+  rollover (calls already in flight finish); then it is pruned and its
+  sessions dropped. The new key must not be blocked or held by another
+  contact, callback or invitation. Blocking or removing one key of a
+  rolled contact covers its other key. A card from another signing key, a
+  forged or expired card, or one for another network is refused and
+  changes nothing.
+- *Snapshot format 2:* contacts gain a flags byte (bit 0 signer, bit 1
+  retire time) and callbacks one (bit 0 signer); unknown bits are refused.
+  Version 1 snapshots are still read (no flags), written back as 2.
+- *Choices made where the request left room:* the old key is kept for a
+  grace rather than replaced at once, timed from the rollover rather than
+  from the old card's end (the gate does not keep cards); invitation
+  holder keys (invitee-generated, per relationship) are not bound to a
+  signing key and do not roll, so contacts made by invitation keep their
+  caller key; `remove_contact` and `block` follow a rolled contact's keys.
+- *Tests* (`tests/handshake_rotation.rs`, 16; 2 snapshot unit tests and 1 wire unit test):
+  (a) an invited caller's HELLO to epoch E-1's key succeeds in the grace
+  after rotating to E, and a stranger's callback to her old key likewise;
+  (b) after the purge (or the responder's own grace end, at any later
+  clock, after a restore) a recorded HELLO or callback to E-1 fails to
+  decrypt; (c) a new card from the same signing key rolls the contact
+  forward, survives a snapshot, keeps the old key for the grace and then
+  drops it with its session, and works again at the next rotation; cards
+  from another signing key, forged, expired or foreign ones are refused, a
+  stolen handshake key cannot be rebound to another signer, a blocked new
+  key cannot be taken; (d) a HELLO the active key opened but the gate
+  refused reports `Unauthorised`, not a draining-key decryption error, and
+  one from a small-order caller key reports `WeakKey` on either slot.
+  Plus: version-1 identities and snapshots load; strict flags; removing
+  or blocking a rolled contact covers its retiring key; a blocked contact
+  cannot roll itself back in; one signing key binds to one current key;
+  the retire time holds in `authorise` and `admits` even without a pruning
+  pass.
+- *Mutation checks:* 37 deliberate breaks across the ring, the storage
+  format, the responder's fallback, the callback listener, binding,
+  rollover, retirement, pruning and both snapshot formats. The first run
+  missed eight: six were real gaps (fallback on a non-decryption read
+  error; `remove_contact` over both keys; retired sessions dropped at the
+  expiry pass; one signer on two keys; binding a blocked key; **a blocked
+  contact rolling to an unblocked new key**, which the code already
+  refused but no test showed), plus the retire time in `admits` and
+  `authorise`. Tests were added and all are caught now, except one pair
+  that is redundant by design: the grace check when reading a HELLO and
+  the drop of the draining key in `expire` each cover the other (`expire`
+  runs before every HELLO), and removing both is caught.
+- *Not done:* nothing rotates automatically, and nothing sends the new
+  card to contacts (the application must, over a live session; until a
+  contact has rolled, a caller should keep calling with its draining key,
+  `handshake_key_for`); the callback remains classical; `snow`'s internal
+  copies of the static key during a handshake are outside our control; the
+  stored identity is not yet encrypted by this crate.

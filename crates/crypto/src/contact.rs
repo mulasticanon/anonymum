@@ -6,20 +6,25 @@
 //! a note.
 //!
 //! * a **contact signing key** (Ed25519) signs the card and invitations;
-//! * a **handshake key** (X25519) is the Noise static key callers reach;
+//! * a **handshake key** (X25519) is the Noise static key callers reach,
+//!   and the static key a stranger's note and callback are tied to;
 //! * an **inbox key** (X25519) opens sealed notes from strangers;
 //! * a **post-quantum inbox key** (ML-KEM-768, FIPS 203, via the RustCrypto
 //!   `ml-kem` crate) is combined with the inbox key in the hybrid note (v5).
 //!   The handshake key has no post-quantum counterpart yet.
 //!
-//! The signing and handshake keys are long-lived. The two inbox keys are
-//! not: they belong to an [`InboxEpoch`] on a shared weekly grid and are
-//! rotated ([`ContactIdentity::rotate_inbox`]). The identity keeps at most
-//! two epochs, the active one (published on the card) and one draining
-//! epoch that can still open notes until its end plus [`DRAIN_GRACE`];
-//! after that [`ContactIdentity::purge_expired_inbox`] drops it, and notes
-//! sealed to it can no longer be read by anyone who later takes the device
-//! (forward secrecy for notes, audit CRIT-02; unreviewed).
+//! Only the signing key is long-lived: it is who the contact is. The
+//! handshake key and the two inbox keys belong to a [`KeyEpoch`] on a
+//! shared weekly grid and are rotated together
+//! ([`ContactIdentity::rotate_epoch`]). The identity keeps at most two
+//! epochs, the active one (published on the card) and one draining epoch
+//! that can still open notes and answer handshakes and callbacks until its
+//! end plus [`DRAIN_GRACE`]; after that [`ContactIdentity::purge_expired`]
+//! drops it, and notes, handshakes and callbacks addressed to it can no
+//! longer be read by anyone who later takes the device (forward secrecy
+//! for notes, audit CRIT-02, and for the first IK message; unreviewed).
+//! Contacts learn a rotated handshake key from a new card signed by the
+//! same signing key ([`crate::wire::Responder::roll_contact_key`]).
 //!
 //! Callers use *caller keys* ([`StaticKey`]) scoped to one relationship or
 //! one request; an invitation is issued to such a holder key.
@@ -59,6 +64,14 @@ pub enum ContactError {
     PriceOutOfRange,
     /// An invitation that was cancelled by a block or a removal.
     Revoked,
+    /// A key rollover for a signing key that is not a current contact.
+    UnknownContact,
+    /// A card or binding whose signing key is not the one recorded for
+    /// that contact.
+    SignerMismatch,
+    /// A new handshake key that is blocked or already belongs to another
+    /// contact or grant.
+    KeyInUse,
     /// An ML-KEM-768 encapsulation key that does not decode (FIPS 203 check).
     BadPqKey,
 }
@@ -155,29 +168,38 @@ pub fn epoch_start(now_secs: u64) -> u64 {
     now_secs - now_secs % EPOCH_LEN
 }
 
-const IDENTITY_VERSION: u8 = 1;
-const EPOCH_BYTES: usize = 32 + PQ_SEED_LEN + 8 + 8;
+/// Storage format of a contact identity. Version 2 (2026-11-21) keeps a
+/// handshake key in each epoch; version 1 kept one long-lived handshake key
+/// and is still read (see [`ContactIdentity::from_secret_bytes`]).
+const IDENTITY_VERSION: u8 = 2;
+const IDENTITY_V1: u8 = 1;
+const EPOCH_BYTES: usize = 32 + 32 + PQ_SEED_LEN + 8 + 8;
+const EPOCH_BYTES_V1: usize = 32 + PQ_SEED_LEN + 8 + 8;
 /// The longest stored identity: both epochs.
-const IDENTITY_MAX_LEN: usize = 1 + 64 + EPOCH_BYTES + 1 + EPOCH_BYTES;
+const IDENTITY_MAX_LEN: usize = 1 + 32 + EPOCH_BYTES + 1 + EPOCH_BYTES;
+const IDENTITY_MAX_LEN_V1: usize = 1 + 64 + EPOCH_BYTES_V1 + 1 + EPOCH_BYTES_V1;
 
-/// One epoch's inbox keys: the X25519 inbox key and the ML-KEM-768 seed,
-/// and the validity a card for them carries. Both secrets are held in
-/// zeroizing buffers, so dropping an epoch wipes them from memory.
-pub struct InboxEpoch {
+/// One epoch's keys: the X25519 handshake key, the X25519 inbox key and the
+/// ML-KEM-768 seed, and the validity a card for them carries. Every secret
+/// is held in a zeroizing buffer, so dropping an epoch wipes them from
+/// memory.
+pub struct KeyEpoch {
+    handshake: StaticKey,
     inbox: StaticKey,
     pq_seed: Zeroizing<[u8; PQ_SEED_LEN]>,
     not_before: u64,
     not_after: u64,
 }
 
-impl InboxEpoch {
+impl KeyEpoch {
     /// Fresh keys for the epoch that holds `now_secs`, valid from
     /// [`CLOCK_GRID_BACKDATE`] before its start until its end.
     pub fn generate_at(now_secs: u64) -> Self {
         let start = epoch_start(now_secs);
         let mut pq_seed = Zeroizing::new([0u8; PQ_SEED_LEN]);
         OsRng.fill_bytes(pq_seed.as_mut());
-        InboxEpoch {
+        KeyEpoch {
+            handshake: StaticKey::generate(),
             inbox: StaticKey::generate(),
             pq_seed,
             not_before: start.saturating_sub(CLOCK_GRID_BACKDATE),
@@ -187,6 +209,7 @@ impl InboxEpoch {
 
     /// Restore from storage. The validity must be a non-empty interval.
     pub fn from_secret_bytes(
+        handshake: [u8; 32],
         inbox: [u8; 32],
         pq_seed: [u8; PQ_SEED_LEN],
         not_before: u64,
@@ -195,12 +218,30 @@ impl InboxEpoch {
         if not_before >= not_after {
             return Err(ContactError::Malformed);
         }
-        Ok(InboxEpoch { inbox: StaticKey::from_bytes(inbox), pq_seed: Zeroizing::new(pq_seed), not_before, not_after })
+        Ok(KeyEpoch {
+            handshake: StaticKey::from_bytes(handshake),
+            inbox: StaticKey::from_bytes(inbox),
+            pq_seed: Zeroizing::new(pq_seed),
+            not_before,
+            not_after,
+        })
     }
 
-    /// The two secrets and the validity, for encrypted storage. Handle with care.
-    pub fn to_secret_bytes(&self) -> ([u8; 32], [u8; PQ_SEED_LEN], u64, u64) {
-        (self.inbox.to_bytes(), *self.pq_seed, self.not_before, self.not_after)
+    /// The three secrets and the validity, for encrypted storage. Handle
+    /// with care.
+    pub fn to_secret_bytes(&self) -> ([u8; 32], [u8; 32], [u8; PQ_SEED_LEN], u64, u64) {
+        (self.handshake.to_bytes(), self.inbox.to_bytes(), *self.pq_seed, self.not_before, self.not_after)
+    }
+
+    /// When this epoch's secrets are dropped: its `not_after` plus
+    /// [`DRAIN_GRACE`].
+    pub fn grace_end(&self) -> u64 {
+        self.not_after.saturating_add(DRAIN_GRACE)
+    }
+
+    /// This epoch's handshake key (the Noise static key callers reach).
+    pub fn handshake_key(&self) -> &StaticKey {
+        &self.handshake
     }
 
     pub fn not_before(&self) -> u64 {
@@ -232,9 +273,9 @@ impl InboxEpoch {
     }
 }
 
-impl fmt::Debug for InboxEpoch {
+impl fmt::Debug for KeyEpoch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InboxEpoch({:?}, [{}, {}))", self.inbox, self.not_before, self.not_after)
+        write!(f, "KeyEpoch({:?}, {:?}, [{}, {}))", self.handshake, self.inbox, self.not_before, self.not_after)
     }
 }
 
@@ -275,54 +316,44 @@ impl fmt::Debug for StaticKey {
     }
 }
 
-/// A contact identity: the long-lived signing and handshake keys, and a
-/// ring of at most two inbox epochs (the active one and one draining).
+/// A contact identity: the long-lived signing key and a ring of at most
+/// two key epochs (the active one and one draining), each holding a
+/// handshake key and the inbox keys.
 pub struct ContactIdentity {
     signing: SigningKey,
-    handshake: StaticKey,
-    active: InboxEpoch,
-    draining: Option<InboxEpoch>,
+    active: KeyEpoch,
+    draining: Option<KeyEpoch>,
 }
 
 impl ContactIdentity {
-    /// A new identity whose first inbox epoch holds `now_secs`.
+    /// A new identity whose first key epoch holds `now_secs`.
     pub fn generate_at(now_secs: u64) -> Self {
-        ContactIdentity {
-            signing: SigningKey::generate(&mut OsRng),
-            handshake: StaticKey::generate(),
-            active: InboxEpoch::generate_at(now_secs),
-            draining: None,
-        }
+        ContactIdentity { signing: SigningKey::generate(&mut OsRng), active: KeyEpoch::generate_at(now_secs), draining: None }
     }
 
-    /// Restore from the signing and handshake secrets and the inbox ring.
-    pub fn from_parts(signing: [u8; 32], handshake: [u8; 32], active: InboxEpoch, draining: Option<InboxEpoch>) -> Self {
-        ContactIdentity {
-            signing: SigningKey::from_bytes(&signing),
-            handshake: StaticKey::from_bytes(handshake),
-            active,
-            draining,
-        }
+    /// Restore from the signing secret and the epoch ring.
+    pub fn from_parts(signing: [u8; 32], active: KeyEpoch, draining: Option<KeyEpoch>) -> Self {
+        ContactIdentity { signing: SigningKey::from_bytes(&signing), active, draining }
     }
 
-    /// The signing and handshake secrets, for encrypted storage (the inbox
-    /// epochs are stored through [`Self::active`] and [`Self::draining`]).
-    /// Handle with care.
-    pub fn root_secret_bytes(&self) -> ([u8; 32], [u8; 32]) {
-        (self.signing.to_bytes(), self.handshake.to_bytes())
+    /// The signing secret, for encrypted storage (the epochs are stored
+    /// through [`Self::active`] and [`Self::draining`]). Handle with care.
+    pub fn signing_secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing.to_bytes())
     }
 
-    /// Everything, for encrypted storage, in one versioned encoding:
-    /// `version (1) || signing (32) || handshake (32) || active epoch ||
-    /// draining flag (1) [|| draining epoch]`, an epoch being `inbox (32) ||
-    /// post-quantum seed (64) || not_before (8) || not_after (8)`, integers
-    /// big-endian. Handle with care: the buffer is wiped when dropped.
+    /// Everything, for encrypted storage, in one versioned encoding
+    /// (version 2): `version (1) || signing (32) || active epoch || draining
+    /// flag (1) [|| draining epoch]`, an epoch being `handshake (32) || inbox
+    /// (32) || post-quantum seed (64) || not_before (8) || not_after (8)`,
+    /// integers big-endian. Handle with care: the buffer is wiped when
+    /// dropped.
     pub fn to_secret_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(Vec::with_capacity(IDENTITY_MAX_LEN));
         out.push(IDENTITY_VERSION);
-        out.extend_from_slice(&self.signing.to_bytes());
-        out.extend_from_slice(self.handshake.secret());
-        let mut epoch = |e: &InboxEpoch| {
+        out.extend_from_slice(self.signing_secret_bytes().as_ref());
+        let mut epoch = |e: &KeyEpoch| {
+            out.extend_from_slice(e.handshake.secret());
             out.extend_from_slice(e.inbox.secret());
             out.extend_from_slice(e.pq_seed.as_ref());
             out.extend_from_slice(&e.not_before.to_be_bytes());
@@ -332,64 +363,83 @@ impl ContactIdentity {
         if let Some(d) = &self.draining {
             epoch(d);
         }
-        out.insert(1 + 64 + EPOCH_BYTES, self.draining.is_some() as u8);
+        out.insert(1 + 32 + EPOCH_BYTES, self.draining.is_some() as u8);
         out
     }
 
     /// Restore what [`Self::to_secret_bytes`] wrote. Strict: an unknown
     /// version, flag or length, or an empty validity, is refused.
+    ///
+    /// Version 1 (one long-lived handshake key) is still read: that key
+    /// becomes the handshake key of both stored epochs, which is what their
+    /// cards published, so existing contacts keep reaching it. The next
+    /// [`Self::rotate_epoch`] gives the new epoch a fresh handshake key, and
+    /// the old one is gone once both epochs that held it are purged.
     pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, ContactError> {
-        let flag_at = 1 + 64 + EPOCH_BYTES;
-        if bytes.len() <= flag_at || bytes[0] != IDENTITY_VERSION {
+        let version = *bytes.first().ok_or(ContactError::Malformed)?;
+        let (v1, epoch_len, max_len) = match version {
+            IDENTITY_VERSION => (false, EPOCH_BYTES, IDENTITY_MAX_LEN),
+            IDENTITY_V1 => (true, EPOCH_BYTES_V1, IDENTITY_MAX_LEN_V1),
+            _ => return Err(ContactError::Malformed),
+        };
+        let first_epoch_at = if v1 { 1 + 64 } else { 1 + 32 };
+        let flag_at = first_epoch_at + epoch_len;
+        if bytes.len() <= flag_at {
             return Err(ContactError::Malformed);
         }
         let expected = match bytes[flag_at] {
             0 => flag_at + 1,
-            1 => IDENTITY_MAX_LEN,
+            1 => max_len,
             _ => return Err(ContactError::Malformed),
         };
         if bytes.len() != expected {
             return Err(ContactError::Malformed);
         }
+        let shared = v1.then(|| Zeroizing::new(take::<32>(bytes, &mut 33)));
         let epoch = |at: usize| {
             let mut at = at;
-            let inbox = take(bytes, &mut at);
+            let handshake = match &shared {
+                Some(key) => Zeroizing::new(**key),
+                None => Zeroizing::new(take::<32>(bytes, &mut at)),
+            };
+            let inbox = Zeroizing::new(take::<32>(bytes, &mut at));
             let seed = Zeroizing::new(take::<PQ_SEED_LEN>(bytes, &mut at));
             let not_before = u64::from_be_bytes(take(bytes, &mut at));
             let not_after = u64::from_be_bytes(take(bytes, &mut at));
-            InboxEpoch::from_secret_bytes(inbox, *seed, not_before, not_after)
+            KeyEpoch::from_secret_bytes(*handshake, *inbox, *seed, not_before, not_after)
         };
-        let mut at = 1;
-        let signing = Zeroizing::new(take::<32>(bytes, &mut at));
-        let handshake = Zeroizing::new(take::<32>(bytes, &mut at));
-        let active = epoch(at)?;
+        let signing = Zeroizing::new(take::<32>(bytes, &mut 1));
+        let active = epoch(first_epoch_at)?;
         let draining = if bytes[flag_at] == 1 { Some(epoch(flag_at + 1)?) } else { None };
-        Ok(Self::from_parts(*signing, *handshake, active, draining))
+        Ok(Self::from_parts(*signing, active, draining))
     }
 
     /// The epoch whose keys the card publishes.
-    pub fn active(&self) -> &InboxEpoch {
+    pub fn active(&self) -> &KeyEpoch {
         &self.active
     }
 
     /// The previous epoch, while it is kept.
-    pub fn draining(&self) -> Option<&InboxEpoch> {
+    pub fn draining(&self) -> Option<&KeyEpoch> {
         self.draining.as_ref()
     }
 
-    /// Start a new inbox epoch for `now_secs`: the active epoch becomes the
-    /// draining one, and an older draining epoch is dropped at once (its
-    /// secrets wiped), whatever its grace left. Publish a new card after.
-    pub fn rotate_inbox(&mut self, now_secs: u64) {
-        let previous = std::mem::replace(&mut self.active, InboxEpoch::generate_at(now_secs));
+    /// Start a new key epoch for `now_secs`: fresh handshake, inbox and
+    /// post-quantum inbox keys. The active epoch becomes the draining one,
+    /// and an older draining epoch is dropped at once (its secrets wiped),
+    /// whatever its grace left. Publish a new card after, and send it to
+    /// contacts so they roll their record of the handshake key forward.
+    pub fn rotate_epoch(&mut self, now_secs: u64) {
+        let previous = std::mem::replace(&mut self.active, KeyEpoch::generate_at(now_secs));
         let oldest = self.draining.replace(previous);
         drop(oldest);
     }
 
-    /// Drop the draining epoch (wiping its secrets) once `now_secs` has
-    /// reached its `not_after` plus [`DRAIN_GRACE`]. Returns whether it did.
-    pub fn purge_expired_inbox(&mut self, now_secs: u64) -> bool {
-        if self.draining.as_ref().is_some_and(|d| now_secs >= d.not_after.saturating_add(DRAIN_GRACE)) {
+    /// Drop the draining epoch (wiping its handshake, inbox and post-quantum
+    /// secrets) once `now_secs` has reached its `not_after` plus
+    /// [`DRAIN_GRACE`]. Returns whether it did.
+    pub fn purge_expired(&mut self, now_secs: u64) -> bool {
+        if self.draining.as_ref().is_some_and(|d| now_secs >= d.grace_end()) {
             let expired = self.draining.take();
             drop(expired);
             return true;
@@ -397,9 +447,19 @@ impl ContactIdentity {
         false
     }
 
-    /// The draining epoch, if it may still open notes at `now_secs`.
-    pub(crate) fn draining_at(&self, now_secs: u64) -> Option<&InboxEpoch> {
-        self.draining.as_ref().filter(|d| now_secs < d.not_after.saturating_add(DRAIN_GRACE))
+    /// The draining epoch, if it may still be used at `now_secs`.
+    pub fn draining_at(&self, now_secs: u64) -> Option<&KeyEpoch> {
+        self.draining.as_ref().filter(|d| now_secs < d.grace_end())
+    }
+
+    /// The handshake secret whose public key is `public`: the active
+    /// epoch's, or the draining epoch's while its grace lasts. A caller uses
+    /// it to call back with the exact key a card it handed out named.
+    pub fn handshake_key_for(&self, public: &[u8; 32], now_secs: u64) -> Option<&StaticKey> {
+        std::iter::once(&self.active)
+            .chain(self.draining_at(now_secs))
+            .map(|e| &e.handshake)
+            .find(|k| &k.public() == public)
     }
 
     /// The active epoch's post-quantum inbox key.
@@ -412,8 +472,9 @@ impl ContactIdentity {
         self.signing.verifying_key().to_bytes()
     }
 
+    /// The active epoch's handshake key: the one the card publishes.
     pub fn handshake_key(&self) -> &StaticKey {
-        &self.handshake
+        &self.active.handshake
     }
 
     /// The active epoch's inbox key.
@@ -439,7 +500,7 @@ impl ContactIdentity {
         let mut card = ContactCard {
             network,
             signing_key: self.signing_key(),
-            handshake_key: self.handshake.public(),
+            handshake_key: self.active.handshake.public(),
             inbox_key: self.active.inbox.public(),
             pq_inbox_key: self.active.pq_inbox_key(),
             price,
