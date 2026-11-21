@@ -116,6 +116,7 @@ impl RatchetKey {
         Self::from_secret(StaticSecret::random_from_rng(OsRng))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self::from_secret(StaticSecret::from(*bytes))
     }

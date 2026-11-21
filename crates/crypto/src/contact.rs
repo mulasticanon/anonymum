@@ -72,6 +72,9 @@ pub enum ContactError {
     /// A new handshake key that is blocked or already belongs to another
     /// contact or grant.
     KeyInUse,
+    /// A rollover card whose `not_after` is not later than the bound
+    /// card's: an old card replayed, or a second card for the same epoch.
+    StaleCard,
     /// An ML-KEM-768 encapsulation key that does not decode (FIPS 203 check).
     BadPqKey,
 }

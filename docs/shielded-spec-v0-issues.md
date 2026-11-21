@@ -828,3 +828,40 @@ stayed readable by whoever later took the answerer's device. Now
   `handshake_key_for`); the callback remains classical; `snow`'s internal
   copies of the static key during a handshake are outside our control; the
   stored identity is not yet encrypted by this crate.
+
+## Ephemeral first ratchet key and forward-only rollover (2026-11-21, unreviewed)
+
+- *Ephemeral `dh_i0`:* CONFIRM now carries a fresh X25519 ratchet public key
+  next to `seed_i`, inside the Noise-sealed record (markers v5). The
+  responder refuses a small-order `dh_i0` before the record counts (the
+  attempt stays, so the real CONFIRM still works) and starts its ratchet
+  against `dh_i0`. The caller uses the matching secret for its first DH
+  step on the ACK. Each attempt has its own key. The caller's static IK key
+  no longer enters the ratchet at all.
+- *Forward-only rollover:* a bound contact or callback records its card's
+  `not_after`. `roll_contact_key` refuses a card that does not end later
+  (`ContactError::StaleCard`), before anything changes. A later card for
+  the same handshake key only raises the mark; binding again never lowers
+  it. Gate snapshot format 3 stores the mark; versions 1 and 2 are still
+  read, with no mark (0).
+- *Consequences, for the owner and the cryptographer:* (1) `rotate_epoch`
+  twice in one weekly epoch gives a new key with the **same** `not_after`,
+  so contacts refuse that card (`StaleCard`) until the next epoch's card:
+  an emergency rotation after a suspected key theft cannot reach contacts
+  early. A signed card sequence number would fix this but changes the card
+  format. (2) A binding loaded from a version 2 snapshot has no mark, so
+  its first rollover is unchecked. (3) The check is only as good as the
+  signing key: whoever holds it can sign a later card.
+- *Tests:* 3 wire unit tests (small-order `dh_i0`, a thief with the static
+  secret and root key cannot open the first turn while the ephemeral key
+  can, a fresh key per attempt), 1 snapshot unit test (version 2 load), and
+  5 in `tests/handshake_rotation.rs` (newer epochs roll and survive a
+  snapshot; older and same-`not_after` cards are refused with the gate
+  unchanged; a retired key cannot come back; binding cannot lower the mark;
+  a later card for the same key moves only the mark).
+- *Mutation checks:* 19 deliberate breaks of the new rules (the `dh_i0`
+  check, its use and freshness; the staleness check and its boundary; the
+  mark on roll, bind, commit, save and load; older snapshot versions), all
+  caught on the first run. The old design (both sides ratcheting from the
+  static key, which still interoperates) was run against the thief test
+  separately.

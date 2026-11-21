@@ -226,8 +226,8 @@ fn bad_snapshots_fail_loudly() {
         assert_eq!(restore(&storage, NET, &tampered), Err(SnapshotError::Undecryptable), "byte {i}");
     }
     let mut versioned = saved.clone();
-    versioned[0] = 3;
-    assert_eq!(restore(&storage, NET, &versioned), Err(SnapshotError::UnsupportedVersion(3)));
+    versioned[0] = 4;
+    assert_eq!(restore(&storage, NET, &versioned), Err(SnapshotError::UnsupportedVersion(4)));
     // The previous format's number on a current snapshot: the inner version
     // byte no longer matches.
     versioned[0] = 1;

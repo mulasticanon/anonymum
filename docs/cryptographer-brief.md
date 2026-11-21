@@ -151,19 +151,20 @@ composition and whether it answers questions 11 and 12:
   message that fails changes no state (all changes are staged and
   committed after it opens); at most 256 keys are skipped per chain step
   and 1,024 kept (oldest erased); a used skipped key is erased at once.
-  Bootstrap from IK: CONFIRM carries the caller's fresh 32-byte seed, ACK
-  the answerer's fresh seed and first ratchet public key; both derive
+  Bootstrap from IK: CONFIRM carries the caller's fresh 32-byte seed and an
+  ephemeral ratchet public key `dh_i0`, ACK the answerer's fresh seed and
+  first ratchet public key `dh_r0` (either refused if small-order); both derive
   `root_0 = MAC_{"anonymum/dr-root/v1"}(seed_i || seed_r || h)` with `h`
   the IK handshake hash (`snow`'s public `get_handshake_hash`). The
-  answerer starts the ratchet ("Alice") against the **caller's static IK
-  key** as the first remote ratchet key, so it can send at once; the caller
-  takes its first DH step on the ACK. Data that overtakes the ACK is held
-  (at most 16 frames) and opened afterwards. **For you:** (1) is using the
-  caller's static key as the initial ratchet key acceptable (it is scoped
-  to one relationship or request; the first root key is independent of it)?
-  (2) Is keyed BLAKE2s an acceptable KDF in place of HKDF/HMAC? (3) Is the
+  answerer starts the ratchet ("Alice") against `dh_i0`, so it can send at
+  once; the caller takes its first DH step on the ACK. Data that overtakes
+  the ACK is held (at most 16 frames) and opened afterwards. **Resolved
+  2026-11-21 (implemented, still unreviewed):** the first turn no longer
+  uses the caller's static IK key as the remote ratchet key; a test gives a
+  thief that static secret and the root key, and it still cannot open the
+  answerer's first message. **For you:** (1) Is keyed BLAKE2s an acceptable KDF in place of HKDF/HMAC? (2) Is the
   unencrypted header acceptable inside the mixnet's own encryption (it
-  shows the ratchet key and counters to whoever sees the frame)? (4) The
+  shows the ratchet key and counters to whoever sees the frame)? (3) The
   skip caps and the eviction policy.
 - `gate.rs` and `wire.rs`: the answerer replies only to an authorised key
   (an unused invitation it issued, an existing contact, or the expected
@@ -268,8 +269,16 @@ composition and whether it answers questions 11 and 12:
   purge, a recorded IK message 1 to the old key (a HELLO or a stranger's
   callback) no longer opens on the device. Contacts move to a rotated key
   from a fresh card signed by the same contact signing key
-  (`roll_contact_key`), keeping the old key admitted for 26 h. Stored
-  identity format 2 and gate snapshot format 2; both still read version 1.
+  (`roll_contact_key`), keeping the old key admitted for 26 h. **Resolved
+  2026-11-21 (implemented, still unreviewed):** rollover is forward-only:
+  the new card's `not_after` must be later than the bound card's
+  (`StaleCard`), so a replayed older card cannot move a contact back.
+  Consequences: a second rotation inside one weekly epoch yields a card
+  with the same `not_after`, which contacts refuse until the next epoch
+  (an emergency mid-week rotation would need a card sequence number); and
+  a binding loaded from a version 2 snapshot has no recorded expiry, so its
+  first rollover is not checked. Stored identity format 2 and gate snapshot
+  format 3; older versions are still read.
   **For you:** is trial decryption of message 1 with two static keys
   acceptable (it adds a timing difference between a HELLO to the active
   and to the draining key, and a decryption attempt for a HELLO to

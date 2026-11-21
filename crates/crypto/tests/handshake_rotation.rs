@@ -276,8 +276,8 @@ fn a_new_card_from_the_same_signing_key_rolls_a_contact_forward_and_survives_a_s
     let new_card = bob.card(NET, 1);
     let rolled_at = boundary() + 60;
     assert_eq!(listener.roll_contact_key(&new_card, at(rolled_at)), Ok(old_key));
-    // Rolling again to the same key changes nothing.
-    assert_eq!(listener.roll_contact_key(&new_card, at(rolled_at)), Ok(new_card.handshake_key));
+    // The same card again is not newer: refused.
+    assert_eq!(listener.roll_contact_key(&new_card, at(rolled_at)), Err(ContactError::StaleCard));
     let new_key = bob.handshake_key().public();
     assert!(listener.gate().admits(&new_key, &ADMISSION));
     assert_eq!(listener.gate().signer_of(&new_key), Some(bob.signing_key()));
@@ -496,4 +496,106 @@ fn a_signing_key_binds_to_one_current_key_and_a_blocked_key_binds_to_none() {
         Err(ContactError::KeyInUse)
     );
     assert_eq!(side.gate().signer_of(&k2.public()), None);
+}
+
+// ---- forward-only rollover ---------------------------------------------------------
+
+#[test]
+fn rolling_to_a_newer_epoch_succeeds_and_records_its_end() {
+    let mut bob = ContactIdentity::generate_at(T0);
+    let carol = ContactIdentity::generate_at(T0);
+    let mut listener = carol_with_bob_as_contact(&bob, &carol);
+    let first = bob.handshake_key().public();
+    assert_eq!(listener.gate().card_not_after(&first), Some(boundary()));
+    bob.rotate_epoch(boundary() + 10);
+    let second = bob.card(NET, 1);
+    assert_eq!(listener.roll_contact_key(&second, at(boundary() + 60)), Ok(first));
+    assert_eq!(listener.gate().card_not_after(&second.handshake_key), Some(second.not_after));
+    bob.rotate_epoch(boundary() + EPOCH_LEN + 10);
+    let third = bob.card(NET, 1);
+    assert!(third.not_after > second.not_after);
+    assert_eq!(listener.roll_contact_key(&third, at(boundary() + EPOCH_LEN + 60)), Ok(second.handshake_key));
+    // The mark survives a snapshot, and still refuses the older card there.
+    let storage = StorageKey::generate();
+    let when = at(boundary() + EPOCH_LEN + 61);
+    let saved = listener.export_snapshot(&storage, when);
+    let mut restored: Responder<u32> = Responder::restore_callback_identity(&carol, NET, &storage, &saved).unwrap();
+    assert_eq!(restored.gate().card_not_after(&third.handshake_key), Some(third.not_after));
+    assert_eq!(restored.roll_contact_key(&third, when), Err(ContactError::StaleCard));
+}
+
+#[test]
+fn an_older_or_same_epoch_card_is_refused_and_changes_nothing() {
+    let mut bob = ContactIdentity::generate_at(T0);
+    let carol = ContactIdentity::generate_at(T0);
+    let mut listener = carol_with_bob_as_contact(&bob, &carol);
+    // A card of Bob's that ends before the bound one and is still valid.
+    let start = epoch_start(T0);
+    let older = bob.card_within(NET, 1, start, boundary() - 3_600);
+    bob.rotate_epoch(T0 + 10); // the same epoch: same `not_after` as the bound card
+    let same_end = bob.card(NET, 1);
+    assert_eq!(same_end.not_after, boundary());
+    let when = at(T0 + 60);
+    // The gate as it stands, to compare with after each refusal.
+    let storage = StorageKey::generate();
+    let saved = listener.export_snapshot(&storage, when);
+    let before: Responder<u32> = Responder::restore_callback_identity(&carol, NET, &storage, &saved).unwrap();
+    assert_eq!(listener.roll_contact_key(&older, when), Err(ContactError::StaleCard));
+    assert_eq!(listener.gate(), before.gate());
+    assert_eq!(listener.roll_contact_key(&same_end, when), Err(ContactError::StaleCard));
+    assert_eq!(listener.gate(), before.gate());
+    assert!(!listener.gate().is_contact(&same_end.handshake_key));
+}
+
+#[test]
+fn an_older_key_cannot_come_back_even_after_it_has_retired() {
+    let mut bob = ContactIdentity::generate_at(T0);
+    let carol = ContactIdentity::generate_at(T0);
+    let mut listener = carol_with_bob_as_contact(&bob, &carol);
+    // Epoch E+1's card stays valid while the contact moves on to E+2.
+    bob.rotate_epoch(boundary() + 10);
+    let replayed = bob.card(NET, 1);
+    let replayed_key = replayed.handshake_key;
+    listener.roll_contact_key(&replayed, at(boundary() + 60)).unwrap();
+    // A card that ends later, from the same signing key, for a new key.
+    let start = boundary() + EPOCH_LEN;
+    let (handshake, inbox, pq, _, _) = KeyEpoch::generate_at(start).to_secret_bytes();
+    let later = KeyEpoch::from_secret_bytes(handshake, inbox, pq, boundary(), start + EPOCH_LEN).unwrap();
+    let newer = ContactIdentity::from_parts(*bob.signing_secret_bytes(), later, None).card(NET, 1);
+    assert_eq!(listener.roll_contact_key(&newer, at(boundary() + 120)), Ok(replayed_key));
+    // The old key's retire time passes while its card is still valid.
+    let after = boundary() + 120 + DRAIN_GRACE;
+    listener.expire(at(after));
+    assert!(after < replayed.not_after && !listener.gate().is_contact(&replayed_key));
+    assert_eq!(listener.roll_contact_key(&replayed, at(after)), Err(ContactError::StaleCard));
+    assert!(!listener.gate().is_contact(&replayed_key));
+    assert!(listener.gate().admits(&newer.handshake_key, &ADMISSION));
+}
+
+#[test]
+fn binding_again_with_an_older_card_does_not_lower_the_mark() {
+    let bob = ContactIdentity::generate_at(T0);
+    let carol = ContactIdentity::generate_at(T0);
+    let mut listener = carol_with_bob_as_contact(&bob, &carol);
+    let key = bob.handshake_key().public();
+    let shorter = bob.card_within(NET, 1, epoch_start(T0), T0 + 3_600);
+    assert_eq!(listener.bind_contact_card(&shorter, at(T0 + 60)), Ok(()));
+    assert_eq!(listener.gate().card_not_after(&key), Some(boundary()));
+}
+
+#[test]
+fn a_later_card_for_the_same_key_only_moves_the_mark() {
+    let bob = ContactIdentity::generate_at(T0);
+    let carol = ContactIdentity::generate_at(T0);
+    // Bound through a short card, then the full-epoch card for the same key.
+    let mut listener: Responder<u32> =
+        Responder::for_callback_identity(&carol, NET, bob.handshake_key().public(), ADMISSION, T0 + 86_400).unwrap();
+    let short = bob.card_within(NET, 1, epoch_start(T0), T0 + 3_600);
+    listener.bind_contact_card(&short, at(T0)).unwrap();
+    call(&mut listener, bob.handshake_key(), carol.handshake_key().public(), ADMISSION, 1, at(T0)).unwrap();
+    let key = bob.handshake_key().public();
+    assert_eq!(listener.gate().card_not_after(&key), Some(T0 + 3_600));
+    assert_eq!(listener.roll_contact_key(&bob.card(NET, 1), at(T0 + 60)), Ok(key));
+    assert_eq!(listener.gate().card_not_after(&key), Some(boundary()));
+    assert!(listener.gate().admits(&key, &ADMISSION), "not retired");
 }

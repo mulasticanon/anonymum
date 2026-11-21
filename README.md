@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; a Double Ratchet (Signal specification) for data frames, seeded from the IK handshake; encrypted, versioned snapshots of grant state (one device); weekly rotation of the handshake and inbox keys together, with contact key rollover from a card signed by the same key; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, ratchet, note format and snapshot have not been reviewed.** | 173 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; a Double Ratchet (Signal specification) for data frames, seeded from the IK handshake; encrypted, versioned snapshots of grant state (one device); weekly rotation of the handshake and inbox keys together, with contact key rollover from a card signed by the same key; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, ratchet, note format and snapshot have not been reviewed.** | 182 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, random (never all-zero) dummy slots, a versioned recovery copy, escrows that lock a fee ceiling (surplus returned privately, a top-up if the fee rises above it), and one-time refund keys per escrow. | 83 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -352,8 +352,11 @@ reviewed.
   is no multi-device guarantee.
 - Per-message forward secrecy and post-compromise security rest on an
   unreviewed Double Ratchet prototype. Its header (ratchet key and
-  counters) is authenticated but not encrypted, and the caller's static
-  key serves as the first ratchet key on the answerer's side.
+  counters) is authenticated but not encrypted.
+- Contact key rollover is forward-only by the card's `not_after`, so a
+  second rotation inside one weekly epoch cannot reach contacts until the
+  next epoch's card (an emergency rotation would need a card sequence
+  number). Unreviewed.
 - Reading an IK first message costs the answerer two key agreements before
   it can refuse. Answered handshakes are capped, but strangers' calls need a
   proper cost.

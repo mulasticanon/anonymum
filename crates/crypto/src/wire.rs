@@ -13,12 +13,13 @@
 //! API only:
 //!
 //! * **Data frames use a Double Ratchet** ([`crate::ratchet`], unreviewed).
-//!   CONFIRM carries the caller's fresh 32-byte seed; ACK carries the
-//!   answerer's fresh seed and its first ratchet public key (refused if
-//!   small-order). Both sides derive the first root key from the two seeds
+//!   CONFIRM carries the caller's fresh 32-byte seed and a fresh ephemeral
+//!   ratchet public key (`dh_i0`); ACK carries the answerer's fresh seed
+//!   and its first ratchet public key (`dh_r0`). Either key is refused if
+//!   small-order. Both sides derive the first root key from the two seeds
 //!   and the IK handshake hash. The answerer starts the ratchet ("Alice")
-//!   against the caller's static key, so it can send at once; the caller
-//!   takes the first ratchet step when the ACK arrives. Data frames that
+//!   against `dh_i0`, never the caller's static key, so it can send at
+//!   once; the caller takes the first ratchet step when the ACK arrives. Data frames that
 //!   reach the caller before the ACK are held ([`MAX_EARLY_DATA`]) and
 //!   opened afterwards ([`Initiator::take_early`]). The Noise session
 //!   carries only CONFIRM and ACK.
@@ -148,14 +149,15 @@ const ACK: u8 = 5;
 const HEADER_LEN: usize = 1 + 4 + 4;
 /// What the caller's confirmation and the answerer's ack carry, after their
 /// record type and the call id and attempt.
-const CONFIRM_MARKER: &[u8] = b"anonymum/confirm/v4";
-const ACK_MARKER: &[u8] = b"anonymum/acknowledge/v4";
+const CONFIRM_MARKER: &[u8] = b"anonymum/confirm/v5";
+const ACK_MARKER: &[u8] = b"anonymum/acknowledge/v5";
 /// Inner record: type byte, then call id and attempt for control records.
 const CONTROL_LEN: usize = 1 + 8;
 /// A fresh random seed each side contributes to the ratchet's root key.
 const SEED_LEN: usize = 32;
-/// CONFIRM's plaintext: control record, marker, the caller's seed.
-const CONFIRM_LEN: usize = CONTROL_LEN + CONFIRM_MARKER.len() + SEED_LEN;
+/// CONFIRM's plaintext: control record, marker, the caller's seed and its
+/// ephemeral first ratchet public key.
+const CONFIRM_LEN: usize = CONTROL_LEN + CONFIRM_MARKER.len() + SEED_LEN + 32;
 /// ACK's plaintext: control record, marker, the answerer's seed and its
 /// first ratchet public key.
 const ACK_LEN: usize = CONTROL_LEN + ACK_MARKER.len() + SEED_LEN + 32;
@@ -244,9 +246,10 @@ fn control(kind: u8, at: Attempt, marker: &[u8]) -> Vec<u8> {
     [&[kind], at.label().as_slice(), marker].concat()
 }
 
-/// The plaintext of a CONFIRM: its control record and the caller's seed.
-fn confirm_record(at: Attempt, seed: &[u8; SEED_LEN]) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new([control(CONFIRM, at, CONFIRM_MARKER).as_slice(), seed].concat())
+/// The plaintext of a CONFIRM: its control record, the caller's seed and
+/// its ephemeral first ratchet public key.
+fn confirm_record(at: Attempt, seed: &[u8; SEED_LEN], ratchet_key: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new([control(CONFIRM, at, CONFIRM_MARKER).as_slice(), seed, ratchet_key].concat())
 }
 
 /// The plaintext of an ACK: control record, the answerer's seed and its
@@ -348,9 +351,17 @@ pub struct Initiator {
 enum State {
     /// HELLO sent; waiting for WELCOME.
     Handshaking { handshake: Handshake, sent: Vec<u8>, resends: u32 },
-    /// CONFIRM (carrying `seed`) sent; waiting for the answerer's ACK. Data
-    /// frames that arrive first are held in `held`, unopened.
-    Confirming { session: Session, seed: Zeroizing<[u8; SEED_LEN]>, sent: Vec<u8>, resends: u32, held: Vec<Vec<u8>> },
+    /// CONFIRM (carrying `seed` and the public half of `ratchet_key`) sent;
+    /// waiting for the answerer's ACK. Data frames that arrive first are
+    /// held in `held`, unopened.
+    Confirming {
+        session: Session,
+        seed: Zeroizing<[u8; SEED_LEN]>,
+        ratchet_key: RatchetKey,
+        sent: Vec<u8>,
+        resends: u32,
+        held: Vec<Vec<u8>>,
+    },
     Established(Ratchet),
     /// The last attempt failed; the next starts after [`Initiator::wait`].
     Waiting,
@@ -481,9 +492,17 @@ impl Initiator {
                 match handshake.finish(body) {
                     Ok(mut session) => {
                         let seed = Zeroizing::new(random_bytes());
-                        let record = session.seal(&confirm_record(current, &seed))?;
+                        let ratchet_key = RatchetKey::generate();
+                        let record = session.seal(&confirm_record(current, &seed, &ratchet_key.public()))?;
                         let sent = handshake_frame(CONFIRM, current, &record);
-                        self.state = State::Confirming { session, seed, sent: sent.clone(), resends: 0, held: Vec::new() };
+                        self.state = State::Confirming {
+                            session,
+                            seed,
+                            ratchet_key,
+                            sent: sent.clone(),
+                            resends: 0,
+                            held: Vec::new(),
+                        };
                         Ok(InitiatorEvent::Send(sent))
                     }
                     Err(error) => {
@@ -492,7 +511,7 @@ impl Initiator {
                     }
                 }
             }
-            (Frame::Handshake { kind: ACK, at, body }, State::Confirming { mut session, seed, sent, resends, held }) => {
+            (Frame::Handshake { kind: ACK, at, body }, State::Confirming { mut session, seed, ratchet_key, sent, resends, held }) => {
                 // The answerer's seed and first ratchet key, inside the
                 // sealed ACK; a small-order ratchet key is refused before
                 // the record counts.
@@ -509,18 +528,17 @@ impl Initiator {
                     .and_then(Result::ok)
                     .map(Zeroizing::new);
                 let Some(record) = opened else {
-                    self.state = State::Confirming { session, seed, sent, resends, held };
+                    self.state = State::Confirming { session, seed, ratchet_key, sent, resends, held };
                     return Err(WireError::Stale);
                 };
                 let seed_r: [u8; SEED_LEN] = record[keys_at..keys_at + SEED_LEN].try_into().expect("32 bytes");
                 let seed_r = Zeroizing::new(seed_r);
                 let dh_r0: [u8; 32] = record[keys_at + SEED_LEN..].try_into().expect("32 bytes");
                 let root = ratchet::root_from_handshake(&seed, &seed_r, session.handshake_hash());
-                // Our caller key is the ratchet key the answerer started
-                // from; the first step with its key happens now.
-                let own = RatchetKey::from_bytes(self.me.secret());
+                // Our ephemeral key is the one the answerer started from;
+                // the first step with its key happens now.
                 let mut ratchet =
-                    Ratchet::respond_to(&root, self.network, own, dh_r0).map_err(WireError::Ratchet)?;
+                    Ratchet::respond_to(&root, self.network, ratchet_key, dh_r0).map_err(WireError::Ratchet)?;
                 for frame in held {
                     if let Ok(plaintext) = open_data(&mut ratchet, &frame) {
                         self.early.push(plaintext);
@@ -529,12 +547,12 @@ impl Initiator {
                 self.state = State::Established(ratchet);
                 Ok(InitiatorEvent::Established)
             }
-            (Frame::Data(body), State::Confirming { session, seed, sent, resends, mut held }) => {
+            (Frame::Data(body), State::Confirming { session, seed, ratchet_key, sent, resends, mut held }) => {
                 let kept = held.len() < MAX_EARLY_DATA;
                 if kept {
                     held.push(body.to_vec());
                 }
-                self.state = State::Confirming { session, seed, sent, resends, held };
+                self.state = State::Confirming { session, seed, ratchet_key, sent, resends, held };
                 if kept { Ok(InitiatorEvent::Held) } else { Err(WireError::Busy) }
             }
             (Frame::Data(body), State::Established(mut ratchet)) => {
@@ -873,8 +891,11 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     }
 
     /// Move a contact to the handshake key on `card`, a fresh card from the
-    /// same signing key: the card must verify for this network at `now`
-    /// and its signing key must be the one recorded for a current contact.
+    /// same signing key: the card must verify for this network at `now`,
+    /// its signing key must be the one recorded for a current contact, and
+    /// its `not_after` must be later than the bound card's
+    /// ([`ContactError::StaleCard`] otherwise, nothing changed), so an older
+    /// card that is still valid cannot move a contact back to an older key.
     /// The contact's grant moves to the new key; the old key stays admitted
     /// for [`crate::contact::DRAIN_GRACE`] (so calls in flight finish) and
     /// is then dropped with its sessions. Returns the old key. Persist the
@@ -1084,19 +1105,27 @@ impl<T: Hash + Eq + Clone> Responder<T> {
         let pending = self.pending.get_mut(&key).expect("found above");
         // A transport message: a bad one is dropped; the attempt stays.
         let expected = control(CONFIRM, at, CONFIRM_MARKER);
-        let record = match pending.session.open_if(body, |p| p.len() == CONFIRM_LEN && p.starts_with(&expected)) {
+        // A small-order ephemeral key is refused before the record counts.
+        let keys_at = expected.len();
+        let record = match pending.session.open_if(body, |p| {
+            p.len() == CONFIRM_LEN
+                && p.starts_with(&expected)
+                && is_contributory_key(p[keys_at + SEED_LEN..].try_into().expect("32 bytes"))
+        }) {
             Ok(record) => Zeroizing::new(record),
             Err(_) => return Err(WireError::Stale),
         };
-        let seed_i: [u8; SEED_LEN] = record[expected.len()..].try_into().expect("32 bytes");
+        let seed_i: [u8; SEED_LEN] = record[keys_at..keys_at + SEED_LEN].try_into().expect("32 bytes");
         let seed_i = Zeroizing::new(seed_i);
+        let dh_i0: [u8; 32] = record[keys_at + SEED_LEN..].try_into().expect("32 bytes");
         // Our seed and first ratchet key; the ratchet starts from the
-        // caller's key (authenticated by the handshake).
+        // caller's ephemeral key (inside the sealed CONFIRM), not its static
+        // key, so that key's later theft does not open our first messages.
         let seed_r = Zeroizing::new(random_bytes());
         let own = RatchetKey::generate();
         let own_public = own.public();
         let root = ratchet::root_from_handshake(&seed_i, &seed_r, pending.session.handshake_hash());
-        let ratchet = Ratchet::initiate_with(&root, self.gate.network(), own, peer).map_err(WireError::Ratchet)?;
+        let ratchet = Ratchet::initiate_with(&root, self.gate.network(), own, dh_i0).map_err(WireError::Ratchet)?;
         let mut pending = self.pending.remove(&key).expect("found above");
         if !self.gate.commit(&peer, &pending.reference, pending.grant, now) {
             return Err(WireError::Unauthorised); // blocked, used or expired meanwhile
@@ -1272,6 +1301,68 @@ mod tests {
                 assert!(matches!(side.handle(tag, &hello, when), Err(WireError::Session(SessionError::WeakKey))));
             }
         }
+    }
+
+    #[test]
+    fn a_confirm_with_a_small_order_ephemeral_key_is_refused_and_the_real_one_still_counts() {
+        let (mut side, mut call, hello) = setup();
+        let w = welcome(&mut side, &hello);
+        let InitiatorEvent::Send(confirm) = call.handle(&w).unwrap() else { panic!() };
+        let at = Attempt { call: call.call, number: 1 };
+        let State::Confirming { session, .. } = &mut call.state else { panic!() };
+        // Sealed in the caller's own session, so it authenticates.
+        for weak in crate::contact::tests::SMALL_ORDER {
+            let forged = handshake_frame(CONFIRM, at, &session.seal(&confirm_record(at, &[7; SEED_LEN], &weak)).unwrap());
+            assert!(matches!(side.handle(1, &forged, now()), Err(WireError::Stale)));
+            assert_eq!(side.sessions(), 0, "nothing committed");
+            assert_eq!(side.pending(), 1, "the attempt stays");
+        }
+        let ResponderEvent::Established { reply, .. } = side.handle(1, &confirm, now()).unwrap() else { panic!() };
+        assert_eq!(call.handle(&reply).unwrap(), InitiatorEvent::Established);
+    }
+
+    #[test]
+    fn the_answerers_first_turn_uses_the_ephemeral_key_and_the_static_key_cannot_open_it() {
+        let (mut side, mut call, hello) = setup();
+        let w = welcome(&mut side, &hello);
+        let InitiatorEvent::Send(confirm) = call.handle(&w).unwrap() else { panic!() };
+        let ResponderEvent::Established { reply, .. } = side.handle(1, &confirm, now()).unwrap() else { panic!() };
+        // The answerer speaks first.
+        let first = side.seal(&1, b"first turn", now()).unwrap();
+        let Frame::Data(first_body) = parse(&first).unwrap() else { panic!() };
+        // The strongest thief: it has the caller's static secret and even
+        // the root key (both seeds and the transcript hash).
+        let static_secret = *call.me.secret();
+        let static_public = call.me.public();
+        let State::Confirming { session, seed, ratchet_key, .. } = &mut call.state else { panic!() };
+        assert_ne!(ratchet_key.public(), static_public, "a separate key");
+        let hash = *session.handshake_hash();
+        let Frame::Handshake { body, .. } = parse(&reply).unwrap() else { panic!() };
+        let record = session.open_if(body, |_| true).unwrap();
+        let keys_at = control(ACK, Attempt { call: 0, number: 0 }, ACK_MARKER).len();
+        let seed_r: [u8; SEED_LEN] = record[keys_at..keys_at + SEED_LEN].try_into().unwrap();
+        let dh_r0: [u8; 32] = record[keys_at + SEED_LEN..].try_into().unwrap();
+        let root = ratchet::root_from_handshake(seed, &seed_r, &hash);
+        let mut thief = Ratchet::respond_to(&root, NET, RatchetKey::from_bytes(&static_secret), dh_r0).unwrap();
+        assert!(matches!(open_data(&mut thief, first_body), Err(WireError::Ratchet(RatchetError::Decrypt))));
+        // The same derivation with the ephemeral key opens it.
+        let mut honest = Ratchet::respond_to(&root, NET, ratchet_key.copy_for_tests(), dh_r0).unwrap();
+        assert_eq!(open_data(&mut honest, first_body).unwrap(), b"first turn");
+    }
+
+    #[test]
+    fn a_fresh_attempt_uses_a_fresh_ephemeral_key() {
+        let (mut side, mut call, hello) = setup();
+        let w = welcome(&mut side, &hello);
+        call.handle(&w).unwrap();
+        let State::Confirming { ratchet_key, .. } = &call.state else { panic!() };
+        let first = ratchet_key.public();
+        call.policy.resends = 0;
+        let again = call.on_timeout().unwrap().unwrap();
+        let w = welcome(&mut side, &again);
+        call.handle(&w).unwrap();
+        let State::Confirming { ratchet_key, .. } = &call.state else { panic!() };
+        assert_ne!(ratchet_key.public(), first);
     }
 
     #[test]
