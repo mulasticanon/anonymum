@@ -112,6 +112,15 @@ pub struct Recovered {
 pub enum RecoveryError {
     /// A purpose longer than 16 bytes.
     PurposeTooLong,
+    /// The refund path is not a one-time refund key ([`REFUND_PURPOSE`]),
+    /// or names the same key as the cancel path: a long-term or shared key
+    /// as `refund_to` would link escrows to each other (I13, review H5).
+    NotAOneTimeRefundKey,
+    /// The refund key is already the `refund_to` of another escrow of this
+    /// wallet on the chain.
+    RefundKeyReused,
+    /// No refund index is left above the highest one in use.
+    KeysExhausted,
     /// The path does not derive the authority the escrow names.
     PathDoesNotMatch,
     /// Not this wallet's copy: wrong size, or it does not decrypt under
@@ -135,6 +144,37 @@ pub enum EscrowStatus {
     ResolvedWithoutRefund { tx_index: usize },
     /// Resolved by `tx_index`, whose outputs include the derived refund.
     Refunded { tx_index: usize, refund: Note, position: u64, created_at: Time },
+    /// Claimed by `tx_index`, whose outputs include the derived surplus of
+    /// the fee reserve, returned to the sender (I8).
+    ClaimedWithSurplus { tx_index: usize, surplus: Note, position: u64, created_at: Time },
+}
+
+impl EscrowStatus {
+    /// The note owed to the sender that this resolution created, if any:
+    /// the refund, or a claim's fee surplus. `(note, position, created_at)`.
+    pub fn sender_note(&self) -> Option<(Note, u64, Time)> {
+        match *self {
+            EscrowStatus::Refunded { refund: n, position, created_at, .. }
+            | EscrowStatus::ClaimedWithSurplus { surplus: n, position, created_at, .. } => Some((n, position, created_at)),
+            _ => None,
+        }
+    }
+}
+
+/// The key purpose of a one-time refund identity. Each escrow gets its own
+/// index under it, so no two escrows share a `refund_to` (I13, H5).
+pub const REFUND_PURPOSE: &str = "refund";
+/// The key purpose of an escrow's cancel authority.
+pub const CANCEL_PURPOSE: &str = "cancel";
+
+/// A new escrow as a wallet prepares it: the note, the paths of its fresh
+/// refund and cancel keys, and the recovery copy for a coin slot.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PreparedEscrow {
+    pub escrow: EscrowNote,
+    pub refund: KeyPath,
+    pub cancel: KeyPath,
+    pub recovery_copy: Vec<u8>,
 }
 
 /// The status of one inserted copy of an escrow, plus, for a refund the
@@ -185,6 +225,13 @@ impl Wallet {
         if self.secret_at(refund).authority() != escrow.refund_to || self.secret_at(cancel).authority() != escrow.canceller {
             return Err(RecoveryError::PathDoesNotMatch);
         }
+        if [refund, cancel].iter().any(|path| path.purpose.len() > PURPOSE_BYTES) {
+            return Err(RecoveryError::PurposeTooLong);
+        }
+        // The refund identity is a one-time key of its own (I13, H5).
+        if refund.purpose != REFUND_PURPOSE || escrow.refund_to == escrow.canceller {
+            return Err(RecoveryError::NotAOneTimeRefundKey);
+        }
         let mut plain = Vec::with_capacity(PLAIN_BYTES);
         plain.push(RECOVERY_VERSION);
         plain.extend_from_slice(&escrow.price.to_le_bytes());
@@ -193,10 +240,7 @@ impl Wallet {
             plain.extend_from_slice(part);
         }
         for path in [refund, cancel] {
-            let purpose = path.purpose.as_bytes();
-            if purpose.len() > PURPOSE_BYTES {
-                return Err(RecoveryError::PurposeTooLong);
-            }
+            let purpose = path.purpose.as_bytes(); // length checked above
             let mut field = [0u8; PURPOSE_BYTES];
             field[..purpose.len()].copy_from_slice(purpose);
             plain.extend_from_slice(&field);
@@ -260,22 +304,66 @@ impl Wallet {
     }
 
     /// The state of every inserted copy of a recovered escrow, including
-    /// whether a refund this wallet owns is still unspent.
+    /// whether a note this wallet is owed (a refund, or a claim's fee
+    /// surplus) is still unspent.
     pub fn refund_states(&self, chain: &Chain, recovered: &Recovered) -> Vec<RefundState> {
         let owner = self.secret_at(&recovered.refund);
         escrow_positions(chain, &recovered.escrow)
             .into_iter()
             .map(|escrow_position| {
                 let status = escrow_status(chain, &recovered.escrow, escrow_position);
-                let refund_spent = match status {
-                    EscrowStatus::Refunded { refund, position, .. } => {
-                        Some(chain.is_spent(&ordinary_nullifier(&owner, &refund.commitment(), position)))
-                    }
-                    _ => None,
-                };
+                let refund_spent = status
+                    .sender_note()
+                    .map(|(note, position, _)| chain.is_spent(&ordinary_nullifier(&owner, &note.commitment(), position)));
                 RefundState { escrow_position, status, refund_spent }
             })
             .collect()
+    }
+
+    /// The refund and cancel paths for this wallet's next escrow: index one
+    /// above the highest refund index any of its escrows on `chain` uses,
+    /// so a restored wallet never hands out a refund key twice.
+    pub fn next_escrow_keys(&self, chain: &Chain) -> Result<(KeyPath, KeyPath), RecoveryError> {
+        let used = self.recover_escrows(chain)?;
+        let index = match used.iter().filter(|r| r.refund.purpose == REFUND_PURPOSE).map(|r| r.refund.index).max() {
+            None => 0,
+            Some(top) => top.checked_add(1).ok_or(RecoveryError::KeysExhausted)?,
+        };
+        Ok((KeyPath::new(REFUND_PURPOSE, index), KeyPath::new(CANCEL_PURPOSE, index)))
+    }
+
+    /// Prepare an escrow to `recipient` with a fresh one-time refund key
+    /// and its own cancel key, and seal its recovery copy. Refuses a refund
+    /// key some escrow of this wallet on `chain` already uses (so even a
+    /// caller who picks the paths by hand cannot link two escrows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_escrow(
+        &self,
+        chain: &Chain,
+        keys: (KeyPath, KeyPath),
+        price: Value,
+        fee_reserve: Value,
+        recipient: Authority,
+        seed: Hash,
+        blinding: Hash,
+        nonce: [u8; NONCE_BYTES],
+    ) -> Result<PreparedEscrow, RecoveryError> {
+        let (refund, cancel) = keys;
+        let refund_to = self.secret_at(&refund).authority();
+        if self.recover_escrows(chain)?.iter().any(|r| r.escrow.refund_to == refund_to) {
+            return Err(RecoveryError::RefundKeyReused);
+        }
+        let escrow = EscrowNote {
+            price,
+            fee_reserve,
+            recipient,
+            refund_to,
+            canceller: self.secret_at(&cancel).authority(),
+            seed,
+            blinding,
+        };
+        let recovery_copy = self.seal_recovery(&escrow, &refund, &cancel, nonce)?;
+        Ok(PreparedEscrow { escrow, refund, cancel, recovery_copy })
     }
 }
 
@@ -287,26 +375,34 @@ pub fn escrow_positions(chain: &Chain, escrow: &EscrowNote) -> Vec<u64> {
 
 /// Where the escrow at `escrow_position` stands: find the finalised
 /// transaction that consumed its nullifier, then look for the derived
-/// refund among *that transaction's outputs only*. An identical commitment
-/// anywhere else in history proves nothing about this escrow.
+/// refund, or a claim's derived fee surplus, among *that transaction's
+/// outputs only*. Both depend on the base fee that transaction paid, which
+/// is public. An identical commitment anywhere else in history proves
+/// nothing about this escrow.
 pub fn escrow_status(chain: &Chain, escrow: &EscrowNote, escrow_position: u64) -> EscrowStatus {
     let commitment = Note::Escrow(*escrow).commitment();
     let nullifier = escrow_nullifier(&escrow.seed, &commitment, escrow_position);
     let Some(tx_index) = chain.transaction_spending(&nullifier) else {
         return EscrowStatus::Unresolved;
     };
-    let refund = derived_refund(escrow, escrow_position);
-    let c = refund.commitment();
-    chain
-        .output_positions(tx_index)
-        .find(|&p| chain.leaves()[p as usize].commitment == c)
-        .map(|position| EscrowStatus::Refunded {
-            tx_index,
-            refund,
-            position,
-            created_at: chain.leaves()[position as usize].created_at,
-        })
-        .unwrap_or(EscrowStatus::ResolvedWithoutRefund { tx_index })
+    let fee = chain.log()[tx_index].base_fee;
+    let find = |note: &Note| {
+        let c = note.commitment();
+        chain
+            .output_positions(tx_index)
+            .find(|&p| chain.leaves()[p as usize].commitment == c)
+            .map(|position| (position, chain.leaves()[position as usize].created_at))
+    };
+    let refund = derived_refund(escrow, escrow_position, fee);
+    if let Some((position, created_at)) = find(&refund) {
+        return EscrowStatus::Refunded { tx_index, refund, position, created_at };
+    }
+    if let Some(surplus) = derived_claim_surplus(escrow, escrow_position, fee) {
+        if let Some((position, created_at)) = find(&surplus) {
+            return EscrowStatus::ClaimedWithSurplus { tx_index, surplus, position, created_at };
+        }
+    }
+    EscrowStatus::ResolvedWithoutRefund { tx_index }
 }
 
 impl Wallet {

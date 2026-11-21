@@ -229,6 +229,12 @@ pub enum Reject {
     ReceiptEscrowMismatch,
     ClaimPayoutWrong,
     RefundNotDerived,
+    /// A claim on an escrow whose reserve exceeds the base fee does not
+    /// return exactly the derived surplus note to `refund_to` (I8, H5).
+    SurplusNotDerived,
+    /// A resolution spends an ordinary top-up note when the reserve covers
+    /// the fee, or none when the fee rose above the reserve (I8).
+    TopUpWrong,
     PenaltyWrong,
     ClaimTooLate,
 }
@@ -300,6 +306,13 @@ impl Chain {
 
     pub fn params(&self) -> &Params {
         &self.params
+    }
+    /// Change the public base fee `F` for every later transaction (in a
+    /// real network, a runtime upgrade). Open escrows keep their reserve:
+    /// a resolution returns any surplus to the sender privately, or takes
+    /// the shortfall from an ordinary top-up note (issue I8, review H1).
+    pub fn set_base_fee(&mut self, base_fee: Value) {
+        self.params.base_fee = base_fee;
     }
     pub fn root(&self) -> Hash {
         self.current_root
@@ -549,7 +562,9 @@ impl Chain {
                     return Err(Reject::MissingSurcharge);
                 }
                 let escrow = escrows[0];
-                if escrow.fee_reserve != p.base_fee {
+                // At least today's fee; the wallet's default is a ceiling
+                // above it, so a later fee rise still settles (I8).
+                if escrow.fee_reserve < p.base_fee {
                     return Err(Reject::FeeReserveWrong);
                 }
                 if tier != Tier::Stranger {
@@ -566,9 +581,13 @@ impl Chain {
                 if !witness.admission.is_empty() {
                     return Err(Reject::NonEmptyAdmission);
                 }
-                let [(Note::Escrow(escrow), created_at, escrow_position, authority)] = real_inputs.as_slice() else {
+                // Exactly one escrow, plus at most one ordinary top-up note.
+                let mut escrows = real_inputs.iter().filter(|(n, ..)| matches!(n, Note::Escrow(_)));
+                let (Some((Note::Escrow(escrow), created_at, escrow_position, authority)), None) = (escrows.next(), escrows.next())
+                else {
                     return Err(Reject::WrongInputType);
                 };
+                let top_ups = real_inputs.len() - 1; // the others are ordinary: retired inputs were refused above
                 let required = match witness.branch {
                     Branch::Claim | Branch::Decline => escrow.recipient,
                     _ => escrow.canceller,
@@ -576,35 +595,61 @@ impl Chain {
                 if authority.authority() != required {
                     return Err(Reject::WrongAuthority);
                 }
-                if escrow.fee_reserve != p.base_fee {
-                    return Err(Reject::FeeReserveWrong);
+                // The reserve may differ from today's fee (I8, H1): a
+                // surplus goes back to `refund_to` in a derived note; a
+                // shortfall must come from one ordinary top-up note, whose
+                // change (pinned by conservation) goes wherever the resolver
+                // likes. A top-up is refused when none is needed.
+                let shortfall = fee_shortfall(escrow, p.base_fee);
+                if (shortfall > 0) != (top_ups == 1) {
+                    return Err(Reject::TopUpWrong);
                 }
+                let max_change = usize::from(shortfall > 0);
                 let deadline = created_at.checked_add(TTL).ok_or(Reject::Overflow)?;
+                // Match the required notes, then count what is left over.
+                let mut rest: Vec<Note> = real_outputs.clone();
+                let mut take = |want: &Note| match rest.iter().position(|n| n == want) {
+                    Some(i) => {
+                        rest.remove(i);
+                        true
+                    }
+                    None => false,
+                };
                 match witness.branch {
                     Branch::Claim => {
                         // Every inclusion time t < not_after <= deadline.
                         if public.not_after > deadline {
                             return Err(Reject::ClaimTooLate);
                         }
-                        let ok = matches!(real_outputs.as_slice(),
-                            [Note::Ordinary { value, owner, .. }] if *value == escrow.price && *owner == escrow.recipient);
-                        if !ok {
+                        if let Some(surplus) = derived_claim_surplus(escrow, *escrow_position, p.base_fee) {
+                            if !take(&surplus) {
+                                return Err(Reject::SurplusNotDerived);
+                            }
+                        }
+                        let payout = rest.iter().position(|n| {
+                            matches!(n, Note::Ordinary { value, owner, .. } if *value == escrow.price && *owner == escrow.recipient)
+                        });
+                        let Some(i) = payout else {
+                            return Err(Reject::ClaimPayoutWrong);
+                        };
+                        rest.remove(i);
+                        // Only top-up change may remain, and only ordinary.
+                        if rest.len() > max_change || rest.iter().any(|n| !matches!(n, Note::Ordinary { .. })) {
                             return Err(Reject::ClaimPayoutWrong);
                         }
                     }
                     _ => {
                         // Decline or sender refund: no time condition.
-                        let refund = derived_refund(escrow, *escrow_position);
-                        let refunds = real_outputs.iter().filter(|n| matches!(n, Note::Ordinary { .. })).count();
-                        let retired: Vec<Value> = real_outputs
+                        if !take(&derived_refund(escrow, *escrow_position, p.base_fee)) {
+                            return Err(Reject::RefundNotDerived);
+                        }
+                        let retired: Vec<Value> = rest
                             .iter()
                             .filter_map(|n| if let Note::Retired { value, .. } = n { Some(*value) } else { None })
                             .collect();
-                        if refunds != 1 || real_outputs.len() != 2 || retired.len() != 1 {
+                        let ordinary = rest.iter().filter(|n| matches!(n, Note::Ordinary { .. })).count();
+                        if retired.len() != 1 || ordinary > max_change || rest.len() != 1 + ordinary {
                             return Err(Reject::WrongOutputs);
-                        }
-                        if !real_outputs.contains(&refund) {
-                            return Err(Reject::RefundNotDerived);
                         }
                         // Implied by the derived refund and conservation,
                         // but kept explicitly (spec v0.5, I12).

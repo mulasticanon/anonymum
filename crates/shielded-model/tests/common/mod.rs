@@ -186,7 +186,7 @@ pub fn claim_tx(w: &World, escrow: &EscrowNote, pos: u64, authority: Secret, tag
 pub fn refund_tx(w: &World, branch: Branch, escrow: &EscrowNote, pos: u64, authority: Secret, tag: &str) -> (PublicTx, Witness) {
     TxBuilder::new(branch, tag.as_bytes())
         .spend(Note::Escrow(*escrow), w.created_at(pos), pos, authority)
-        .output(derived_refund(escrow, pos))
+        .output(derived_refund(escrow, pos, F))
         .output(Note::Retired { value: penalty(escrow.price), blinding: blinding(&format!("{tag}/penalty")) })
         .build(&w.chain, w.time)
 }

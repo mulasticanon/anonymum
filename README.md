@@ -18,7 +18,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
 | `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; encrypted, versioned snapshots of grant state (one device); weekly inbox key rotation; dummy stranger notes that are real v5 notes between throwaway keys. **The handshake, note format and snapshot have not been reviewed.** | 127 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
-| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, random (never all-zero) dummy slots, and a versioned recovery copy. | 65 tests, including adversarial cases and a randomised conservation test |
+| `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, random (never all-zero) dummy slots, a versioned recovery copy, escrows that lock a fee ceiling (surplus returned privately, a top-up if the fee rises above it), and one-time refund keys per escrow. | 83 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
 
 Nothing here has been audited. Do not use it to protect anything real.
@@ -236,7 +236,10 @@ turn to confirm a test catches it.
 Problems found in the spec while building it are listed in
 `docs/shielded-spec-v0-issues.md`: v0.5 resolved I1–I12 except I8 (changing
 the base fee while escrows are open), and raised two wording issues (I13,
-I14).
+I14). I8 is addressed in the model since 2026-11-21 (audit HIGH-03): an
+escrow locks a fee ceiling, the unused part returns to the sender on every
+outcome, and a fee above the reserve is paid with a top-up note. Not
+reviewed.
 
 ## What is real and what is not
 

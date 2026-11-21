@@ -8,6 +8,30 @@ use crate::hash::{h, Hash};
 use crate::objects::*;
 use rand_core::{OsRng, RngCore};
 
+/// The fee ceiling a wallet locks by default in each escrow, as a multiple
+/// of today's base fee `F`: a placeholder until a fee policy exists. The
+/// part of the reserve the resolution does not need returns to the sender
+/// (issue I8, review H1).
+pub const FEE_CEILING_MULTIPLE: Value = 2;
+
+/// The reserve an opening locks unless the caller chooses another one
+/// (at least `F`): `FEE_CEILING_MULTIPLE * F`, saturating.
+pub fn default_fee_reserve(params: &Params) -> Value {
+    params.base_fee.saturating_mul(FEE_CEILING_MULTIPLE)
+}
+
+/// An ordinary note spent to cover the shortfall when the base fee rose
+/// above an escrow's reserve, and where its change goes.
+#[derive(Clone, Copy, Debug)]
+pub struct TopUp {
+    pub note: Note,
+    pub created_at: Time,
+    pub position: u64,
+    pub owner: Secret,
+    /// Owner of the change note (normally the resolver).
+    pub change_to: Authority,
+}
+
 #[derive(Clone)]
 pub struct TxBuilder {
     branch: Branch,
@@ -45,6 +69,67 @@ impl TxBuilder {
         assert!(self.outputs.len() < N_OUT, "too many outputs");
         self.outputs.push(OutputWitness::Real(note));
         self
+    }
+
+    /// Leave the next output slot unused (a zero-value retired note), so a
+    /// later output lands in a fixed slot.
+    pub fn dummy_output(mut self) -> Self {
+        assert!(self.outputs.len() < N_OUT, "too many outputs");
+        let blinding = self.derived("dummy-output", self.outputs.len());
+        self.outputs.push(OutputWitness::Dummy { blinding });
+        self
+    }
+
+    /// A Claim, Decline or Sender refund of the escrow at `position`, paying
+    /// the base fee `chain` charges now, with the outputs in fixed slots:
+    ///
+    /// | slot | Claim | Decline, Sender refund |
+    /// |---|---|---|
+    /// | input 0 | the escrow | the escrow |
+    /// | input 1 | top-up note, only if `F > fee_reserve` | the same |
+    /// | output 0 | `price` to `recipient` | derived refund: `price - penalty + surplus` to `refund_to` |
+    /// | output 1 | derived surplus to `refund_to` if `fee_reserve > F`, else unused | retired penalty |
+    /// | output 2 | top-up change, if any | the same |
+    ///
+    /// `authority` is the recipient's secret (Claim, Decline) or the
+    /// canceller's (Sender refund). A top-up passed when none is needed is
+    /// spent anyway, and the chain refuses the result (`TopUpWrong`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolution(
+        chain: &Chain,
+        branch: Branch,
+        escrow: &EscrowNote,
+        created_at: Time,
+        position: u64,
+        authority: Secret,
+        top_up: Option<TopUp>,
+        salt: &[u8],
+    ) -> Self {
+        assert!(matches!(branch, Branch::Claim | Branch::Decline | Branch::SenderRefund), "not a resolution");
+        let fee = chain.params().base_fee;
+        let mut b = TxBuilder::new(branch, salt).spend(Note::Escrow(*escrow), created_at, position, authority);
+        if let Some(t) = &top_up {
+            b = b.spend(t.note, t.created_at, t.position, t.owner);
+        }
+        b = if branch == Branch::Claim {
+            let payout = Note::Ordinary { value: escrow.price, owner: escrow.recipient, blinding: b.derived("payout", 0) };
+            let b = b.output(payout);
+            match derived_claim_surplus(escrow, position, fee) {
+                Some(surplus) => b.output(surplus),
+                None => b.dummy_output(),
+            }
+        } else {
+            let retired = Note::Retired { value: penalty(escrow.price), blinding: b.derived("penalty", 0) };
+            b.output(derived_refund(escrow, position, fee)).output(retired)
+        };
+        if let Some(t) = top_up {
+            let change = t.note.value().unwrap_or(0).saturating_sub(fee_shortfall(escrow, fee));
+            if change > 0 {
+                let blinding = b.derived("change", 0);
+                b = b.output(Note::Ordinary { value: change, owner: t.change_to, blinding });
+            }
+        }
+        b
     }
 
     pub fn admission(mut self, record: AdmissionRecord) -> Self {

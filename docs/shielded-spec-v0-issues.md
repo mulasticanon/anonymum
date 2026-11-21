@@ -20,12 +20,12 @@ how it stands and what the model or prototype does.
 | I5 | Where the admission record lives | Resolved in v0.5 |
 | I6 | `created_at`: block time or window start | Resolved in v0.5 |
 | I7 | Form of a dummy output | Resolved in v0.5 |
-| I8 | Changing `F` strands open escrows | **Open** (v0.5 question 10) |
+| I8 | Changing `F` strands open escrows | **Addressed in the model, 2026-11-21** (fee ceiling, private surplus, top-up; O9, P4); review open (questions 4, 10) |
 | I9 | Refunds of twin escrows were identical | Resolved in v0.5 |
 | I10 | Minimum price and parameter values | Resolved in v0.5 (parameter values still placeholders) |
 | I11 | Recovery copy needed a nonce search | Resolved in v0.5 |
 | I12 | Penalty constraint implied by two others | Resolved in v0.5 (check kept) |
-| I13 | "Every note has a fresh secret blinding" vs the derived refund | Wording fixed in v0.6; **cryptographic question open** (question 8, review H5) |
+| I13 | "Every note has a fresh secret blinding" vs the derived refund | Wording fixed in v0.6; one-time `refund_to` per escrow enforced by the model's wallet (2026-11-21); **cryptographic question open** (question 8, review H5) |
 | I14 | "Refunded after 24 hours" vs a refund valid at any time | Closed: wording fixed in v0.6 |
 
 ## Resolved in v0.5
@@ -87,7 +87,12 @@ anyway. *Model:* kept; disabling it still fails no test, as expected.
 v0.6 fixes `F` for the prototype (P4) and names the review's candidate (a
 maximum fee `C` locked in each escrow, `C - F` returned privately on every
 outcome), which would amend O7 and needs the owner's decision. Same finding
-as review H1. *Model:* `F` is constant; a resolution needs `fee_reserve = F`.
+as review H1. *Addressed in the model on 2026-11-21* (O9, the owner's
+HIGH-03 request; see "Fee changes and one-time refund keys" at the end of
+this file): an opening locks `fee_reserve >= F` (wallet default `2 F`);
+the surplus returns to `refund_to` in a derived note on every outcome; a
+fee above the reserve is covered by a top-up note. Still for review:
+questions 4 and 10.
 
 ## Raised by v0.5
 
@@ -97,7 +102,13 @@ and the escrow's position, so both escrow parties can recompute its
 commitment. *Wording fixed in v0.6:* section 3 names the refund as the one
 exception. *Still open:* the cryptographic question of what the recipient
 can learn from it (question 8; review H5 asks for owner-only serials and an
-in-circuit constraint on destination, amount and blinding).
+in-circuit constraint on destination, amount and blinding). *2026-11-21:*
+the model already constrains destination, amount and blinding (including
+the new claim surplus); its wallet now gives every escrow its own one-time
+`refund_to` key and refuses a reused or long-term one; tests show that
+everything the recipient knows (seed, escrow, `refund_to`, blinding,
+commitment) neither spends the note nor yields its nullifier. That is a
+property of the model's hash stand-ins, not a proof about a circuit.
 
 **I14. "Refunded after 24 hours".** O6 and P3 said an ignored stranger's
 escrow "comes back after 24 hours", although the sender refund is valid at
@@ -110,11 +121,11 @@ always refundable").
 
 | # | Finding (short) | Status |
 |---|---|---|
-| H1 | A changed base fee strands old escrows (= I8) | **Open.** `F` fixed for the prototype (v0.6 P4); the max-fee alternative needs the owner's decision |
+| H1 | A changed base fee strands old escrows (= I8) | **Addressed in the model, 2026-11-21** (audit HIGH-03): the max-fee alternative, with a top-up when the fee exceeds the reserve (O9, P4). Unreviewed |
 | H2 | Restore did not cover the key indices the wallet can use | **Fixed in the model** (and v0.6): the recovery copy records purpose and index for the refund identity and the cancel authority; no search. Tested at `u64::MAX`, sparse indices and 40 escrows |
 | H3 | Noise XX gives a reusable wallet credential to any initiating peer | Addressed in the prototype, unreviewed; spec questions 11 and 12 |
 | H4 | The sealed note's prologue needs the stranger's address before decrypting | Addressed in the prototype, unreviewed; spec questions 11 and 12 |
-| H5 | A resolver knows the deterministic refund; spend privacy and recovery need in-circuit guarantees | **Open cryptographic gate.** The model enforces the exact refund fields; it cannot show proof properties |
+| H5 | A resolver knows the deterministic refund; spend privacy and recovery need in-circuit guarantees | **Open cryptographic gate.** The model enforces the exact refund and claim-surplus fields and one-time refund keys (2026-11-21); it cannot show proof properties |
 | H6 | Wallet-specific fetches, immediate callbacks and a small population can reveal correspondents | **Open deployment gate.** Immediate callbacks: the demo now waits a random 30-300 s before calling back (2026-11-21, MED-03 below); wallet-specific fetches and the small population remain |
 | H7 | Circuit completeness, verifier validation, key privacy, setup and mobile proving are unproven | **Open release gate** |
 | M1 | Wallet matched the expected refund commitment anywhere in history | **Fixed in the model** (and v0.6): the wallet finds the finalised transaction that consumed the escrow's nullifier, matches the refund among its outputs only, and reports separately whether it is unspent. Tested with an identical decoy commitment made earlier |
@@ -278,7 +289,7 @@ Status after the fixes of 2026-11-20:
 | A3 (MED-02) | Unchecked pallet arithmetic | **Fixed.** `Percent::mul_floor` for the fee split; checked adds for the expiry height and the id and sequence counters, returning `ArithmeticError::Overflow` and charging nothing. Tested at each boundary |
 | A4 (HIGH-02) | Sessions keyed by reply handle and unbounded; one caller could fill the pending table | **Fixed.** Candidate handles are capped at one per caller (a newer one replaces it) and are dropped with a caller evicted from a handle (tested: a CONFIRM replayed from 200 handles leaves one). Live sessions are keyed by the caller's authenticated key (one each) with a route table from reply handle to caller. Caps with named defaults: `MAX_PENDING` 1,024, `MAX_PENDING_PER_CALLER` 4, `MAX_SESSIONS` 1,024 (`Limits`). A repeated CONFIRM from a new handle gets the cached ACK there, but the session moves only when a fresh data frame from that handle decrypts, so a replayed CONFIRM cannot redirect replies. At the session cap a new caller is refused before its CONFIRM is opened and nothing is committed. Tests for each |
 | A5 (MED-01) | Unchecked send counter | **Fixed.** `Session::seal` uses nonces up to `u64::MAX - 1` and then refuses (`Exhausted`); Noise reserves only `u64::MAX`, so it cannot wrap. No rekeying |
-| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21; CRIT-02's forward-secrecy half prototyped on 2026-11-21 (inbox key rotation); MED-03 (dummy payloads, callback timing) addressed on 2026-11-21; see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
+| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21; CRIT-02's forward-secrecy half prototyped on 2026-11-21 (inbox key rotation); MED-03 (dummy payloads, callback timing) addressed on 2026-11-21; HIGH-03 (fee changes, refund keys) addressed in the model on 2026-11-21; see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
 | A7 (LOW-01) | Replace the random-secret key check with a list of small-order points | **Not done, by decision**: no hand-written list of bad points; the check stays on `x25519-dalek`'s `was_contributory` |
 
 **Where the audit is wrong or overstated (my reading, for the owner).**
@@ -641,3 +652,78 @@ acceptance block.
   builds no shielded transactions, so nothing yet passes `dummy_note`
   outside tests.
 
+## Fee changes and one-time refund keys: audit HIGH-03, I8/H1 and I13/H5 (2026-11-21, unreviewed)
+
+The audit's HIGH-03 joined two findings: a change of the base fee `F`
+strands open escrows (I8, H1), and the derived refund needs a refund key
+the resolver cannot exploit (I13, H5). The owner asked for the max-fee
+design; the spec records it as O9 and the new P4.
+
+- *Fee ceiling* (`chain.rs`, `objects.rs`): an Open needs
+  `fee_reserve >= F` (was `= F`; `FeeReserveWrong` below `F`). The wallet
+  default is `FEE_CEILING_MULTIPLE * F` = `2 F` (`build::default_fee_reserve`,
+  a placeholder). `Chain::set_base_fee` models a fee change by runtime
+  upgrade; every transaction still pays today's `F` publicly.
+- *Surplus* (`fee_reserve >= F`): no top-up note may be spent (`TopUpWrong`).
+  Decline and Sender refund must create `derived_refund(escrow, position,
+  F)`, worth `price - penalty + (fee_reserve - F)`. A claim with a surplus
+  must create `derived_claim_surplus`, an ordinary note of
+  `fee_reserve - F` to `refund_to` with the derived refund blinding
+  (`SurplusNotDerived` otherwise); with no surplus the slot stays unused
+  as before.
+- *Top-up* (`fee_reserve < F`): the resolution must spend one ordinary
+  top-up note (authorised by its owner, like any input) and may create
+  one ordinary change note; conservation pins its value. The sender's
+  outcome is as at `F = fee_reserve`. No escrow is stranded, but a
+  resolver without coins cannot settle until they have some.
+- *Conservation* is unchanged in form for all six branches:
+  `sum(inputs) = sum(ordinary outputs) + sum(escrow outputs: price +
+  fee_reserve) + sum(retired outputs) + F`; the harness checks the supply
+  after every accepted transaction.
+- *Builder:* `TxBuilder::resolution(chain, branch, escrow, created_at,
+  position, authority, top_up, salt)` fills the fixed slot layout (input 0
+  escrow, input 1 top-up or dummy; output 0 payout or refund, output 1
+  claim surplus or penalty, output 2 change) and `dummy_output()` keeps a
+  slot unused.
+- *Wallet* (`wallet.rs`): `escrow_status` reads the fee from the consuming
+  transaction (public), so it finds a refund or a claim's surplus
+  (`EscrowStatus::ClaimedWithSurplus`) even after a later fee change;
+  `refund_states` tracks either. `next_escrow_keys` hands out the index one
+  above the highest refund index any of the wallet's escrows on the chain
+  uses (`KeysExhausted` at the top, never wraps); `prepare_escrow` refuses a
+  `refund_to` already used by one of its escrows on the chain
+  (`RefundKeyReused`); `seal_recovery` refuses a refund path whose purpose
+  is not `REFUND_PURPOSE` or whose key equals the cancel key
+  (`NotAOneTimeRefundKey`). The H2 tests (any index, sparse indices) still
+  pass: they use distinct `"refund"` indices.
+- *Tests* (`tests/fee_changes.rs`, 18): (a) `F` rises to 11, 15 and 20
+  with a reserve of 20: Claim, Decline and Sender refund settle and return
+  exactly `reserve - F`; a needless top-up is refused. (b) `F` rises above
+  the reserve (21, 35; and 20 over a reserve of 10): each branch settles
+  with a top-up and returns exact change; without one it cannot balance;
+  an exact top-up leaves no change; a short one, someone else's note, or a
+  second change note is refused. (c) `F` falls (9, 4, 1, 0) over reserves of
+  10 and 20: the whole surplus comes back and value is conserved; a
+  transaction built at the old fee is refused (`WrongBaseFee`). (d) a
+  decline whose refund has a random, zero or wrong-position blinding, or
+  whose surplus is split off to the recipient, and a claim whose surplus
+  has a random blinding, the wrong owner, is retired, or is folded into the
+  payout, are all refused at no charge. (e) two escrows of one wallet get
+  distinct one-time `refund_to` keys (a restored wallet continues above
+  them); reused, long-term or cancel-equal refund keys are refused; for a
+  refund and a claim surplus, nothing the recipient knows spends the note
+  or reproduces the nullifier the sender's spend publishes. Also: a
+  resolution without a top-up may not add even a zero-value note, and the
+  claim surplus's blinding is the seed-and-position one.
+- *Mutation checks:* 18 deliberate breaks (reserve back to `= F`; the
+  top-up rule removed or loosened; change allowed without a top-up; claim
+  surplus not required, leftovers or extra decline notes unchecked; the
+  surplus missing from the refund, with the escrow's blinding or the
+  recipient as owner; the wallet reading today's fee or ignoring claim
+  surplus; refund purpose, refund-equals-cancel or reuse unchecked; the
+  next index reused or wrapping; default reserve of `F`). The first run
+  missed four (extra zero-value notes, surplus blinding source); two tests
+  were added and all 18 are now caught.
+- *Not checked:* that a circuit can express these rules cheaply, or that a
+  two-input resolution (with a top-up) cannot be told apart from others by
+  its proof (question 4); fee levels and the ceiling are placeholders.

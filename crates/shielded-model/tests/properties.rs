@@ -164,7 +164,7 @@ fn two_escrows_with_the_same_seed_give_different_refunds() {
         w.submit(&public, &witness).unwrap();
         let (public, witness) = refund_tx(&w, Branch::Decline, &second, pos2, p.recipient, "d2");
         w.submit(&public, &witness).unwrap();
-        let (r1, r2) = (derived_refund(&first, pos1), derived_refund(&second, pos2));
+        let (r1, r2) = (derived_refund(&first, pos1, F), derived_refund(&second, pos2, F));
         assert_ne!(r1.commitment(), r2.commitment(), "twins={twins}: refunds must differ");
 
         // The sender finds each refund through the transaction that consumed
@@ -244,7 +244,7 @@ fn a_refund_that_differs_from_the_derived_one_is_rejected() {
     let p = parties();
     let thief = secret("thief");
     let (_, escrow, escrow_pos) = world_with_escrow(101);
-    let derived = derived_refund(&escrow, escrow_pos);
+    let derived = derived_refund(&escrow, escrow_pos, F);
     let Note::Ordinary { value, owner, blinding: b } = derived else { unreachable!() };
     let altered = [
         ("owner", Note::Ordinary { value, owner: thief.authority(), blinding: b }),
@@ -427,7 +427,7 @@ fn knowing_the_seed_gives_the_recipient_no_authority_over_the_refund() {
     let (mut w, escrow, pos) = world_with_escrow(101);
     let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
     w.submit(&public, &witness).unwrap();
-    let refund = derived_refund(&escrow, pos);
+    let refund = derived_refund(&escrow, pos, F);
     let rpos = w.position_of(&refund);
     // The recipient can compute the refund commitment (they know the seed)...
     assert_eq!(w.chain.leaves()[rpos as usize].commitment, refund.commitment());
@@ -852,7 +852,7 @@ fn boundary_prices_resolve_exactly_by_claim_and_by_decline() {
         let (mut w, escrow, pos) = escrow_at_price(price);
         let (public, witness) = refund_tx(&w, Branch::Decline, &escrow, pos, p.recipient, "d");
         w.submit(&public, &witness).unwrap_or_else(|e| panic!("decline at {price}: {e:?}"));
-        assert_eq!(derived_refund(&escrow, pos).value(), Some(refund_value), "refund at {price}");
+        assert_eq!(derived_refund(&escrow, pos, F).value(), Some(refund_value), "refund at {price}");
         assert!(w.conserved());
         // Claim: the recipient gets the full price.
         let (mut w, escrow, pos) = escrow_at_price(price);

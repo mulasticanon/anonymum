@@ -99,9 +99,11 @@ design most depends on:
 8. **Sender self-recovery.** Each opening carries a copy of the escrow
    data encrypted to a key derived from the sender's backed-up keys. How
    should that key and the seed be derived? (Spec question 9.)
-9. **Changing the base fee.** Open escrows hold a reserve equal to the fee
-   of their day. A fee change strands them or marks them. (Issue I8; spec
-   question 10.) Unsolved.
+9. **Changing the base fee.** Escrows used to hold a reserve equal to the
+   fee of their day, so a fee change stranded or marked them (issue I8;
+   spec question 10). Since 2026-11-21 the reserve is a ceiling: the
+   surplus returns privately in a derived note, a shortfall is topped up
+   by the resolver. Modelled, not reviewed.
 
 ### B. Choices we need you to make or approve
 
@@ -238,6 +240,20 @@ composition and whether it answers questions 11 and 12:
   too) indistinguishable from a real one, are random bytes right for coin
   slots once their real format is fixed, and what delay distribution
   (and for refunds and change) would you want?
+- **Fee changes and one-time refund keys** (issues file, "Fee changes
+  and one-time refund keys", audit HIGH-03, I8/H1, I13/H5; 2026-11-21,
+  modelled, unreviewed): an escrow now locks a fee *ceiling*
+  (`fee_reserve >= F`, wallet default `2 F`). At resolution the surplus
+  `fee_reserve - F` returns to `refund_to` in a note with the derived
+  refund blinding: folded into the refund on a decline or sender refund,
+  a separate note on a claim. If `F` has risen above the reserve, the
+  resolver spends one ordinary top-up note and takes the change. Each
+  escrow's `refund_to` is a one-time key; the model's wallet refuses reuse.
+  **For you:** is a derived surplus note on a claim as sound as the derived
+  refund (question 8), does a two-input resolution (escrow plus top-up)
+  show through the proof or its timing (question 4), and is a ceiling of
+  `2 F` a reasonable default, or should the surplus be retired instead of
+  returned?
 - **Two open items on the proof binding** (recorded 2026-11-21, yours to
   decide): (1) `stranger_note_hash` should be computed *outside* the
   circuit with an ordinary hash (BLAKE2s, as the model uses, or SHA-256)
@@ -307,7 +323,8 @@ wallet synchronisation, and from the small population at launch.
   blocks whom.
 - The shielded design is a specification and a rules model only.
 - Parameter values (base fee, surcharge, window width) are placeholders.
-- The base fee cannot change while escrows are open (I8).
+- A resolver with no coins cannot settle an escrow whose reserve is below a
+  raised base fee until they have some (I8, top-up rule).
 - Wallets must scan every transaction; no detection scheme is designed.
 - Refunds are not automatic: the sender's app must submit them.
 - A sender can withdraw a request while the recipient's claim is still

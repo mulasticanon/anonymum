@@ -66,7 +66,7 @@ fn funded_world(sender: &Wallet, values: &[Value]) -> World {
 fn decline(w: &mut World, escrow: &EscrowNote, pos: u64, tag: &str) {
     let (public, witness) = TxBuilder::new(Branch::Decline, tag.as_bytes())
         .spend(Note::Escrow(*escrow), w.created_at(pos), pos, secret("recipient"))
-        .output(derived_refund(escrow, pos))
+        .output(derived_refund(escrow, pos, F))
         .output(Note::Retired { value: penalty(escrow.price), blinding: blinding(&format!("{tag}/p")) })
         // Deliberately unusable settlement data.
         .payload(0, vec![0xEE; COIN_PAYLOAD_LEN])
@@ -206,7 +206,7 @@ fn an_identical_commitment_elsewhere_is_not_mistaken_for_the_refund() {
     let (escrow, pos) = open_from_wallet(&mut w, &sender, 0, 101, &KeyPath::new("refund", 1), &KeyPath::new("cancel", 1), "o");
 
     // The decoy: same owner, value and derived blinding as the real refund.
-    let decoy = derived_refund(&escrow, pos);
+    let decoy = derived_refund(&escrow, pos, F);
     let (public, witness) = TxBuilder::new(Branch::Transfer, b"decoy")
         .spend(w.notes[recipient_coins as usize], 0, recipient_coins, recipient)
         .output(decoy)

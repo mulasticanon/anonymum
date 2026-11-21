@@ -38,7 +38,8 @@ pub struct Leaf(pub Hash);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EscrowNote {
     pub price: Value,
-    /// Prepaid resolution fee; must equal the base fee `F` at opening (P4).
+    /// Prepaid resolution fee: at least the base fee `F` at opening (P4).
+    /// What the resolution does not need returns to `refund_to` (I8).
     pub fee_reserve: Value,
     /// May claim or decline.
     pub recipient: Authority,
@@ -134,16 +135,47 @@ pub fn refund_blinding(seed: &Hash, escrow_position: u64) -> Hash {
     h("refund-blinding", &[seed, &escrow_position.to_le_bytes()])
 }
 
+/// What is left of an escrow's prepaid reserve after its resolution pays
+/// the base fee `base_fee` in force at that time (zero if the fee rose
+/// above the reserve). It goes back to the sender privately (issue I8,
+/// review H1, audit HIGH-03).
+pub fn fee_surplus(escrow: &EscrowNote, base_fee: Value) -> Value {
+    escrow.fee_reserve.saturating_sub(base_fee)
+}
+
+/// How much the resolver must add from an ordinary top-up note when the
+/// base fee rose above the escrow's reserve (zero otherwise).
+pub fn fee_shortfall(escrow: &EscrowNote, base_fee: Value) -> Value {
+    base_fee.saturating_sub(escrow.fee_reserve)
+}
+
 /// The one refund note a Decline or Sender refund may create for the escrow
-/// at `escrow_position`. Fully determined by the escrow and its position,
-/// so the sender can find it without receiving anything from whoever
-/// resolved the escrow.
-pub fn derived_refund(escrow: &EscrowNote, escrow_position: u64) -> Note {
+/// at `escrow_position`, when the resolution pays base fee `base_fee`:
+/// `price - penalty` plus the reserve's surplus, owned by `refund_to`, with
+/// the blinding derived from the seed and position. Fully determined by
+/// the escrow, its position and the public fee of the resolving
+/// transaction, so the sender can find it without receiving anything from
+/// whoever resolved the escrow, and a resolver cannot pick a blinding the
+/// sender does not know (review H5, I13).
+pub fn derived_refund(escrow: &EscrowNote, escrow_position: u64, base_fee: Value) -> Note {
     Note::Ordinary {
-        value: escrow.price - penalty(escrow.price),
+        value: escrow.price - penalty(escrow.price) + fee_surplus(escrow, base_fee),
         owner: escrow.refund_to,
         blinding: refund_blinding(&escrow.seed, escrow_position),
     }
+}
+
+/// The note a Claim must return to the sender when the escrow's reserve
+/// exceeds the base fee `base_fee`: the surplus, owned by `refund_to`, with
+/// the same derived blinding as a refund. `None` when there is no surplus
+/// (the claim then creates only the payout, plus top-up change).
+pub fn derived_claim_surplus(escrow: &EscrowNote, escrow_position: u64, base_fee: Value) -> Option<Note> {
+    let surplus = fee_surplus(escrow, base_fee);
+    (surplus > 0).then(|| Note::Ordinary {
+        value: surplus,
+        owner: escrow.refund_to,
+        blinding: refund_blinding(&escrow.seed, escrow_position),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

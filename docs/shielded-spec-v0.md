@@ -18,11 +18,18 @@ admission record's zero fields enforced (W3), and a hybrid post-quantum
 stranger note with one ML-KEM-768 key on the contact card (rules 2 and 4
 of section 2a, W6).
 
+Updated 2026-11-21 (still v0.7, unreviewed; audit HIGH-03): escrows lock a
+fee ceiling instead of exactly `F`, so a change of `F` no longer strands
+them (O9, P4, section 4; issue I8, review H1). The unused part of the
+reserve returns to the sender in a derived note on every outcome, and a
+fee above the reserve is covered by a top-up note from whoever resolves.
+Each escrow's `refund_to` is a one-time key of its own (I13, review H5).
+
 v0.6 takes in the findings of `design-review-2026-11-19.md` (an AI-written
 review, not the human specialist review still required): a separate
 contact identity (section 2a), key locators in the sender's recovery copy,
 a stricter rule for finding refunds, and a fixed base fee for the
-prototype.
+prototype (replaced by a fee ceiling on 2026-11-21, O9).
 
 A second, more detailed proposal exists in
 `Shielded_Payments_Protocol_v0.1.md` (the "alternative protocol"). It shares
@@ -44,6 +51,7 @@ differences.
 | O6 | Blocked or ignored strangers get no answer. The sender can take the refund, minus the penalty, at any time; after 24 hours the recipient can no longer claim, so an ignored request is then always refundable (P3; wording corrected for I14). | 2026-11-19 |
 | O7 | Opening a request locks the price plus one base fee, so settlement is prepaid (P4). | 2026-11-19 |
 | O8 | Claims stop at 24 hours; after that only a refund is possible (P5). | 2026-11-19 |
+| O9 | Amends O7: an opening locks the price plus a fee *ceiling* of at least one base fee (wallet default `2 F`, a placeholder). What the resolution does not need returns privately to the sender on every outcome, including a claim; if the fee has risen above the reserve, whoever resolves adds a top-up note (P4; I8, H1). Requested by the owner with the HIGH-03 work. | 2026-11-21 |
 
 ## 2. Design rules
 
@@ -87,15 +95,29 @@ pass the recipient can no longer claim. Nothing comes back on its own
 (P6). The chain cannot
 refuse them in advance.
 
-**P4. Resolution fees are prepaid.** Opening an escrow locks the price plus
-one base fee. Whoever resolves the escrow pays the base fee from that
-reserve, so a claim pays the recipient the full price and a refund never
-strands a sender who has no other coins. For the prototype `F` is fixed
-(review H1; issue I8): a change in either direction would leave open
-escrows unable to settle. The review's candidate for a later version is to
-lock a maximum fee `C` in each escrow and privately return `C - F` to the
-sender on every outcome, including a claim. That would amend O7 and needs
-the owner's decision.
+**P4. Resolution fees are prepaid, up to a ceiling (O9).** Opening an
+escrow locks the price plus a reserve `fee_reserve >= F`, where `F` is the
+base fee at opening; wallets lock `2 F` by default (a placeholder until a
+fee policy exists). Whoever resolves the escrow pays the base fee `F` in
+force *at resolution* from that reserve, so a claim pays the recipient the
+full price and a refund never strands a sender who has no other coins.
+`F` may change while escrows are open (I8, review H1):
+
+- `fee_reserve >= F`: the surplus `fee_reserve - F` goes back to
+  `refund_to` privately. A decline or sender refund folds it into the
+  refund note; a claim returns it in a separate note. Both notes have the
+  derived refund blinding, so the sender finds them without help and the
+  resolver cannot pick a blinding the sender does not know. No top-up note
+  may be spent.
+- `fee_reserve < F`: the resolution must spend exactly one ordinary top-up
+  note of the resolver's, worth at least `F - fee_reserve`; its change goes
+  wherever the resolver likes. The sender's outcome is the same as at
+  `F = fee_reserve` (no surplus). No escrow is ever stranded, but a
+  resolver with no coins of their own cannot settle until they have some.
+
+The public fee of every transaction is still today's `F`, the same for all,
+so a resolution does not mark itself by paying an old fee. Whether the
+hidden surplus or top-up creates a linkage is question 4.
 
 **P5. Claims stop at the deadline.** The recipient can claim only before
 24 hours have passed. After that only a refund is possible.
@@ -111,7 +133,8 @@ claim is still unconfirmed.
 
 **P8. Penalty: 1% of the price, rounded up, on every outcome except a
 claim.** Same as today. The penalty is retired inside the pool as an
-unspendable note, never published as an amount.
+unspendable note, never published as an amount. It is computed on the
+price alone: the reserve's surplus (P4) comes back in full.
 
 **P9. No public user balances.** Coins are shielded from the first
 distribution. Validator and governance flows may stay public.
@@ -320,16 +343,26 @@ cannot be guessed from a known amount. (v0.2 omitted this: a retired note
 of the known surcharge `S` could have been recognised on-chain. Found in
 the owner's ChatGPT review of 2026-11-19.)
 
-The one exception is a refund note (section 4): its blinding is derived
-from the escrow's seed and position, so both escrow parties can recompute
-its commitment. It stays hidden from everyone else (I13; question 8).
+The one exception is the note owed to the sender when an escrow resolves
+(section 4): the refund of a decline or sender refund, or the fee surplus
+of a claim. Its blinding is derived from the escrow's seed and position, so
+both escrow parties can recompute its commitment. It stays hidden from
+everyone else (I13; question 8). Its owner `refund_to` is a one-time key
+used by no other escrow, and spending it needs that key's secret, from
+which alone (with the commitment and position) its nullifier is derived:
+knowing the seed, the blinding and the commitment does not let the
+recipient spend it or recognise its nullifier (review H5; the model tests
+this, a circuit must enforce it).
 
 - **Ordinary note**: `(value, owner, blinding)`.
 - **Escrow note**: `(price, fee_reserve, recipient, refund_to,
   canceller, seed, blinding)`.
   - `recipient`: authority that may claim or decline.
-  - `refund_to`: owner of the refund note (the sender, or a fresh identity
-    of theirs).
+  - `fee_reserve`: at least `F` at opening (P4); its surplus over the fee
+    at resolution returns to `refund_to`.
+  - `refund_to`: owner of the refund note and of a claim's fee surplus: a
+    fresh one-time identity of the sender's, never reused across escrows
+    (I13).
   - `canceller`: authority that may take the refund at any time (the
     sender).
   - `seed`: secret shared by both parties, from which the escrow's single
@@ -413,10 +446,15 @@ Branches:
 |---|---|---|---|---|
 | Transfer | ordinary notes | ordinary notes; empty admission record (W3) | owners | none |
 | Invited request | ordinary notes | change; admission record with tier "invited" and no escrow | owners | none |
-| Open (stranger request) | ordinary notes | one escrow note with `fee_reserve = F`; a retired note of `S`; change; admission record with tier "stranger" naming that escrow | owners | none |
-| Claim | one escrow note | ordinary note of `price` owned by `recipient`; empty admission record (W3) | `recipient` | `not_after <= created_at + 24h` |
-| Decline | one escrow note | ordinary note of `price - penalty` owned by `refund_to`; retired note of `penalty`; empty admission record (W3) | `recipient` | none |
-| Sender refund | one escrow note | same as Decline | `canceller` | none |
+| Open (stranger request) | ordinary notes | one escrow note with `fee_reserve >= F`; a retired note of `S`; change; admission record with tier "stranger" naming that escrow | owners | none |
+| Claim | one escrow note; a top-up note only if `F > fee_reserve` | ordinary note of `price` owned by `recipient`; if `fee_reserve > F`, the derived surplus note of `fee_reserve - F` owned by `refund_to`; top-up change, if any; empty admission record (W3) | `recipient` (and the top-up's owner) | `not_after <= created_at + 24h` |
+| Decline | one escrow note; a top-up note only if `F > fee_reserve` | derived refund of `price - penalty + max(0, fee_reserve - F)` owned by `refund_to`; retired note of `penalty`; top-up change, if any; empty admission record (W3) | `recipient` (and the top-up's owner) | none |
+| Sender refund | same as Decline | same as Decline | `canceller` (and the top-up's owner) | none |
+
+Slot layout (the model's builder; the proof does not depend on it): input
+0 the escrow, input 1 the top-up or a dummy; output 0 the payout or
+refund, output 1 the claim's surplus (else unused) or the penalty, output 2
+the top-up change (else unused).
 
 `penalty = ceil(price / 100)`, constrained as integers. The explicit
 penalty check is kept even though the derived refund and the conservation
@@ -444,14 +482,21 @@ fully determined by the escrow. Its owner is `refund_to`, its value is
 escrow's position in the tree, so two escrows that happen to share a seed
 still produce different refunds (I9). The sender
 already holds all three, so their app can compute the exact commitment to
-look for and spend it without receiving anything from the recipient. The
+look for and spend it without receiving anything from the recipient. Its
+value also includes the reserve's surplus over the fee the resolving
+transaction paid, which is public. A claim's surplus note follows the same
+rule (owner `refund_to`, value `fee_reserve - F`, the same derived
+blinding), so a recipient who claims cannot keep or hide the sender's
+surplus either. The
 alternative protocol instead proves inside the transaction that the
 encrypted copy sent to the sender is correct, which is far more expensive.
 Which is sound is question 8 for the cryptographer.
 
 In Claim, Decline and Sender refund the transaction's base fee `F` is
 paid from the escrow's `fee_reserve`, so the conservation equation reads
-`price + fee_reserve = outputs + F` with `fee_reserve = F`.
+`price + fee_reserve = outputs + F` when the reserve covers the fee (the
+outputs include the surplus), and `price + fee_reserve + top_up = outputs
++ F` when it does not (the outputs include the change).
 
 **The receipt is bound to the request.** The proof shows that the admission
 record's tier matches what was actually retired, and that the escrow it
@@ -595,7 +640,10 @@ and reward payout; network-layer privacy of submission and queries.
    resolved"?
 3. Is stamping `created_at` into every leaf sound, and do shared validity
    windows leak deadlines near expiry?
-4. Does prepaying the resolution fee (P4) create any linkage?
+4. Does prepaying the resolution fee (P4) create any linkage? Since
+   2026-11-21 the reserve is a ceiling: the surplus or top-up is hidden,
+   but a resolution with a top-up spends two notes instead of one escrow;
+   does that show through the proof's public shape or timing?
 5. Is the retired-note type the best way to burn confidentially, compared
    with a committed supply accumulator?
 6. With P1, is any privacy lost by all transactions paying the same public
@@ -608,14 +656,12 @@ and reward payout; network-layer privacy of submission and queries.
 9. How exactly should a restored wallet derive the key for its own
    recovery copy, and should `seed` be random or derived from the sender's
    keys?
-10. Changing the base fee `F` (I8). An open escrow holds a reserve equal
-    to the `F` of its day and its resolution must pay exactly `F`. If `F`
-    changes, old escrows either cannot resolve or resolve at a visibly
-    different fee, which marks them. Options: `F` is fixed for the life of
-    a rules version; a change takes effect only for new escrows while old
-    ones resolve under a rule that hides the difference; or the reserve is
-    over-funded and the excess retired. Until this is settled, `F` cannot
-    be changed on a network with open escrows.
+10. Changing the base fee `F` (I8). *Answered in the model on 2026-11-21
+    (O9, P4):* each escrow locks a ceiling; the surplus returns privately
+    in a derived note, and a fee above the reserve is covered by a top-up.
+    Open for review: is the derived surplus note on a claim as sound as the
+    derived refund (question 8), and does a two-input resolution leak
+    anything (question 4)?
 11. Is Noise IK, with the authorisation check before the first reply, the
     right replacement for Noise XX (which the prototype used until
     2026-11-20)? Are the mitigations for its
