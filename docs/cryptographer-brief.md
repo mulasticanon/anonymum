@@ -197,8 +197,17 @@ composition and whether it answers questions 11 and 12:
   secret as the psk of `Noise_Xpsk0` (`ml-kem` 0.3.3); one ML-KEM key per
   card, signed through its BLAKE2s hash (card 1,408 bytes). Sender
   authentication stays classical. Is this the right hybrid?
+- **Durable grant state** (issues file, R8 and MED-04; 2026-11-21,
+  unreviewed): a responder's gate can be saved as a ChaCha20-Poly1305
+  snapshot (associated data `"anonymum/gate-snapshot/v1" || network`,
+  fresh nonce, versioned, every failure explicit), with a
+  persist-before-reply rule: the snapshot is written durably before the
+  ACK that follows a committed grant. This is crash safety for **one
+  device**. Several devices must not share one gate: each device gets its
+  own contact identity (own keys and invitations). Revoked and consumed
+  invitation ids are pruned at expiry plus 300 s of clock skew.
 - **Open questions for you** (issues file, "Open questions recorded
-  2026-11-20"): durable and multi-device grant state; Bob's callback using
+  2026-11-20"): multi-device grant state; Bob's callback using
   the handshake key on his card (I16); timing equivalence between authorised and unauthorised
   callers, which nobody has measured; and whether the unchecked ephemeral
   keys inside `snow` are acceptable.

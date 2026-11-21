@@ -57,8 +57,38 @@
 //! * **Deadlines.** An answered handshake whose CONFIRM never comes expires
 //!   [`PENDING_TIMEOUT`] after it was answered; a session expires after
 //!   [`SESSION_IDLE_TIMEOUT`] without traffic; a callback grant expires at
-//!   the deadline it was given. All are checked against the injected
-//!   monotonic clock on every operation.
+//!   the deadline it was given (Unix seconds, so it survives a restart).
+//!   The first two use the injected monotonic clock, the third the injected
+//!   wall clock; all are checked on every operation.
+//!
+//! # Persist before reply
+//!
+//! A responder's [`Gate`] can be saved, encrypted, with
+//! [`Responder::export_snapshot`] and restored with
+//! [`Responder::restore_identity`] or [`Responder::restore_callback`]
+//! (format in [`crate::snapshot`]). A caller that keeps grant state across
+//! restarts must follow one rule: **after anything changes the gate, write
+//! a fresh snapshot durably (temporary file, flush, rename:
+//! [`crate::snapshot::write_atomically`]) before sending the frame that
+//! change produced.** In practice:
+//!
+//! * [`ResponderEvent::Established`]: the grant was committed (an
+//!   invitation consumed, a caller made a contact, a callback used). Persist,
+//!   then send its ACK. If the process dies before the snapshot is written,
+//!   no ACK went out and the restored gate still shows the grant unused, so
+//!   the caller's retry is answered as the first try was; once the ACK has
+//!   gone out, the consumption is on disk and a replay after a restart is
+//!   refused.
+//! * [`Responder::record_invitation`], [`Responder::block`],
+//!   [`Responder::unblock`], [`Responder::remove_contact`]: persist before
+//!   telling anyone the change was made.
+//! * A WELCOME ([`ResponderEvent::Reply`] to a HELLO) changes no persistent
+//!   state, so it needs no new snapshot.
+//!
+//! Live sessions and unconfirmed handshakes are not persisted; after a
+//! restart callers handshake again (a contact is let in by its grant). One
+//! device per identity: the snapshot is crash safety for a single device,
+//! not a way to share a gate between devices.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -68,6 +98,7 @@ use rand_core::{OsRng, RngCore};
 
 use crate::contact::{ContactError, ContactIdentity, Invitation, Network, StaticKey};
 use crate::gate::{Gate, Grant, Now};
+use crate::snapshot::{self, SnapshotError, StorageKey};
 use crate::session::{
     Handshake, Incoming, Session, SessionError, MAX_NOISE_MESSAGE, MAX_PLAINTEXT, MESSAGE1_LEN, MESSAGE2_LEN,
     MIN_SEALED, NONCE_LEN, REFERENCE_LEN,
@@ -528,13 +559,13 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     }
 
     /// A stranger's callback listener (reverse rendezvous): answers only
-    /// `caller` naming `reference`, until `deadline`.
+    /// `caller` naming `reference`, until `deadline` (Unix seconds).
     pub fn for_callback(
         callback: &StaticKey,
         network: Network,
         caller: [u8; 32],
         reference: [u8; REFERENCE_LEN],
-        deadline: Instant,
+        deadline: u64,
     ) -> Result<Self, ContactError> {
         let mut gate = Gate::new(network, None);
         gate.expect_callback(caller, reference, deadline)?;
@@ -551,6 +582,50 @@ impl<T: Hash + Eq + Clone> Responder<T> {
             routes: HashMap::new(),
             candidates: HashMap::new(),
         }
+    }
+
+    /// The gate's state, encrypted under `key` for this responder's network
+    /// with a fresh nonce. Write it durably before replying (see the module
+    /// documentation, "Persist before reply").
+    pub fn export_snapshot(&self, key: &StorageKey) -> Vec<u8> {
+        let plaintext = zeroize::Zeroizing::new(self.gate.encode());
+        snapshot::seal(key, &self.gate.network(), &plaintext)
+    }
+
+    /// A responder for `me` restored from a snapshot it exported. Fails
+    /// loudly (never an empty gate) on an unknown version, the wrong key or
+    /// network, a modified or truncated snapshot, or another identity's.
+    pub fn restore_identity(
+        me: &ContactIdentity,
+        network: Network,
+        key: &StorageKey,
+        saved: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        let gate = Self::restore_gate(network, key, saved)?;
+        if gate.issuer() != Some(me.signing_key()) {
+            return Err(SnapshotError::WrongIdentity);
+        }
+        Ok(Self::build(me.handshake_key().clone(), gate))
+    }
+
+    /// A callback listener restored from a snapshot it exported; as
+    /// [`Responder::restore_identity`], for a gate that issues nothing.
+    pub fn restore_callback(
+        callback: &StaticKey,
+        network: Network,
+        key: &StorageKey,
+        saved: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        let gate = Self::restore_gate(network, key, saved)?;
+        if gate.issuer().is_some() {
+            return Err(SnapshotError::WrongIdentity);
+        }
+        Ok(Self::build(callback.clone(), gate))
+    }
+
+    fn restore_gate(network: Network, key: &StorageKey, saved: &[u8]) -> Result<Gate, SnapshotError> {
+        let plaintext = snapshot::open(key, &network, saved)?;
+        Gate::decode(&plaintext, &network)
     }
 
     /// Replace the default caps.
@@ -604,9 +679,11 @@ impl<T: Hash + Eq + Clone> Responder<T> {
     }
 
     /// Drop answered handshakes past their deadline and sessions idle past
-    /// theirs. Runs at the start of every operation; drivers may also call
-    /// it on a timer.
+    /// theirs, and prune the gate of grants and revocations that can no
+    /// longer matter ([`Gate::prune`]). Runs at the start of every
+    /// operation; drivers may also call it on a timer.
     pub fn expire(&mut self, now: Now) -> Expired<T> {
+        self.gate.prune(now.unix);
         let mut out = Expired { pending: Vec::new(), sessions: Vec::new() };
         self.pending.retain(|(from, _), p| {
             let keep = now.mono < p.deadline;

@@ -223,7 +223,7 @@ section 2a prototype. Status after the fixes of 2026-11-20 in
 | R5 | Lost ACK: the demo stopped reading after its first ACK; a caller that moved to a higher attempt was welcomed but its CONFIRM was tested against the older live session | **Fixed.** A CONFIRM is matched first to the exact live attempt (resend the ACK, after a gate check), then to the matching pending attempt, which replaces the old session as a contact without using the invitation again. The demo's responders keep reading after establishing; `ANONYMUM_DROP_FIRST_ACK=1` drops the first ACK in a live run. Tests: the higher-attempt case and a driver loop under eight deterministic loss patterns |
 | R6 | Frame type, call id and attempt were outside the authenticated content | **Fixed.** Call id and attempt are in the IK prologue; every sealed record carries its type, and CONFIRM and ACK also carry call id and attempt, inside the ciphertext; a record whose inner type or labels do not match is refused without using up its counter. Data frames carry at most 65,518 bytes (one byte for the type) |
 | R7 | Bob's callback uses his card key (I16); the note signature is transferable (I27) | I16 **open, with the cryptographer**. I27 **prototyped, unreviewed** (deniable Noise X note, 2026-11-20; see I27) |
-| R8 | In-memory grant state; no idle or callback expiry; pending expiry only on receive timeouts | **Partly fixed.** Answered handshakes expire after `PENDING_TIMEOUT` (180 s), sessions after `SESSION_IDLE_TIMEOUT` (30 min) without traffic, callback grants at their deadline, all checked against an injected monotonic clock on every operation. **Open:** durable and multi-device grant state, crash recovery of an invitation consumed while its ACK is outstanding |
+| R8 | In-memory grant state; no idle or callback expiry; pending expiry only on receive timeouts | **Fixed for one device (2026-11-21, unreviewed).** Answered handshakes expire after `PENDING_TIMEOUT` (180 s) and sessions after `SESSION_IDLE_TIMEOUT` (30 min), on the monotonic clock, in memory only. Everything the gate keeps is now in Unix seconds (invitation expiries, callback deadlines, and the expiry of every revoked or consumed invitation id) and can be saved as an encrypted, versioned snapshot (`Responder::export_snapshot`, `restore_identity`, `restore_callback`; see below). Crash between commit and ACK: handled by the persist-before-reply rule in `wire.rs`. **Open:** multi-device grant state |
 | R9 | `Incoming::accept` could build a WELCOME without a gate | **Fixed.** The answering handshake types are crate-private; `Responder` is the only way to answer (compile-fail doc tests) |
 | R10 | `record_invitation` trusted its caller | **Fixed.** It checks issuer (our signing key), signature, network, holder key and expiry; a callback listener records none |
 | R11 | Responder and gate took the network separately | **Fixed.** `Responder::for_identity` / `for_callback` build the gate from the same network id |
@@ -245,11 +245,12 @@ Is that acceptable for IK and N here, or must the resolver fail closed?
 
 ## Open questions recorded 2026-11-20 (not to be solved yet)
 
-- **Durable and multi-device grant state** (review finding 8). Invitations
-  honoured, contacts, callbacks and blocks live in one process's memory.
-  What must survive a restart, how two devices of one person agree that an
-  invitation was used once, and how a crash between committing a grant and
-  delivering its ACK is recovered.
+- **Durable and multi-device grant state** (review finding 8). *Durable
+  state on one device: done 2026-11-21 (R8, MED-04 below).* Still open:
+  how two devices of one person agree that an invitation was used once.
+  The rule until then: one device per contact identity; a second device
+  gets its own identity (its own keys and invitations), never a copy of
+  another device's gate.
 - **Bob's callback uses his card's handshake key** (I16, review finding 7).
   A recorder of the callback's first message who later learns the callback
   secret learns Bob's key and the request reference. How should the
@@ -276,7 +277,7 @@ Status after the fixes of 2026-11-20:
 | A3 (MED-02) | Unchecked pallet arithmetic | **Fixed.** `Percent::mul_floor` for the fee split; checked adds for the expiry height and the id and sequence counters, returning `ArithmeticError::Overflow` and charging nothing. Tested at each boundary |
 | A4 (HIGH-02) | Sessions keyed by reply handle and unbounded; one caller could fill the pending table | **Fixed.** Candidate handles are capped at one per caller (a newer one replaces it) and are dropped with a caller evicted from a handle (tested: a CONFIRM replayed from 200 handles leaves one). Live sessions are keyed by the caller's authenticated key (one each) with a route table from reply handle to caller. Caps with named defaults: `MAX_PENDING` 1,024, `MAX_PENDING_PER_CALLER` 4, `MAX_SESSIONS` 1,024 (`Limits`). A repeated CONFIRM from a new handle gets the cached ACK there, but the session moves only when a fresh data frame from that handle decrypts, so a replayed CONFIRM cannot redirect replies. At the session cap a new caller is refused before its CONFIRM is opened and nothing is committed. Tests for each |
 | A5 (MED-01) | Unchecked send counter | **Fixed.** `Session::seal` uses nonces up to `u64::MAX - 1` and then refuses (`Exhausted`); Noise reserves only `u64::MAX`, so it cannot wrap. No rekeying |
-| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved** (see below and earlier sections: I8, I13, I27, R8) |
+| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21, see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
 | A7 (LOW-01) | Replace the random-secret key check with a list of small-order points | **Not done, by decision**: no hand-written list of bad points; the check stays on `x25519-dalek`'s `was_contributory` |
 
 **Where the audit is wrong or overstated (my reading, for the owner).**
@@ -457,4 +458,52 @@ fails instead of returning a shorter list. The layout is documented in
   ciphertext in the prologue" a sound hybrid here, compared with a
   standard hybrid KEM combiner (for example X-Wing) or `snow`'s
   non-default `hfs` feature?
+
+## Durable gate state: R8 and audit MED-04 (2026-11-21, unreviewed)
+
+`anonymum-crypto` can now save and restore a responder's grant state,
+encrypted, without any database dependency.
+- *Time:* the gate keeps only Unix seconds: invitation expiries, callback
+  deadlines (`Responder::for_callback` now takes Unix seconds), and for
+  every revoked or consumed invitation id the invitation's expiry. The
+  monotonic clock is used only for the wire layer's in-memory timeouts.
+- *Pruning:* `Gate::prune(now_secs)`, run by `Responder::expire` before
+  every operation, drops a revoked or consumed id once `now_secs >=
+  expires_at + CLOCK_SKEW_SECS` (300 s). By then the invitation itself no
+  longer verifies, so it cannot be recorded or used again (tested). Expired
+  unused invitations and callback grants past their deadline are dropped
+  too. A grant pruned at its deadline stays gone if the clock later reads
+  earlier.
+- *Snapshot:* `version (1, clear) || nonce (12) || ChaCha20-Poly1305
+  ciphertext || tag`, associated data `"anonymum/gate-snapshot/v1" ||
+  network`, a fresh random nonce each time, under a `StorageKey` (32 bytes,
+  wiped on drop, never printed). The plaintext repeats the version and the
+  network and lists issued and consumed invitations, revocations,
+  contacts, callback grants and blocks, sorted, with exact lengths. Crate
+  `chacha20poly1305` `=0.10.1`, already pinned in the lockfile for the
+  shielded model (no version moved).
+- *Fails loudly:* unknown version (`UnsupportedVersion`), too short
+  (`Truncated`), wrong key, wrong network or a modified or cut-short
+  ciphertext (`Undecryptable`: the AEAD cannot tell these apart), a bad
+  inner encoding (`Malformed`, `WrongNetwork`), another identity's or
+  another kind of responder's snapshot (`WrongIdentity`). A caller must
+  never start with an empty gate because a snapshot did not open.
+- *Persist before reply* (documented in `wire.rs`): after
+  `ResponderEvent::Established` (a grant committed) the caller writes the
+  snapshot durably (`snapshot::write_atomically`: temporary file, flush,
+  rename, and on Unix a directory flush) before sending the ACK; likewise
+  after recording an invitation, blocking, unblocking or removing a
+  contact. A WELCOME changes nothing persistent. A crash after the commit
+  but before the snapshot leaves the invitation unused on disk, and since
+  no ACK went out, the caller's retry is simply answered again (tested).
+- *Not persisted:* live sessions and unconfirmed handshakes; callers
+  handshake again after a restart.
+- *Tests* (`tests/snapshot.rs`, unit tests in `snapshot.rs`): round trip
+  across a restart; a consumed or revoked invitation refused after a
+  restore (and, as a control, accepted by a responder that lost its state);
+  the crash case; pruning at expiry plus skew; every loud failure; the
+  atomic write. Every new rule was broken once and a test caught it.
+- *Not done:* the demo does not persist its gate (its responders live for
+  one run); multi-device state (above); the storage key's own protection
+  (an operating-system key store) is the caller's job.
 

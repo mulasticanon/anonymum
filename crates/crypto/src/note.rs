@@ -532,7 +532,7 @@ mod tests {
     fn a_forger_with_the_inbox_secret_cannot_complete_the_callback() {
         use crate::gate::Now;
         use crate::wire::{Initiator, Responder, ResponderEvent, RetryPolicy, WireError};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
         let bob_card = bob.card(NET, 1, 0, 100);
@@ -546,7 +546,7 @@ mod tests {
             Initiator::start_with(bob.handshake_key(), opened.callback(), NET, opened.admission, RetryPolicy::default())
                 .unwrap();
         let now = Now { unix: NOW, mono: Instant::now() };
-        let deadline = now.mono + Duration::from_secs(60);
+        let deadline = now.unix + 60;
         // Mallory answers with any key she holds, here her own: nothing can
         // be read, so nothing is sent and no session forms.
         let mallory = StaticKey::generate();

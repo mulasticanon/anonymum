@@ -461,7 +461,7 @@ async fn stranger_side(
         NETWORK,
         recipient_card.handshake_key,
         reference,
-        Instant::now() + CALLBACK_WINDOW,
+        now_secs() + CALLBACK_WINDOW.as_secs(),
     )?;
     let (peer, tag, grant) =
         serve(&mut throwaway, &mut side, SERVE_PATIENCE).await?.ok_or("Bob's callback never finished")?;

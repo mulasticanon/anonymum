@@ -16,3 +16,6 @@ zeroize = "1.9.2"
 # BLAKE2s to commit to the ML-KEM key in the signed card.
 ml-kem = { version = "=0.3.3", features = ["getrandom", "zeroize"] }
 blake2 = "0.10.6"
+# AEAD for the encrypted gate snapshot; the same pinned version the
+# shielded model already uses (no lockfile change).
+chacha20poly1305 = "=0.10.1"

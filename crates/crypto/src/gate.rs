@@ -36,17 +36,37 @@
 //! side.gate_mut().block([1; 32]);
 //! ```
 //!
-//! State lives in memory only: durable and multi-device grant state is an
-//! open question (issues file, review finding 8).
+//! # Time and durability
+//!
+//! Everything the gate keeps is measured in Unix seconds, so it means the
+//! same after a restart: invitation expiries, callback deadlines, and the
+//! expiry of every revoked or consumed invitation id. (The wire layer's
+//! short timeouts for unconfirmed handshakes and idle sessions use a
+//! monotonic clock and are not persisted: after a restart callers simply
+//! handshake again.) A revoked or consumed id is kept until its invitation
+//! has expired plus [`CLOCK_SKEW_SECS`], after which the invitation itself
+//! no longer verifies, so [`Gate::prune`] may forget it.
+//!
+//! The gate's state can be saved and restored, encrypted, through
+//! [`crate::wire::Responder::export_snapshot`] and the `restore_*`
+//! constructors (see [`crate::snapshot`]); the responder documents when a
+//! caller must persist it (persist before reply). One device per contact
+//! identity: two devices sharing a gate's state are not supported.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::contact::{check_key, ContactError, Invitation, Network, Purpose};
+use crate::snapshot::{SnapshotError, GATE_SNAPSHOT_VERSION};
+
+/// How long past an invitation's expiry its revoked or consumed id is still
+/// kept, in case this machine's clock steps backwards.
+pub const CLOCK_SKEW_SECS: u64 = 300;
 
 /// The time, as the gate and the wire layer need it: wall-clock seconds for
-/// invitation expiry (an absolute date both sides can check) and a monotonic
-/// instant for deadlines. Tests inject both.
+/// everything the gate keeps (absolute dates that survive a restart) and a
+/// monotonic instant for the wire layer's in-memory timeouts. Tests inject
+/// both.
 #[derive(Clone, Copy, Debug)]
 pub struct Now {
     pub unix: u64,
@@ -71,19 +91,22 @@ pub enum Grant {
     Callback,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Gate {
     network: Network,
     /// Our contact signing key, if we issue invitations.
     issuer: Option<[u8; 32]>,
     /// Invitations we issued and have not honoured, by holder key.
     issued: HashMap<[u8; 32], Invitation>,
-    honoured: HashSet<[u8; 32]>,
-    /// Invitations cancelled by a block or a removal; never usable again.
-    revoked: HashSet<[u8; 32]>,
+    /// Consumed invitation id -> its expiry (Unix seconds).
+    honoured: HashMap<[u8; 32], u64>,
+    /// Invitations cancelled by a block or a removal, never usable again:
+    /// id -> its expiry (Unix seconds).
+    revoked: HashMap<[u8; 32], u64>,
     /// Caller key -> the reference its calls must name.
     contacts: HashMap<[u8; 32], [u8; 32]>,
-    /// Caller key -> (reference, deadline).
-    callbacks: HashMap<[u8; 32], ([u8; 32], Instant)>,
+    /// Caller key -> (reference, deadline in Unix seconds).
+    callbacks: HashMap<[u8; 32], ([u8; 32], u64)>,
     blocked: HashSet<[u8; 32]>,
 }
 
@@ -93,8 +116,8 @@ impl Gate {
             network,
             issuer,
             issued: HashMap::new(),
-            honoured: HashSet::new(),
-            revoked: HashSet::new(),
+            honoured: HashMap::new(),
+            revoked: HashMap::new(),
             contacts: HashMap::new(),
             callbacks: HashMap::new(),
             blocked: HashSet::new(),
@@ -111,7 +134,7 @@ impl Gate {
     pub(crate) fn record_invitation(&mut self, invitation: Invitation, now: Now) -> Result<(), ContactError> {
         let issuer = self.issuer.ok_or(ContactError::WrongIssuer)?;
         invitation.verify(&issuer, &self.network, now.unix)?;
-        if self.revoked.contains(&invitation.id) {
+        if self.revoked.contains_key(&invitation.id) {
             return Err(ContactError::Revoked);
         }
         self.issued.insert(invitation.holder, invitation);
@@ -119,12 +142,13 @@ impl Gate {
     }
 
     /// Accept a call from `caller` about the request `reference` until
-    /// `deadline` (the stranger's side of reverse rendezvous).
+    /// `deadline`, in Unix seconds (the stranger's side of reverse
+    /// rendezvous).
     pub(crate) fn expect_callback(
         &mut self,
         caller: [u8; 32],
         reference: [u8; 32],
-        deadline: Instant,
+        deadline: u64,
     ) -> Result<(), ContactError> {
         check_key(&caller)?;
         self.callbacks.insert(caller, (reference, deadline));
@@ -149,7 +173,7 @@ impl Gate {
 
     fn cancel_grants(&mut self, caller: &[u8; 32]) {
         if let Some(invitation) = self.issued.remove(caller) {
-            self.revoked.insert(invitation.id);
+            self.revoked.insert(invitation.id, invitation.expires_at);
         }
         self.callbacks.remove(caller);
     }
@@ -167,7 +191,30 @@ impl Gate {
     }
 
     pub fn is_honoured(&self, invitation_id: &[u8; 32]) -> bool {
-        self.honoured.contains(invitation_id)
+        self.honoured.contains_key(invitation_id)
+    }
+
+    pub fn is_revoked(&self, invitation_id: &[u8; 32]) -> bool {
+        self.revoked.contains_key(invitation_id)
+    }
+
+    /// Forget what can no longer matter at `now_secs`: revoked and consumed
+    /// ids once their invitation expired [`CLOCK_SKEW_SECS`] ago (it no
+    /// longer verifies, so it cannot be recorded or used again), unused
+    /// invitations once expired, and callback grants past their deadline.
+    /// Returns how many entries were dropped.
+    pub fn prune(&mut self, now_secs: u64) -> usize {
+        let before = self.len();
+        let keep = |expires_at: &mut u64| now_secs < expires_at.saturating_add(CLOCK_SKEW_SECS);
+        self.honoured.retain(|_, e| keep(e));
+        self.revoked.retain(|_, e| keep(e));
+        self.issued.retain(|_, invitation| now_secs < invitation.expires_at);
+        self.callbacks.retain(|_, (_, deadline)| now_secs < *deadline);
+        before - self.len()
+    }
+
+    fn len(&self) -> usize {
+        self.honoured.len() + self.revoked.len() + self.issued.len() + self.callbacks.len()
     }
 
     /// Is `caller` a current, unblocked contact for `reference`? Checked on
@@ -185,7 +232,7 @@ impl Gate {
             return Some(Grant::Contact);
         }
         if let Some((expected, deadline)) = self.callbacks.get(caller) {
-            if expected == reference && now.mono < *deadline {
+            if expected == reference && now.unix < *deadline {
                 return Some(Grant::Callback);
             }
         }
@@ -194,8 +241,8 @@ impl Gate {
             && invitation.network == self.network
             && invitation.purpose == Purpose::Contact
             && now.unix < invitation.expires_at
-            && !self.honoured.contains(&invitation.id)
-            && !self.revoked.contains(&invitation.id);
+            && !self.honoured.contains_key(&invitation.id)
+            && !self.revoked.contains_key(&invitation.id);
         usable.then_some(Grant::Invitation { id: invitation.id })
     }
 
@@ -209,8 +256,8 @@ impl Gate {
         }
         match grant {
             Grant::Invitation { id } => {
-                self.honoured.insert(id);
-                self.issued.remove(caller);
+                let expires_at = self.issued.remove(caller).map_or(u64::MAX, |i| i.expires_at);
+                self.honoured.insert(id, expires_at);
             }
             Grant::Callback => {
                 self.callbacks.remove(caller);
@@ -219,5 +266,154 @@ impl Gate {
         }
         self.contacts.insert(*caller, *reference);
         true
+    }
+}
+
+// ---- snapshot encoding -------------------------------------------------------
+
+/// The plaintext of a gate snapshot, format version 1. All integers are
+/// big-endian; every table is sorted by key, so equal gates encode equally.
+///
+/// ```text
+/// version (1)  network (32)  issuer flag (1) [issuer (32)]
+/// issued:    u32 count, each an Invitation (Invitation::LEN bytes)
+/// honoured:  u32 count, each id (32) || expires_at (8)
+/// revoked:   u32 count, each id (32) || expires_at (8)
+/// contacts:  u32 count, each caller (32) || reference (32)
+/// callbacks: u32 count, each caller (32) || reference (32) || deadline (8)
+/// blocked:   u32 count, each caller (32)
+/// ```
+impl Gate {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        fn sorted<K: Ord + Copy, V>(map: &HashMap<K, V>) -> Vec<(K, &V)> {
+            let mut out: Vec<(K, &V)> = map.iter().map(|(k, v)| (*k, v)).collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        }
+        fn count(out: &mut Vec<u8>, n: usize) {
+            out.extend_from_slice(&u32::try_from(n).expect("table fits u32").to_be_bytes());
+        }
+        let mut out = vec![GATE_SNAPSHOT_VERSION];
+        out.extend_from_slice(&self.network);
+        match self.issuer {
+            Some(issuer) => {
+                out.push(1);
+                out.extend_from_slice(&issuer);
+            }
+            None => out.push(0),
+        }
+        count(&mut out, self.issued.len());
+        for (_, invitation) in sorted(&self.issued) {
+            out.extend_from_slice(&invitation.to_bytes());
+        }
+        for table in [&self.honoured, &self.revoked] {
+            count(&mut out, table.len());
+            for (id, expires_at) in sorted(table) {
+                out.extend_from_slice(&id);
+                out.extend_from_slice(&expires_at.to_be_bytes());
+            }
+        }
+        count(&mut out, self.contacts.len());
+        for (caller, reference) in sorted(&self.contacts) {
+            out.extend_from_slice(&caller);
+            out.extend_from_slice(reference);
+        }
+        count(&mut out, self.callbacks.len());
+        for (caller, (reference, deadline)) in sorted(&self.callbacks) {
+            out.extend_from_slice(&caller);
+            out.extend_from_slice(reference);
+            out.extend_from_slice(&deadline.to_be_bytes());
+        }
+        let mut blocked: Vec<&[u8; 32]> = self.blocked.iter().collect();
+        blocked.sort();
+        count(&mut out, blocked.len());
+        for caller in blocked {
+            out.extend_from_slice(caller);
+        }
+        out
+    }
+
+    /// A gate from its encoding, for `network`. Strict: every byte must be
+    /// accounted for, and the encoded network must match.
+    pub(crate) fn decode(bytes: &[u8], network: &Network) -> Result<Gate, SnapshotError> {
+        let mut r = Reader { bytes, at: 0 };
+        let version = r.u8()?;
+        if version != GATE_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        if &r.array::<32>()? != network {
+            return Err(SnapshotError::WrongNetwork);
+        }
+        let issuer = match r.u8()? {
+            0 => None,
+            1 => Some(r.array::<32>()?),
+            _ => return Err(SnapshotError::Malformed),
+        };
+        let mut gate = Gate::new(*network, issuer);
+        for _ in 0..r.count()? {
+            let invitation = Invitation::from_bytes(r.take(Invitation::LEN)?).map_err(|_| SnapshotError::Malformed)?;
+            if invitation.network != *network || gate.issued.insert(invitation.holder, invitation).is_some() {
+                return Err(SnapshotError::Malformed);
+            }
+        }
+        for table in [&mut gate.honoured, &mut gate.revoked] {
+            for _ in 0..r.count()? {
+                let (id, expires_at) = (r.array::<32>()?, r.u64()?);
+                if table.insert(id, expires_at).is_some() {
+                    return Err(SnapshotError::Malformed);
+                }
+            }
+        }
+        for _ in 0..r.count()? {
+            let (caller, reference) = (r.array::<32>()?, r.array::<32>()?);
+            if gate.contacts.insert(caller, reference).is_some() {
+                return Err(SnapshotError::Malformed);
+            }
+        }
+        for _ in 0..r.count()? {
+            let (caller, reference, deadline) = (r.array::<32>()?, r.array::<32>()?, r.u64()?);
+            if gate.callbacks.insert(caller, (reference, deadline)).is_some() {
+                return Err(SnapshotError::Malformed);
+            }
+        }
+        for _ in 0..r.count()? {
+            if !gate.blocked.insert(r.array::<32>()?) {
+                return Err(SnapshotError::Malformed);
+            }
+        }
+        if r.at != bytes.len() {
+            return Err(SnapshotError::Malformed);
+        }
+        Ok(gate)
+    }
+
+    pub(crate) fn issuer(&self) -> Option<[u8; 32]> {
+        self.issuer
+    }
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+        let end = self.at.checked_add(n).filter(|end| *end <= self.bytes.len()).ok_or(SnapshotError::Malformed)?;
+        let out = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(out)
+    }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], SnapshotError> {
+        Ok(self.take(N)?.try_into().expect("N bytes"))
+    }
+    fn u8(&mut self) -> Result<u8, SnapshotError> {
+        Ok(self.array::<1>()?[0])
+    }
+    fn u64(&mut self) -> Result<u64, SnapshotError> {
+        Ok(u64::from_be_bytes(self.array()?))
+    }
+    fn count(&mut self) -> Result<u32, SnapshotError> {
+        Ok(u32::from_be_bytes(self.array()?))
     }
 }

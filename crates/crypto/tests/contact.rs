@@ -314,7 +314,7 @@ fn offline_carol_accepts_only_bobs_callback() {
 
     // Carol's throwaway side answers only Bob's handshake key, about this
     // request. It is offline: frames queue at her gateway.
-    let deadline = Instant::now() + Duration::from_secs(3_600);
+    let deadline = NOW + 3_600;
     let mut carol_side: Responder<u32> =
         Responder::for_callback(callback, NET, card.handshake_key, admission, deadline).unwrap();
     let mut gateway: VecDeque<(u32, Vec<u8>)> = VecDeque::new();
@@ -386,7 +386,7 @@ fn record_invitation_checks_what_it_is_given() {
         NET,
         bob.handshake_key().public(),
         [1; 32],
-        Instant::now() + Duration::from_secs(60),
+        NOW + 60,
     )
     .unwrap();
     let good = bob.invite(NET, holder, Purpose::Contact, NOW + 60);
@@ -407,16 +407,20 @@ fn responder_and_gate_share_one_network() {
 fn a_callback_grant_expires_at_its_deadline_and_nothing_is_sent() {
     let bob = ContactIdentity::generate();
     let callback = StaticKey::generate();
-    let start = Instant::now();
-    let deadline = start + Duration::from_secs(600);
+    let deadline = NOW + 600;
     let mut carol_side: Responder<u32> =
         Responder::for_callback(&callback, NET, bob.handshake_key().public(), [1; 32], deadline).unwrap();
     let (_, hello) = Initiator::start_with(bob.handshake_key(), callback.public(), NET, [1; 32], POLICY).unwrap();
-    let late = Now { unix: NOW, mono: deadline };
+    let late = Now { unix: deadline, mono: Instant::now() };
     assert!(matches!(carol_side.handle(7, &hello, late), Err(WireError::Unauthorised)));
     assert_eq!(carol_side.pending(), 0);
-    let early = Now { unix: NOW, mono: deadline - Duration::from_secs(1) };
-    assert!(matches!(carol_side.handle(7, &hello, early), Ok(ResponderEvent::Reply(_))));
+    // Past its deadline the grant is pruned for good, even if the clock
+    // later reads earlier; a listener that was not yet past it answers.
+    let early = Now { unix: deadline - 1, mono: Instant::now() };
+    assert!(matches!(carol_side.handle(7, &hello, early), Err(WireError::Unauthorised)));
+    let mut fresh: Responder<u32> =
+        Responder::for_callback(&callback, NET, bob.handshake_key().public(), [1; 32], deadline).unwrap();
+    assert!(matches!(fresh.handle(7, &hello, early), Ok(ResponderEvent::Reply(_))));
     // A small-order caller key cannot be expected at all.
     assert!(Responder::<u32>::for_callback(&callback, NET, [0; 32], [1; 32], deadline).is_err());
 }
@@ -498,7 +502,7 @@ fn blocking_cancels_grants_and_unblocking_restores_none() {
 fn removing_the_recipient_cancels_an_outstanding_callback_grant() {
     let bob = ContactIdentity::generate();
     let callback = StaticKey::generate();
-    let deadline = Instant::now() + Duration::from_secs(3_600);
+    let deadline = NOW + 3_600;
     let mut carol_side: Responder<u32> =
         Responder::for_callback(&callback, NET, bob.handshake_key().public(), [1; 32], deadline).unwrap();
     carol_side.remove_contact(bob.handshake_key().public());

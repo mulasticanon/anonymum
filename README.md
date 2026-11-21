@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation. **The handshake and note format have not been reviewed.** | 106 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; encrypted, versioned snapshots of grant state (one device). **The handshake, note format and snapshot have not been reviewed.** | 115 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, and a versioned recovery copy. | 61 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -336,8 +336,10 @@ I14).
   not: its public API offers no hook. Open for the cryptographer.
 - Whether a caller can tell an authorised refusal from an unauthorised one
   by timing has not been measured.
-- Grant state (invitations used, contacts, blocks) is in memory only: no
-  durable or multi-device guarantee yet.
+- Grant state (invitations used, contacts, blocks, callbacks) can be saved
+  as an encrypted snapshot and must be written before each reply that
+  follows a change (one device only; the demo does not persist it). There
+  is no multi-device guarantee.
 - Forward secrecy is per session, not per message. Sessions should be
   renewed often; a double ratchet would do this automatically.
 - Reading an IK first message costs the answerer two key agreements before
