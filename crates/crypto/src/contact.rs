@@ -12,6 +12,15 @@
 //!   `ml-kem` crate) is combined with the inbox key in the hybrid note (v5).
 //!   The handshake key has no post-quantum counterpart yet.
 //!
+//! The signing and handshake keys are long-lived. The two inbox keys are
+//! not: they belong to an [`InboxEpoch`] on a shared weekly grid and are
+//! rotated ([`ContactIdentity::rotate_inbox`]). The identity keeps at most
+//! two epochs, the active one (published on the card) and one draining
+//! epoch that can still open notes until its end plus [`DRAIN_GRACE`];
+//! after that [`ContactIdentity::purge_expired_inbox`] drops it, and notes
+//! sealed to it can no longer be read by anyone who later takes the device
+//! (forward secrecy for notes, audit CRIT-02; unreviewed).
+//!
 //! Callers use *caller keys* ([`StaticKey`]) scoped to one relationship or
 //! one request; an invitation is issued to such a holder key.
 //!
@@ -119,6 +128,116 @@ pub(crate) fn check_key(public: &[u8; 32]) -> Result<(), ContactError> {
     }
 }
 
+// ---- inbox epochs -----------------------------------------------------------------
+
+/// Length of an inbox epoch: one week. Epochs start at multiples of this
+/// (Unix seconds), the same grid for everyone, so a card's validity does
+/// not reveal when its owner created or rotated it.
+pub const EPOCH_LEN: u64 = 7 * 86_400;
+
+/// How far a card's `not_before` lies before its epoch's start. The chain
+/// stamps a request's `created_at` as the start of the clock-grid window
+/// that holds its block (spec P11), which can be earlier than the moment
+/// the card was made; the widest window P11 allows is 24 hours (it must
+/// divide 24 hours). Backdating by a full day means a freshly made card is
+/// always valid at the floored `created_at` of a note sealed with it, and
+/// also absorbs a sender clock that runs up to a day ahead.
+pub const CLOCK_GRID_BACKDATE: u64 = 86_400;
+
+/// How long after an epoch's `not_after` its inbox secrets are kept: the
+/// 24-hour request lifetime (decision D2) plus 2 hours for gateway delivery
+/// and clock skew. A note sealed to the card at its last valid moment can
+/// be answered until its request expires, and opened for 2 hours more.
+pub const DRAIN_GRACE: u64 = 24 * 3600 + 2 * 3600;
+
+/// The start of the epoch that holds `now_secs`.
+pub fn epoch_start(now_secs: u64) -> u64 {
+    now_secs - now_secs % EPOCH_LEN
+}
+
+const IDENTITY_VERSION: u8 = 1;
+const EPOCH_BYTES: usize = 32 + PQ_SEED_LEN + 8 + 8;
+/// The longest stored identity: both epochs.
+const IDENTITY_MAX_LEN: usize = 1 + 64 + EPOCH_BYTES + 1 + EPOCH_BYTES;
+
+/// One epoch's inbox keys: the X25519 inbox key and the ML-KEM-768 seed,
+/// and the validity a card for them carries. Both secrets are held in
+/// zeroizing buffers, so dropping an epoch wipes them from memory.
+pub struct InboxEpoch {
+    inbox: StaticKey,
+    pq_seed: Zeroizing<[u8; PQ_SEED_LEN]>,
+    not_before: u64,
+    not_after: u64,
+}
+
+impl InboxEpoch {
+    /// Fresh keys for the epoch that holds `now_secs`, valid from
+    /// [`CLOCK_GRID_BACKDATE`] before its start until its end.
+    pub fn generate_at(now_secs: u64) -> Self {
+        let start = epoch_start(now_secs);
+        let mut pq_seed = Zeroizing::new([0u8; PQ_SEED_LEN]);
+        OsRng.fill_bytes(pq_seed.as_mut());
+        InboxEpoch {
+            inbox: StaticKey::generate(),
+            pq_seed,
+            not_before: start.saturating_sub(CLOCK_GRID_BACKDATE),
+            not_after: start.saturating_add(EPOCH_LEN),
+        }
+    }
+
+    /// Restore from storage. The validity must be a non-empty interval.
+    pub fn from_secret_bytes(
+        inbox: [u8; 32],
+        pq_seed: [u8; PQ_SEED_LEN],
+        not_before: u64,
+        not_after: u64,
+    ) -> Result<Self, ContactError> {
+        if not_before >= not_after {
+            return Err(ContactError::Malformed);
+        }
+        Ok(InboxEpoch { inbox: StaticKey::from_bytes(inbox), pq_seed: Zeroizing::new(pq_seed), not_before, not_after })
+    }
+
+    /// The two secrets and the validity, for encrypted storage. Handle with care.
+    pub fn to_secret_bytes(&self) -> ([u8; 32], [u8; PQ_SEED_LEN], u64, u64) {
+        (self.inbox.to_bytes(), *self.pq_seed, self.not_before, self.not_after)
+    }
+
+    pub fn not_before(&self) -> u64 {
+        self.not_before
+    }
+
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
+
+    pub fn inbox_key(&self) -> &StaticKey {
+        &self.inbox
+    }
+
+    fn pq_decapsulation_key(&self) -> DecapsulationKey768 {
+        DecapsulationKey768::from_seed((*self.pq_seed).into())
+    }
+
+    /// The post-quantum inbox key (ML-KEM-768 encapsulation key) for the card.
+    pub fn pq_inbox_key(&self) -> [u8; PQ_KEY_LEN] {
+        self.pq_decapsulation_key().encapsulation_key().to_bytes().into()
+    }
+
+    /// The shared secret in `ciphertext`, as ML-KEM decapsulates it (an
+    /// unrelated value for a ciphertext not made for this key: FIPS 203's
+    /// implicit rejection).
+    pub(crate) fn pq_decapsulate(&self, ciphertext: &[u8; PQ_CIPHERTEXT_LEN]) -> [u8; 32] {
+        self.pq_decapsulation_key().decapsulate(&(*ciphertext).into()).into()
+    }
+}
+
+impl fmt::Debug for InboxEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "InboxEpoch({:?}, [{}, {}))", self.inbox, self.not_before, self.not_after)
+    }
+}
+
 /// Largest price a card may quote: the shielded design's amounts are
 /// unsigned 64-bit (spec section 3).
 pub const MAX_PRICE: Amount = u64::MAX as Amount;
@@ -156,57 +275,136 @@ impl fmt::Debug for StaticKey {
     }
 }
 
-/// A contact identity: signing, handshake and inbox keys, and the seed of
-/// the post-quantum inbox key.
+/// A contact identity: the long-lived signing and handshake keys, and a
+/// ring of at most two inbox epochs (the active one and one draining).
 pub struct ContactIdentity {
     signing: SigningKey,
     handshake: StaticKey,
-    inbox: StaticKey,
-    pq_seed: Zeroizing<[u8; PQ_SEED_LEN]>,
+    active: InboxEpoch,
+    draining: Option<InboxEpoch>,
 }
 
 impl ContactIdentity {
-    pub fn generate() -> Self {
-        let mut pq_seed = Zeroizing::new([0u8; PQ_SEED_LEN]);
-        OsRng.fill_bytes(pq_seed.as_mut());
+    /// A new identity whose first inbox epoch holds `now_secs`.
+    pub fn generate_at(now_secs: u64) -> Self {
         ContactIdentity {
             signing: SigningKey::generate(&mut OsRng),
             handshake: StaticKey::generate(),
-            inbox: StaticKey::generate(),
-            pq_seed,
+            active: InboxEpoch::generate_at(now_secs),
+            draining: None,
         }
     }
 
-    /// Restore from the four secrets (signing, handshake, inbox, and the
-    /// 64-byte seed of the post-quantum inbox key).
-    pub fn from_secret_bytes(signing: [u8; 32], handshake: [u8; 32], inbox: [u8; 32], pq_seed: [u8; PQ_SEED_LEN]) -> Self {
+    /// Restore from the signing and handshake secrets and the inbox ring.
+    pub fn from_parts(signing: [u8; 32], handshake: [u8; 32], active: InboxEpoch, draining: Option<InboxEpoch>) -> Self {
         ContactIdentity {
             signing: SigningKey::from_bytes(&signing),
             handshake: StaticKey::from_bytes(handshake),
-            inbox: StaticKey::from_bytes(inbox),
-            pq_seed: Zeroizing::new(pq_seed),
+            active,
+            draining,
         }
     }
 
-    /// The four secrets, for encrypted storage. Handle with care.
-    pub fn to_secret_bytes(&self) -> ([u8; 32], [u8; 32], [u8; 32], [u8; PQ_SEED_LEN]) {
-        (self.signing.to_bytes(), self.handshake.to_bytes(), self.inbox.to_bytes(), *self.pq_seed)
+    /// The signing and handshake secrets, for encrypted storage (the inbox
+    /// epochs are stored through [`Self::active`] and [`Self::draining`]).
+    /// Handle with care.
+    pub fn root_secret_bytes(&self) -> ([u8; 32], [u8; 32]) {
+        (self.signing.to_bytes(), self.handshake.to_bytes())
     }
 
-    fn pq_decapsulation_key(&self) -> DecapsulationKey768 {
-        DecapsulationKey768::from_seed((*self.pq_seed).into())
+    /// Everything, for encrypted storage, in one versioned encoding:
+    /// `version (1) || signing (32) || handshake (32) || active epoch ||
+    /// draining flag (1) [|| draining epoch]`, an epoch being `inbox (32) ||
+    /// post-quantum seed (64) || not_before (8) || not_after (8)`, integers
+    /// big-endian. Handle with care: the buffer is wiped when dropped.
+    pub fn to_secret_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(IDENTITY_MAX_LEN));
+        out.push(IDENTITY_VERSION);
+        out.extend_from_slice(&self.signing.to_bytes());
+        out.extend_from_slice(self.handshake.secret());
+        let mut epoch = |e: &InboxEpoch| {
+            out.extend_from_slice(e.inbox.secret());
+            out.extend_from_slice(e.pq_seed.as_ref());
+            out.extend_from_slice(&e.not_before.to_be_bytes());
+            out.extend_from_slice(&e.not_after.to_be_bytes());
+        };
+        epoch(&self.active);
+        if let Some(d) = &self.draining {
+            epoch(d);
+        }
+        out.insert(1 + 64 + EPOCH_BYTES, self.draining.is_some() as u8);
+        out
     }
 
-    /// The post-quantum inbox key (ML-KEM-768 encapsulation key) for the card.
+    /// Restore what [`Self::to_secret_bytes`] wrote. Strict: an unknown
+    /// version, flag or length, or an empty validity, is refused.
+    pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self, ContactError> {
+        let flag_at = 1 + 64 + EPOCH_BYTES;
+        if bytes.len() <= flag_at || bytes[0] != IDENTITY_VERSION {
+            return Err(ContactError::Malformed);
+        }
+        let expected = match bytes[flag_at] {
+            0 => flag_at + 1,
+            1 => IDENTITY_MAX_LEN,
+            _ => return Err(ContactError::Malformed),
+        };
+        if bytes.len() != expected {
+            return Err(ContactError::Malformed);
+        }
+        let epoch = |at: usize| {
+            let mut at = at;
+            let inbox = take(bytes, &mut at);
+            let seed = Zeroizing::new(take::<PQ_SEED_LEN>(bytes, &mut at));
+            let not_before = u64::from_be_bytes(take(bytes, &mut at));
+            let not_after = u64::from_be_bytes(take(bytes, &mut at));
+            InboxEpoch::from_secret_bytes(inbox, *seed, not_before, not_after)
+        };
+        let mut at = 1;
+        let signing = Zeroizing::new(take::<32>(bytes, &mut at));
+        let handshake = Zeroizing::new(take::<32>(bytes, &mut at));
+        let active = epoch(at)?;
+        let draining = if bytes[flag_at] == 1 { Some(epoch(flag_at + 1)?) } else { None };
+        Ok(Self::from_parts(*signing, *handshake, active, draining))
+    }
+
+    /// The epoch whose keys the card publishes.
+    pub fn active(&self) -> &InboxEpoch {
+        &self.active
+    }
+
+    /// The previous epoch, while it is kept.
+    pub fn draining(&self) -> Option<&InboxEpoch> {
+        self.draining.as_ref()
+    }
+
+    /// Start a new inbox epoch for `now_secs`: the active epoch becomes the
+    /// draining one, and an older draining epoch is dropped at once (its
+    /// secrets wiped), whatever its grace left. Publish a new card after.
+    pub fn rotate_inbox(&mut self, now_secs: u64) {
+        let previous = std::mem::replace(&mut self.active, InboxEpoch::generate_at(now_secs));
+        let oldest = self.draining.replace(previous);
+        drop(oldest);
+    }
+
+    /// Drop the draining epoch (wiping its secrets) once `now_secs` has
+    /// reached its `not_after` plus [`DRAIN_GRACE`]. Returns whether it did.
+    pub fn purge_expired_inbox(&mut self, now_secs: u64) -> bool {
+        if self.draining.as_ref().is_some_and(|d| now_secs >= d.not_after.saturating_add(DRAIN_GRACE)) {
+            let expired = self.draining.take();
+            drop(expired);
+            return true;
+        }
+        false
+    }
+
+    /// The draining epoch, if it may still open notes at `now_secs`.
+    pub(crate) fn draining_at(&self, now_secs: u64) -> Option<&InboxEpoch> {
+        self.draining.as_ref().filter(|d| now_secs < d.not_after.saturating_add(DRAIN_GRACE))
+    }
+
+    /// The active epoch's post-quantum inbox key.
     pub fn pq_inbox_key(&self) -> [u8; PQ_KEY_LEN] {
-        self.pq_decapsulation_key().encapsulation_key().to_bytes().into()
-    }
-
-    /// The shared secret in `ciphertext`, as ML-KEM decapsulates it (an
-    /// unrelated value for a ciphertext not made for this key: FIPS 203's
-    /// implicit rejection).
-    pub(crate) fn pq_decapsulate(&self, ciphertext: &[u8; PQ_CIPHERTEXT_LEN]) -> [u8; 32] {
-        self.pq_decapsulation_key().decapsulate(&(*ciphertext).into()).into()
+        self.active.pq_inbox_key()
     }
 
     /// The public contact signing key: who this contact is.
@@ -218,23 +416,32 @@ impl ContactIdentity {
         &self.handshake
     }
 
+    /// The active epoch's inbox key.
     pub fn inbox_key(&self) -> &StaticKey {
-        &self.inbox
+        self.active.inbox_key()
     }
 
     pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing.sign(message).to_bytes()
     }
 
-    /// A signed card to hand out or list, for one network: keys, price,
-    /// validity `[not_before, not_after)` in seconds.
-    pub fn card(&self, network: Network, price: Amount, not_before: u64, not_after: u64) -> ContactCard {
+    /// A signed card to hand out or list, for one network: keys, price, and
+    /// the active epoch's validity (backdated start, epoch end).
+    pub fn card(&self, network: Network, price: Amount) -> ContactCard {
+        self.card_within(network, price, self.active.not_before, self.active.not_after)
+    }
+
+    /// A card whose validity is `[not_before, not_after)` narrowed to the
+    /// active epoch's: a card never outlives the inbox keys it publishes.
+    pub fn card_within(&self, network: Network, price: Amount, not_before: u64, not_after: u64) -> ContactCard {
+        let not_before = not_before.max(self.active.not_before);
+        let not_after = not_after.min(self.active.not_after);
         let mut card = ContactCard {
             network,
             signing_key: self.signing_key(),
             handshake_key: self.handshake.public(),
-            inbox_key: self.inbox.public(),
-            pq_inbox_key: self.pq_inbox_key(),
+            inbox_key: self.active.inbox.public(),
+            pq_inbox_key: self.active.pq_inbox_key(),
             price,
             not_before,
             not_after,
@@ -539,7 +746,7 @@ pub(crate) mod tests {
 
     /// A card signed over arbitrary keys, as a malicious holder could make.
     fn signed_card(id: &ContactIdentity, handshake: [u8; 32], inbox: [u8; 32], price: Amount) -> ContactCard {
-        let mut card = id.card(NET, price, 0, 100);
+        let mut card = id.card_within(NET, price, 0, 100);
         card.handshake_key = handshake;
         card.inbox_key = inbox;
         card.signature = id.sign(&card.summary().signed_bytes());
@@ -558,7 +765,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_signed_card_with_a_small_order_key_is_refused() {
-        let id = ContactIdentity::generate();
+        let id = ContactIdentity::generate_at(0);
         let good = StaticKey::generate().public();
         for weak in SMALL_ORDER {
             assert_eq!(signed_card(&id, weak, good, 1).verify(&NET, 50), Err(ContactError::WeakKey));
@@ -571,18 +778,18 @@ pub(crate) mod tests {
     fn a_signed_card_with_an_invalid_post_quantum_key_is_refused() {
         // Signed by its holder, so only the FIPS 203 input check catches it:
         // coefficients of 0xFFF are not below the ML-KEM modulus.
-        let id = ContactIdentity::generate();
-        let mut card = id.card(NET, 1, 0, 100);
+        let id = ContactIdentity::generate_at(0);
+        let mut card = id.card_within(NET, 1, 0, 100);
         card.pq_inbox_key = [0xFF; PQ_KEY_LEN];
         card.signature = id.sign(&card.summary().signed_bytes());
         assert_eq!(card.summary().verify(&NET, 50), Ok(()), "the signature itself is fine");
         assert_eq!(card.verify(&NET, 50), Err(ContactError::BadPqKey));
-        assert_eq!(id.card(NET, 1, 0, 100).verify(&NET, 50), Ok(()));
+        assert_eq!(id.card_within(NET, 1, 0, 100).verify(&NET, 50), Ok(()));
     }
 
     #[test]
     fn a_card_price_must_fit_64_bits() {
-        let id = ContactIdentity::generate();
+        let id = ContactIdentity::generate_at(0);
         let (h, i) = (StaticKey::generate().public(), StaticKey::generate().public());
         assert_eq!(signed_card(&id, h, i, MAX_PRICE).verify(&NET, 50), Ok(()));
         assert_eq!(signed_card(&id, h, i, MAX_PRICE + 1).verify(&NET, 50), Err(ContactError::PriceOutOfRange));
@@ -591,7 +798,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_invitation_to_a_small_order_holder_key_is_refused() {
-        let id = ContactIdentity::generate();
+        let id = ContactIdentity::generate_at(0);
         for weak in SMALL_ORDER {
             let invitation = id.invite(NET, weak, Purpose::Contact, 100);
             assert_eq!(invitation.verify(&id.signing_key(), &NET, 50), Err(ContactError::WeakKey));

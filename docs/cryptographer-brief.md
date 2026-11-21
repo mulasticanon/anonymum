@@ -156,7 +156,7 @@ composition and whether it answers questions 11 and 12:
   is no per-request callback key any more, so a later compromise of the
   sender's handshake key reveals the recipient's card key and the request
   reference from a recorded callback message. (3) Forward secrecy for notes
-  is still open.
+  now comes from rotating the inbox keys (below).
 - `invite.rs`: the transparent chain's one-time invites (Ed25519), kept.
 - Since the source review of cdad354 (`docs/source-review-cdad354-2026-11-20.md`,
   AI-written): revocation is atomic, received X25519 keys are checked for
@@ -166,7 +166,7 @@ composition and whether it answers questions 11 and 12:
   handshakes, idle sessions and callback grants expire by deadline.
 - **Also for you** (issues file, "AI-written audit of 3f7092d"): no
   forward secrecy for notes sealed to a long-lived inbox key (inbox key
-  rotation as a candidate mitigation); no delay between claim finality and
+  rotation, now prototyped as weekly epochs, above); no delay between claim finality and
   the callback; dummy payload slots that must be indistinguishable from
   real ones (slot sizes now proposed: two 200-byte coin slots and one
   1,787-byte stranger slot, I24);
@@ -208,6 +208,39 @@ composition and whether it answers questions 11 and 12:
   invitation ids are pruned at expiry plus 300 s of clock skew, and the
   gate keeps a persisted clock floor so a clock set back cannot revive
   them (a clock that once ran ahead keeps the gate in that future).
+- **Inbox key rotation** (issues file, "Inbox key rotation"; 2026-11-21,
+  unreviewed): the forward-secrecy half of CRIT-02. The signing and
+  handshake keys stay long-lived; the X25519 inbox key and the ML-KEM-768
+  seed belong to an epoch on a shared weekly grid (`EPOCH_LEN`, epochs start
+  at multiples of 7 days in Unix seconds). A contact identity keeps two
+  slots: the active epoch (on the card, valid from one day before the
+  epoch starts, `CLOCK_GRID_BACKDATE`, until it ends) and one draining
+  epoch. `rotate_inbox` moves active to draining and drops any older
+  draining epoch at once; `purge_expired_inbox` drops the draining epoch at
+  its end plus 26 hours (`DRAIN_GRACE`: the 24-hour request lifetime plus
+  2 hours of delivery and clock grace); `open_note` tries the active keys,
+  then the draining keys while that grace lasts. Secrets sit in zeroizing
+  buffers (the `ml-kem` decapsulation key is built per use with its
+  `zeroize` feature); copies inside `snow`'s handshake state during an
+  open are outside our control. **For you:** is a week the right epoch, is
+  wiping on drop enough on the devices we target (swap, backups, the
+  operating system's own copies), and should the handshake key rotate too
+  (it is long-lived, so the callback still has no forward secrecy)?
+- **Two open items on the proof binding** (recorded 2026-11-21, yours to
+  decide): (1) `stranger_note_hash` should be computed *outside* the
+  circuit with an ordinary hash (BLAKE2s, as the model uses, or SHA-256)
+  and enter the proof only as a public input, so the 1,787 slot bytes are
+  never hashed in-circuit; which hash, and who computes it (the chain on
+  inclusion, the verifier, or both). (2) Everything the proof must commit
+  to (nullifiers, commitments, the two coin slots, `stranger_note_hash`,
+  the admission commitment, fee and validity window) could be bound
+  through one whole-transaction sighash digest that enters Groth16 as a
+  single public input (or two field elements for 256 bits), instead of
+  many separate inputs, each of which costs the verifier a scalar
+  multiplication. The model's `PublicTx::digest` stands in for this. Is a
+  single digest sound here (domain separation, how a 256-bit digest maps
+  to the scalar field), and what must stay a separate public input
+  (nullifiers, so the chain can check double spends)?
 - **Open questions for you** (issues file, "Open questions recorded
   2026-11-20"): multi-device grant state; Bob's callback using
   the handshake key on his card (I16); timing equivalence between authorised and unauthorised
@@ -216,7 +249,8 @@ composition and whether it answers questions 11 and 12:
 - Known limits: IK's replayable message 1 (a still-authorised caller's
   recorded message 1 gets a reply: an availability signal, question 11);
   IK's weaker caller privacy if the answerer's handshake key leaks; notes
-  (Noise X) have no forward secrecy for the inbox key; the ephemeral key in a note is
+  (Noise X) get forward secrecy only from inbox rotation (a seized device
+  reads notes to the epochs it still holds: up to a week plus 26 hours); the ephemeral key in a note is
   a raw X25519 point (question 12); forward secrecy per session only; no
   post-quantum key exchange; nothing audited. Questions raised while
   building it are I15-I27 in the issues file.

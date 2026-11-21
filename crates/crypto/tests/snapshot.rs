@@ -39,7 +39,7 @@ fn invite(bob: &ContactIdentity, key: &StaticKey, expires_at: u64) -> Invitation
 
 #[test]
 fn a_restored_responder_keeps_contacts_blocks_callbacks_and_revocations() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
     let peer = bob.handshake_key().public();
@@ -94,7 +94,7 @@ fn a_restored_responder_keeps_contacts_blocks_callbacks_and_revocations() {
 
 #[test]
 fn a_consumed_or_revoked_invitation_cannot_be_replayed_after_a_restore() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let peer = bob.handshake_key().public();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
@@ -129,7 +129,7 @@ fn a_consumed_or_revoked_invitation_cannot_be_replayed_after_a_restore() {
 
 #[test]
 fn persist_before_reply_a_crash_before_the_ack_leaves_the_invitation_unused() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let peer = bob.handshake_key().public();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
@@ -154,7 +154,7 @@ fn persist_before_reply_a_crash_before_the_ack_leaves_the_invitation_unused() {
 
 #[test]
 fn expired_revocations_are_pruned_after_expiry_plus_skew_and_unexpired_ones_stay() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
     let (short, long) = (StaticKey::generate(), StaticKey::generate());
@@ -193,7 +193,7 @@ fn expired_revocations_are_pruned_after_expiry_plus_skew_and_unexpired_ones_stay
 
 #[test]
 fn a_consumed_invitation_is_kept_until_expiry_plus_skew() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let peer = bob.handshake_key().public();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
     let alice = StaticKey::generate();
@@ -209,7 +209,7 @@ fn a_consumed_invitation_is_kept_until_expiry_plus_skew() {
 
 #[test]
 fn bad_snapshots_fail_loudly() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
     side.block([3; 32]);
@@ -234,7 +234,7 @@ fn bad_snapshots_fail_loudly() {
     assert_eq!(restore(&storage, NET, &saved[..MIN_SNAPSHOT_LEN - 1]), Err(SnapshotError::Truncated));
     assert_eq!(restore(&storage, NET, &[]), Err(SnapshotError::Truncated));
     // Another identity's snapshot, or a callback listener's, is refused.
-    let other = ContactIdentity::generate();
+    let other = ContactIdentity::generate_at(NOW);
     let theirs = Responder::<u32>::for_identity(&other, NET).export_snapshot(&storage, now());
     assert_eq!(restore(&storage, NET, &theirs), Err(SnapshotError::WrongIdentity));
     let mut listener = Responder::<u32>::for_callback(&StaticKey::generate(), NET, [5; 32], [1; 32], NOW + 60).unwrap();
@@ -261,7 +261,7 @@ fn snapshots_are_written_atomically() {
 
 #[test]
 fn a_pruned_invitation_stays_refused_when_the_clock_jumps_back_after_a_restore() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let peer = bob.handshake_key().public();
     let mut side: Responder<u32> = Responder::for_identity(&bob, NET);
@@ -296,7 +296,7 @@ fn a_pruned_invitation_stays_refused_when_the_clock_jumps_back_after_a_restore()
 
 #[test]
 fn a_callback_grant_cannot_be_resurrected_by_a_backward_clock_across_a_restart() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let storage = StorageKey::generate();
     let carol = StaticKey::generate();
     let peer = bob.handshake_key().public();

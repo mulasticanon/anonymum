@@ -40,8 +40,12 @@
 //!   X25519 can derive the inbox secret from the public card and forge
 //!   notes, and the callback's Noise IK handshake is classical too
 //!   (post-quantum callbacks are to be negotiated off-chain later).
-//! - Forward secrecy for notes is still open: if both inbox secrets leak,
-//!   every recorded note to them can be read.
+//! - Forward secrecy for notes comes only from rotating the inbox keys
+//!   ([`ContactIdentity::rotate_inbox`], weekly epochs): while an epoch's
+//!   two secrets are kept, anyone who takes them can read every recorded
+//!   note sealed to that epoch. Once the epoch is purged (its end plus
+//!   [`crate::contact::DRAIN_GRACE`]) they are gone from the device.
+//!   Unreviewed.
 //!
 //! # Field layout (fixed, [`SEALED_NOTE_LEN`] = 1,787 bytes)
 //!
@@ -89,8 +93,8 @@ use anonymum_core::crypto::SealedNote;
 use snow::Builder;
 
 use crate::contact::{
-    is_contributory_key, pq_encapsulate, CardSummary, ContactCard, ContactError, ContactIdentity, Network,
-    PQ_CIPHERTEXT_LEN,
+    is_contributory_key, pq_encapsulate, CardSummary, ContactCard, ContactError, ContactIdentity, InboxEpoch,
+    Network, PQ_CIPHERTEXT_LEN,
 };
 
 const PATTERN: &str = "Noise_Xpsk0_25519_ChaChaPoly_BLAKE2s";
@@ -271,21 +275,43 @@ pub fn seal_note(
 }
 
 /// Try to open a note on `network` with `me`'s inbox keys (X25519 and
-/// ML-KEM). `created_at` is the wall-clock time (seconds) at which the
-/// request carrying the note was created on chain, taken from chain state:
-/// the sender's card must have been valid then (it may have expired since).
-/// Needs nothing else: no sender address, no hint. A note for someone else,
-/// another network, another admission commitment, another note format or
-/// with a tampered ciphertext fails with [`NoteError::Noise`].
+/// ML-KEM): the active epoch's first, then the draining epoch's if
+/// `now_secs` (the opener's clock) is before its `not_after` plus
+/// [`crate::contact::DRAIN_GRACE`]. `created_at` is the wall-clock time
+/// (seconds) at which the request carrying the note was created on chain,
+/// taken from chain state: the sender's card must have been valid then (it
+/// may have expired since). Needs nothing else: no sender address, no hint.
+/// A note for someone else (or for an epoch already dropped), another
+/// network, another admission commitment, another note format or with a
+/// tampered ciphertext fails with [`NoteError::Noise`]. A note that
+/// decrypts under the active keys but fails a later check is not retried
+/// with the draining keys.
 pub fn open_note(
     me: &ContactIdentity,
     network: &Network,
     note: &SealedNote,
     created_at: u64,
+    now_secs: u64,
 ) -> Result<ContactNote, NoteError> {
     if note.0.len() != SEALED_NOTE_LEN {
         return Err(NoteError::BadSize { len: note.0.len() });
     }
+    match open_with(me.active(), network, note, created_at) {
+        Err(NoteError::Noise(error)) => match me.draining_at(now_secs) {
+            Some(previous) => open_with(previous, network, note, created_at),
+            None => Err(NoteError::Noise(error)),
+        },
+        result => result,
+    }
+}
+
+/// Open a note of the right length with one epoch's inbox keys.
+fn open_with(
+    me: &InboxEpoch,
+    network: &Network,
+    note: &SealedNote,
+    created_at: u64,
+) -> Result<ContactNote, NoteError> {
     let admission: [u8; ADMISSION_LEN] = note.0[..ADMISSION_LEN].try_into().expect("32 bytes");
     let ciphertext: [u8; PQ_CIPHERTEXT_LEN] = note.0[ADMISSION_LEN..ENVELOPE_AT].try_into().expect("1088 bytes");
     // ML-KEM's implicit rejection: a ciphertext not made for our key gives
@@ -348,7 +374,7 @@ mod tests {
     const NOW: u64 = 50;
 
     fn card_of(id: &ContactIdentity) -> ContactCard {
-        id.card(NET, 1, 0, 100)
+        id.card_within(NET, 1, 0, 100)
     }
 
     fn seal(to: &ContactIdentity, from: &ContactIdentity, intro: &str) -> SealedNote {
@@ -493,17 +519,17 @@ mod tests {
         // Deniability: Bob, with only his own inbox secrets (X25519 and
         // ML-KEM) and Carol's public card, makes a note that opens exactly
         // as one from Carol.
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let forged = forged_note(bob.inbox_key(), &bob.pq_inbox_key(), &card_of(&carol), &ROUTE, "I never sent this");
         assert_eq!(forged.0.len(), SEALED_NOTE_LEN);
-        let opened = open_note(&bob, &NET, &forged, NOW).unwrap();
+        let opened = open_note(&bob, &NET, &forged, NOW, NOW).unwrap();
         assert_eq!(opened.sender(), carol.signing_key());
         assert_eq!(opened.callback(), carol.handshake_key().public());
         assert_eq!(opened.card, card_of(&carol).summary());
         // An honest note from Carol opens the same way: Bob cannot show a
         // third party which of the two he received.
         let honest = seal(&bob, &carol, "hi");
-        let opened_honest = open_note(&bob, &NET, &honest, NOW).unwrap();
+        let opened_honest = open_note(&bob, &NET, &honest, NOW, NOW).unwrap();
         assert_eq!(opened.card, opened_honest.card);
         assert_eq!(forged.0.len(), honest.0.len());
     }
@@ -513,19 +539,19 @@ mod tests {
         // Mallory stole only Bob's X25519 inbox secret (not his ML-KEM
         // secret, not Carol's keys). Bob's post-quantum key is public, so
         // she can still make a note that opens at Bob as one from Carol.
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let stolen = StaticKey::from_bytes(bob.inbox_key().to_bytes());
         let malloys_route = [0x66; ROUTE_LEN];
         let forged = forged_note(&stolen, &card_of(&bob).pq_inbox_key, &card_of(&carol), &malloys_route, "call me here");
-        let opened = open_note(&bob, &NET, &forged, NOW).unwrap();
+        let opened = open_note(&bob, &NET, &forged, NOW, NOW).unwrap();
         assert_eq!(opened.sender(), carol.signing_key(), "it opens as Carol's");
         assert_eq!(opened.route, malloys_route);
         // What limits it: the callback goes to Carol's handshake key, which
         // Mallory does not hold (see tests/contact.rs, the callback test).
         assert_eq!(opened.callback(), carol.handshake_key().public());
         // The forgery only works against the stolen inbox: Dave rejects it.
-        let dave = ContactIdentity::generate();
-        assert!(matches!(open_note(&dave, &NET, &forged, NOW), Err(NoteError::Noise(_))));
+        let dave = ContactIdentity::generate_at(NOW);
+        assert!(matches!(open_note(&dave, &NET, &forged, NOW, NOW), Err(NoteError::Noise(_))));
     }
 
     #[test]
@@ -534,13 +560,13 @@ mod tests {
         use crate::wire::{Initiator, Responder, ResponderEvent, RetryPolicy, WireError};
         use std::time::Instant;
 
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
-        let bob_card = bob.card(NET, 1, 0, 100);
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
+        let bob_card = bob.card_within(NET, 1, 0, 100);
         // Mallory holds Bob's inbox secret and forges a note "from Carol"
         // pointing at her own route.
         let stolen = StaticKey::from_bytes(bob.inbox_key().to_bytes());
         let forged = forged_note(&stolen, &bob_card.pq_inbox_key, &card_of(&carol), &[0x66; ROUTE_LEN], "call me");
-        let opened = open_note(&bob, &NET, &forged, NOW).unwrap();
+        let opened = open_note(&bob, &NET, &forged, NOW, NOW).unwrap();
         // Bob calls back the handshake key the note authenticated.
         let (_, hello) =
             Initiator::start_with(bob.handshake_key(), opened.callback(), NET, opened.admission, RetryPolicy::default())
@@ -569,31 +595,31 @@ mod tests {
         // Built with the forging resolver: the claimed sender key is a
         // small-order point, so the static agreement is all zeros on both
         // sides and snow accepts it; our check refuses it.
-        let bob = ContactIdentity::generate();
-        let carol = ContactIdentity::generate();
+        let bob = ContactIdentity::generate_at(NOW);
+        let carol = ContactIdentity::generate_at(NOW);
         for weak in crate::contact::tests::SMALL_ORDER {
             let mut card = card_of(&carol);
             card.handshake_key = weak;
             let forged = forged_note(bob.inbox_key(), &bob.pq_inbox_key(), &card, &ROUTE, "x");
-            assert!(matches!(open_note(&bob, &NET, &forged, NOW), Err(NoteError::WeakKey)), "{weak:02x?}");
+            assert!(matches!(open_note(&bob, &NET, &forged, NOW, NOW), Err(NoteError::WeakKey)), "{weak:02x?}");
         }
     }
 
     #[test]
     fn a_tampered_ml_kem_ciphertext_is_refused() {
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let note = seal(&bob, &carol, "hi");
-        assert!(open_note(&bob, &NET, &note, NOW).is_ok(), "control");
+        assert!(open_note(&bob, &NET, &note, NOW, NOW).is_ok(), "control");
         for at in [ADMISSION_LEN, ADMISSION_LEN + 500, ENVELOPE_AT - 1] {
             let mut bad = note.0.clone();
             bad[at] ^= 1;
-            assert!(matches!(open_note(&bob, &NET, &SealedNote(bad), NOW), Err(NoteError::Noise(_))), "byte {at}");
+            assert!(matches!(open_note(&bob, &NET, &SealedNote(bad), NOW, NOW), Err(NoteError::Noise(_))), "byte {at}");
         }
         // A whole fresh ciphertext to Bob's own key, swapped in: refused too.
         let (other, _) = pq_encapsulate(&bob.pq_inbox_key()).unwrap();
         let mut swapped = note.0.clone();
         swapped[ADMISSION_LEN..ENVELOPE_AT].copy_from_slice(&other);
-        assert!(matches!(open_note(&bob, &NET, &SealedNote(swapped), NOW), Err(NoteError::Noise(_))));
+        assert!(matches!(open_note(&bob, &NET, &SealedNote(swapped), NOW, NOW), Err(NoteError::Noise(_))));
     }
 
     #[test]
@@ -601,35 +627,37 @@ mod tests {
         // Ciphertext and prologue as normal, but the Noise message keyed by
         // a different encapsulation's secret: it does not open. So the
         // shared secret is used, not only the ciphertext's bytes.
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let body = payload(&card_of(&carol).summary(), &ROUTE, b"hi");
         let (ciphertext, shared) = pq_encapsulate(&bob.pq_inbox_key()).unwrap();
         let (_, other_shared) = pq_encapsulate(&bob.pq_inbox_key()).unwrap();
-        assert!(open_note(&bob, &NET, &reseal_with(&bob, &carol, &ciphertext, &shared, &body), NOW).is_ok(), "control");
+        assert!(open_note(&bob, &NET, &reseal_with(&bob, &carol, &ciphertext, &shared, &body), NOW, NOW).is_ok(), "control");
         assert!(matches!(
-            open_note(&bob, &NET, &reseal_with(&bob, &carol, &ciphertext, &other_shared, &body), NOW),
+            open_note(&bob, &NET, &reseal_with(&bob, &carol, &ciphertext, &other_shared, &body), NOW, NOW),
             Err(NoteError::Noise(_))
         ));
         // Without Bob's ML-KEM secret the X25519 inbox secret is not enough
         // to read a note: someone holding the same X25519 key but another
         // ML-KEM key cannot open it.
-        let (signing, handshake, inbox, _) = bob.to_secret_bytes();
-        let half_bob = ContactIdentity::from_secret_bytes(signing, handshake, inbox, [0x42; 64]);
-        assert!(matches!(open_note(&half_bob, &NET, &seal(&bob, &carol, "hi"), NOW), Err(NoteError::Noise(_))));
+        let (signing, handshake) = bob.root_secret_bytes();
+        let (inbox, _, not_before, not_after) = bob.active().to_secret_bytes();
+        let other_pq = InboxEpoch::from_secret_bytes(inbox, [0x42; 64], not_before, not_after).unwrap();
+        let half_bob = ContactIdentity::from_parts(signing, handshake, other_pq, None);
+        assert!(matches!(open_note(&half_bob, &NET, &seal(&bob, &carol, "hi"), NOW, NOW), Err(NoteError::Noise(_))));
     }
 
     #[test]
     fn a_card_with_the_wrong_pq_inbox_hash_is_refused() {
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let honest = card_of(&carol).summary();
-        assert!(open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&honest, &ROUTE, b"hi")), NOW).is_ok(), "control");
+        assert!(open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&honest, &ROUTE, b"hi")), NOW, NOW).is_ok(), "control");
         // One bit off, or another identity's key hash: the card signature
         // (which covers the hash) does not verify.
-        let other = crate::contact::pq_key_hash(&ContactIdentity::generate().pq_inbox_key());
+        let other = crate::contact::pq_key_hash(&ContactIdentity::generate_at(NOW).pq_inbox_key());
         for hash in [{ let mut h = honest.pq_inbox_hash; h[0] ^= 1; h }, other] {
             let summary = CardSummary { pq_inbox_hash: hash, ..honest };
             assert!(matches!(
-                open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&summary, &ROUTE, b"hi")), NOW),
+                open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&summary, &ROUTE, b"hi")), NOW, NOW),
                 Err(NoteError::BadCard(ContactError::BadSignature))
             ));
         }
@@ -679,18 +707,18 @@ mod tests {
 
     #[test]
     fn v4_and_v5_notes_cannot_be_confused() {
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let old = v4::seal(&NET, &bob.inbox_key().public(), &carol);
         assert!(v4::opens(&bob, &NET, &old.0[..32], &old.0[32..]), "control: the v4 note is valid as v4");
-        assert!(matches!(open_note(&bob, &NET, &old, NOW), Err(NoteError::BadSize { len: 667 })));
+        assert!(matches!(open_note(&bob, &NET, &old, NOW, NOW), Err(NoteError::BadSize { len: 667 })));
         // Padded to v5's length, either way round, it still does not open.
         let mut padded = old.0.clone();
         padded.resize(SEALED_NOTE_LEN, 0);
-        assert!(matches!(open_note(&bob, &NET, &SealedNote(padded), NOW), Err(NoteError::Noise(_))));
+        assert!(matches!(open_note(&bob, &NET, &SealedNote(padded), NOW, NOW), Err(NoteError::Noise(_))));
         let mut placed = vec![0u8; SEALED_NOTE_LEN];
         placed[..32].copy_from_slice(&ADMISSION);
         placed[ENVELOPE_AT..ENVELOPE_AT + v4::LEN - 32].copy_from_slice(&old.0[32..]);
-        assert!(matches!(open_note(&bob, &NET, &SealedNote(placed), NOW), Err(NoteError::Noise(_))));
+        assert!(matches!(open_note(&bob, &NET, &SealedNote(placed), NOW, NOW), Err(NoteError::Noise(_))));
         // And a v5 note's Noise message is not a v4 note.
         let new = seal(&bob, &carol, "hi");
         assert!(!v4::opens(&bob, &NET, &new.0[..32], &new.0[ENVELOPE_AT..]));
@@ -698,37 +726,37 @@ mod tests {
 
     #[test]
     fn padding_version_and_card_are_checked() {
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let card = card_of(&carol).summary();
         let mut bad_version = payload(&card, &ROUTE, b"hi");
         bad_version[0] = 4;
-        assert!(matches!(open_note(&bob, &NET, &reseal(&bob, &carol, &bad_version), NOW), Err(NoteError::Malformed)));
+        assert!(matches!(open_note(&bob, &NET, &reseal(&bob, &carol, &bad_version), NOW, NOW), Err(NoteError::Malformed)));
         let mut bad_padding = payload(&card, &ROUTE, b"hi");
         bad_padding[PAYLOAD_LEN - 1] = 1;
-        assert!(matches!(open_note(&bob, &NET, &reseal(&bob, &carol, &bad_padding), NOW), Err(NoteError::Malformed)));
+        assert!(matches!(open_note(&bob, &NET, &reseal(&bob, &carol, &bad_padding), NOW, NOW), Err(NoteError::Malformed)));
         // Someone else's card fields under Carol's handshake key: the card
         // signature (which covers the handshake key) does not verify.
-        let wrong_card = payload(&card_of(&ContactIdentity::generate()).summary(), &ROUTE, b"hi");
-        assert!(matches!(open_note(&bob, &NET, &reseal(&bob, &carol, &wrong_card), NOW), Err(NoteError::BadCard(_))));
+        let wrong_card = payload(&card_of(&ContactIdentity::generate_at(NOW)).summary(), &ROUTE, b"hi");
+        assert!(matches!(open_note(&bob, &NET, &reseal(&bob, &carol, &wrong_card), NOW, NOW), Err(NoteError::BadCard(_))));
         // A card that had expired when the request was created.
         assert!(matches!(
-            open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&card, &ROUTE, b"hi")), 100),
+            open_note(&bob, &NET, &reseal(&bob, &carol, &payload(&card, &ROUTE, b"hi")), 100, 100),
             Err(NoteError::BadCard(ContactError::Expired))
         ));
     }
 
     #[test]
     fn a_note_for_network_a_does_not_open_on_network_b() {
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let note = seal(&bob, &carol, "hi");
         assert_eq!(note.0.len(), SEALED_NOTE_LEN);
-        assert!(open_note(&bob, &NET, &note, NOW).is_ok());
-        assert!(matches!(open_note(&bob, &[0xB; 32], &note, NOW), Err(NoteError::Noise(_))));
+        assert!(open_note(&bob, &NET, &note, NOW, NOW).is_ok());
+        assert!(matches!(open_note(&bob, &[0xB; 32], &note, NOW, NOW), Err(NoteError::Noise(_))));
     }
 
     #[test]
     fn sealing_refuses_a_weak_inbox_a_bad_pq_key_or_a_card_that_is_not_the_senders() {
-        let (bob, carol) = (ContactIdentity::generate(), ContactIdentity::generate());
+        let (bob, carol) = (ContactIdentity::generate_at(NOW), ContactIdentity::generate_at(NOW));
         let try_to = |recipient: &ContactCard, sender_card: &ContactCard| {
             seal_note(&NET, recipient, &carol, sender_card, &ROUTE, "", &ADMISSION)
         };
@@ -740,9 +768,9 @@ mod tests {
         // input check).
         let recipient = ContactCard { pq_inbox_key: [0xFF; PQ_KEY_LEN], ..card_of(&bob) };
         assert!(matches!(try_to(&recipient, &card_of(&carol)), Err(NoteError::BadCard(ContactError::BadPqKey))));
-        let elsewhere = bob.card([1; 32], 1, 0, 100);
+        let elsewhere = bob.card_within([1; 32], 1, 0, 100);
         assert!(matches!(try_to(&elsewhere, &card_of(&carol)), Err(NoteError::BadCard(ContactError::WrongNetwork))));
-        let other_card = card_of(&ContactIdentity::generate());
+        let other_card = card_of(&ContactIdentity::generate_at(NOW));
         assert!(matches!(try_to(&card_of(&bob), &other_card), Err(NoteError::BadCard(ContactError::WrongIssuer))));
     }
 }

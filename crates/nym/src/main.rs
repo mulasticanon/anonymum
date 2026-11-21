@@ -204,8 +204,8 @@ async fn run() -> Result<(), AnyError> {
         bob_wallet.address(),
         carol_wallet.address()
     );
-    let bob = ContactIdentity::generate();
-    let card = bob.card(NETWORK, COIN, now_secs(), now_secs() + 86_400);
+    let bob = ContactIdentity::generate_at(now_secs());
+    let card = bob.card(NETWORK, COIN);
     println!(
         "Bob's contact card (separate from his wallet): signing {}, handshake {}, inbox {}, price {} units",
         short(&card.signing_key),
@@ -300,8 +300,8 @@ async fn run() -> Result<(), AnyError> {
 
     // ---- Carol, a stranger, by note and reverse rendezvous ---------------------
     println!("\nCarol -> Bob: a stranger. Bob's route is not published; she has only his card.");
-    let carol = ContactIdentity::generate();
-    let carol_card = carol.card(NETWORK, COIN, now_secs(), now_secs() + 86_400);
+    let carol = ContactIdentity::generate_at(now_secs());
+    let carol_card = carol.card(NETWORK, COIN);
     let throwaway_dir = std::env::temp_dir().join(format!("anonymum-throwaway-{}", std::process::id()));
     let throwaway = Endpoint::connect_persistent("carol (throwaway)", &throwaway_dir).await?;
     let throwaway_route = throwaway.address();
@@ -339,7 +339,7 @@ async fn run() -> Result<(), AnyError> {
     // that time comes from chain state (creation height x block time).
     let created_height = req.expires_at - chain.params().request_ttl_blocks();
     let created_at = chain_started + created_height * chain.params().block_time_ms / 1_000;
-    let opened = open_note(&bob, &NETWORK, &req.note, created_at)?;
+    let opened = open_note(&bob, &NETWORK, &req.note, created_at, now_secs())?;
     println!(
         "  Bob's client opens the note with his inbox key alone. Sender's contact key {}, intro: {:?}",
         short(&opened.sender()),
@@ -555,46 +555,43 @@ fn fixed<const N: usize>(text: &str) -> Result<[u8; N], AnyError> {
     from_hex(text)?.try_into().map_err(|_| format!("expected {N} bytes").into())
 }
 
+/// The hex text of a `name=hex` line in a key file.
+fn line<'a>(path: &str, text: &'a str, name: &str) -> Result<&'a str, AnyError> {
+    Ok(text
+        .lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')))
+        .ok_or(format!("{path}: no {name}"))?)
+}
+
 /// `name=hex` lines from a key file.
 fn field<const N: usize>(path: &str, name: &str) -> Result<[u8; N], AnyError> {
     let text = std::fs::read_to_string(path)?;
-    let line = text
-        .lines()
-        .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')))
-        .ok_or(format!("{path}: no {name}"))?;
-    fixed::<N>(line)
+    fixed::<N>(line(path, &text, name)?)
 }
 
 fn load_wallet(path: &str) -> Result<Identity, AnyError> {
     Ok(Identity::from_secret_bytes(field(path, "signing")?, field(path, "messaging")?))
 }
 
+/// The contact identity (signing and handshake keys and the inbox ring) in
+/// `anonymum-crypto`'s own versioned encoding.
 fn load_contact(path: &str) -> Result<ContactIdentity, AnyError> {
-    Ok(ContactIdentity::from_secret_bytes(
-        field(path, "contact_signing")?,
-        field(path, "contact_handshake")?,
-        field(path, "contact_inbox")?,
-        field(path, "contact_pq")?,
-    ))
+    let text = std::fs::read_to_string(path)?;
+    Ok(ContactIdentity::from_secret_bytes(&from_hex(line(path, &text, "contact")?)?)?)
 }
 
 fn cmd_wallet(args: &[String]) -> Result<(), AnyError> {
     let path = args.first().ok_or("usage: wallet <file>")?;
     if !std::path::Path::new(path).exists() {
         let (signing, messaging) = Identity::generate().to_secret_bytes();
-        let (cs, ch, ci, cpq) = ContactIdentity::generate().to_secret_bytes();
-        std::fs::write(
-            path,
-            format!(
-                "signing={}\nmessaging={}\ncontact_signing={}\ncontact_handshake={}\ncontact_inbox={}\ncontact_pq={}\n",
-                to_hex(&signing),
-                to_hex(&messaging),
-                to_hex(&cs),
-                to_hex(&ch),
-                to_hex(&ci),
-                to_hex(&cpq)
-            ),
-        )?;
+        let contact = ContactIdentity::generate_at(now_secs()).to_secret_bytes();
+        let text = format!(
+            "signing={}\nmessaging={}\ncontact={}\n",
+            to_hex(&signing),
+            to_hex(&messaging),
+            to_hex(&contact)
+        );
+        std::fs::write(path, text)?;
     }
     let wallet = load_wallet(path)?;
     let contact = load_contact(path)?;
@@ -605,7 +602,7 @@ fn cmd_wallet(args: &[String]) -> Result<(), AnyError> {
     println!("address={}", to_hex(&wallet.address().0));
     println!("msgkey={}", to_hex(&key));
     println!("binding={}", to_hex(&binding.0));
-    println!("card={}", to_hex(&contact.card(NETWORK, COIN, 0, now_secs() + 86_400).to_bytes()));
+    println!("card={}", to_hex(&contact.card(NETWORK, COIN).to_bytes()));
     Ok(())
 }
 
@@ -621,7 +618,7 @@ fn cmd_seal(args: &[String]) -> Result<(), AnyError> {
     let card = ContactCard::from_bytes(&from_hex(flag(args, "--card")?)?)?;
     card.verify(&NETWORK, now_secs())?;
     let sender = load_contact(flag(args, "--sender")?)?;
-    let sender_card = sender.card(NETWORK, COIN, 0, now_secs() + 86_400);
+    let sender_card = sender.card(NETWORK, COIN);
     let admission = random_bytes();
     let note = seal_note(
         &NETWORK,
@@ -644,7 +641,7 @@ fn cmd_open(args: &[String]) -> Result<(), AnyError> {
     let contact = load_contact(flag(args, "--wallet")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
     let created: u64 = flag(args, "--created")?.parse()?;
-    let opened = open_note(&contact, &NETWORK, &note, created)?;
+    let opened = open_note(&contact, &NETWORK, &note, created, now_secs())?;
     println!("reply={}", to_hex(&opened.route));
     println!("sender={}", to_hex(&opened.sender()));
     println!("callback={}", to_hex(&opened.callback()));
@@ -678,7 +675,7 @@ async fn cmd_callback(args: &[String]) -> Result<(), AnyError> {
     let bob = load_contact(flag(args, "--bob")?)?;
     let note = SealedNote(from_hex(flag(args, "--note")?)?);
     let created: u64 = flag(args, "--created")?.parse()?;
-    let opened = open_note(&bob, &NETWORK, &note, created)?;
+    let opened = open_note(&bob, &NETWORK, &note, created, now_secs())?;
     let mut bob_net = Endpoint::connect("bob").await?;
     let learned = recipient_side(&mut bob_net, &bob, &opened).await?;
     println!("mine={}", bob_net.address());

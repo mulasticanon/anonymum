@@ -28,7 +28,7 @@ struct Caller {
 
 impl Bob {
     fn new() -> Bob {
-        let me = ContactIdentity::generate();
+        let me = ContactIdentity::generate_at(0);
         let side = Responder::for_identity(&me, NET);
         Bob { me, side, now: Now { unix: UNIX, mono: Instant::now() } }
     }

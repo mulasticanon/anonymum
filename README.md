@@ -16,7 +16,7 @@ Four crates, plus a Substrate port in `substrate/`:
 | Crate | What it is | Verified how |
 |---|---|---|
 | `anonymum-core` | The rules: invites, paid contact requests, channels, blocks, fees, escrow, storage deposits, client-side admission, rate limits. No dependencies. | 63 tests |
-| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; encrypted, versioned snapshots of grant state (one device). **The handshake, note format and snapshot have not been reviewed.** | 117 tests |
+| `anonymum-crypto` | Real cryptography: Ed25519 wallets and chain invites; contact identities separate from the wallet (cards, invitations); Noise IK sessions where the answering side decides before replying; strangers' notes (format v5: hybrid ML-KEM-768 + Noise Xpsk0, deniable sender authentication) opened with the inbox keys alone; framing with retries and confirmation; encrypted, versioned snapshots of grant state (one device). **The handshake, note format and snapshot have not been reviewed.** | 124 tests |
 | `anonymum-nym` | Demo: an invited contact, a stranger arriving by reverse rendezvous, and a dropped non-contact, over the live Nym mixnet. | Manual live runs on Windows, 2026-11-18 to 2026-11-20 (see below). Not an automated test. |
 | `anonymum-shielded-model` | A plain-Rust **model of the shielded-money rules** in `docs/shielded-spec-v0.md`, for review. Not private, not secure: no proofs, no encryption of notes; it checks the hidden witness directly. Fixed asymmetric payload slots (2 x 200 + 1,787 bytes), a prunable 24-hour stranger-note store with a permanent hash the proof binds to, and a versioned recovery copy. | 61 tests, including adversarial cases and a randomised conservation test |
 | `pallet-anonymum` (`substrate/`) | The same chain rules as a FRAME pallet (Polkadot SDK `stable2609-2`), plus a minimal runtime that includes it. | 64 tests (rule tests matching the core crate's, plus FRAME checks); runtime ran on a local dev node with real transactions, 2026-11-18 |
@@ -324,8 +324,11 @@ I14).
 - The channel table is public: the chain shows that A and B are connected.
   This contradicts the mixnet's purpose until shielded payments exist. The
   same goes for contact requests (Y requested X) and blocks (who blocked whom).
-- Contact notes have no forward secrecy: if a recipient's inbox key leaks
-  later, old notes sealed to it can be read. Rotating the key limits this.
+- Contact notes get forward secrecy only from inbox key rotation (weekly
+  epochs; an old epoch's keys are dropped 26 hours after it ends, but only
+  when the client rotates and purges: nothing does so automatically yet).
+  Until then, whoever takes a device can read notes sealed to the epochs it
+  still holds. Unreviewed.
 - Noise IK's first message can be replayed. A replay cannot use an
   invitation twice or reopen a blocked contact (tested), but a still-
   authorised caller's recorded first message gets a reply: an availability

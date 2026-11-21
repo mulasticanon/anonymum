@@ -31,7 +31,7 @@
 //!
 //! ```compile_fail
 //! # use anonymum_crypto::{wire::Responder, ContactIdentity};
-//! let me = ContactIdentity::generate();
+//! let me = ContactIdentity::generate_at(0);
 //! let mut side: Responder<u32> = Responder::for_identity(&me, [0; 32]);
 //! side.gate_mut().block([1; 32]);
 //! ```

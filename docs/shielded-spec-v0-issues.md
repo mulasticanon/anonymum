@@ -204,7 +204,8 @@ card key and the request reference from a recorded first message (before,
 only the fresh callback key's compromise did). A per-request key would need
 binding to the identity again, which is what the signature did.
 *Still open:* forward secrecy for notes (an inbox key leak opens every
-recorded note); whether Noise X's identity hiding and the visible
+recorded note; inbox rotation prototyped 2026-11-21, see the end of this
+file); whether Noise X's identity hiding and the visible
 ephemeral key meet question 12.
 
 ## Source review of cdad354 (2026-11-20)
@@ -277,7 +278,7 @@ Status after the fixes of 2026-11-20:
 | A3 (MED-02) | Unchecked pallet arithmetic | **Fixed.** `Percent::mul_floor` for the fee split; checked adds for the expiry height and the id and sequence counters, returning `ArithmeticError::Overflow` and charging nothing. Tested at each boundary |
 | A4 (HIGH-02) | Sessions keyed by reply handle and unbounded; one caller could fill the pending table | **Fixed.** Candidate handles are capped at one per caller (a newer one replaces it) and are dropped with a caller evicted from a handle (tested: a CONFIRM replayed from 200 handles leaves one). Live sessions are keyed by the caller's authenticated key (one each) with a route table from reply handle to caller. Caps with named defaults: `MAX_PENDING` 1,024, `MAX_PENDING_PER_CALLER` 4, `MAX_SESSIONS` 1,024 (`Limits`). A repeated CONFIRM from a new handle gets the cached ACK there, but the session moves only when a fresh data frame from that handle decrypts, so a replayed CONFIRM cannot redirect replies. At the session cap a new caller is refused before its CONFIRM is opened and nothing is committed. Tests for each |
 | A5 (MED-01) | Unchecked send counter | **Fixed.** `Session::seal` uses nonces up to `u64::MAX - 1` and then refuses (`Exhausted`); Noise reserves only `u64::MAX`, so it cannot wrap. No rekeying |
-| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21, see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
+| A6 (CRIT-02, HIGH-03, MED-03, MED-04, CRIT-01) | Note signature and forward secrecy, refund blinding and fee, dummy payloads, durable state, the transparent chain and unproved model | **Recorded, not solved; MED-04 (durable state) fixed for one device on 2026-11-21; CRIT-02's forward-secrecy half prototyped on 2026-11-21 (inbox key rotation); see the end of this file** (see below and earlier sections: I8, I13, I27, R8) |
 | A7 (LOW-01) | Replace the random-secret key check with a list of small-order points | **Not done, by decision**: no hand-written list of bad points; the check stays on `x25519-dalek`'s `was_contributory` |
 
 **Where the audit is wrong or overstated (my reading, for the owner).**
@@ -300,6 +301,8 @@ Status after the fixes of 2026-11-20:
   long-lived inbox key; if that key leaks, every recorded note to it opens.
   Candidate mitigation: rotate the inbox key (short card validity) and
   erase old inbox secrets once no pending request can still use them.
+  *Prototyped 2026-11-21 (weekly epochs, 26-hour drain), see "Inbox key
+  rotation" at the end of this file.*
 - **No delay between claim finality and the callback.** The recipient
   calls the throwaway route as soon as the acceptance is final, so the
   timing links the chain event to the mixnet traffic. Random delay or batched
@@ -521,4 +524,62 @@ encrypted, without any database dependency.
 - *Not done:* the demo does not persist its gate (its responders live for
   one run); multi-device state (above); the storage key's own protection
   (an operating-system key store) is the caller's job.
+
+## Inbox key rotation: the forward-secrecy half of CRIT-02 (2026-11-21, unreviewed)
+
+A stranger's note is sealed to the recipient card's two inbox keys
+(X25519 and ML-KEM-768). Before this change they lived as long as the
+contact identity, so whoever later took them could read every recorded
+note. Now (`anonymum-crypto::contact`):
+- *Stable root:* the signing key (who the contact is) and the handshake key
+  are unchanged. Rotating the handshake key would break existing contacts'
+  calls; it is left for a separate change.
+- *Epochs on one grid:* `EPOCH_LEN` = 7 days; an epoch starts at a multiple
+  of it (Unix seconds), so everyone's cards share the same boundaries and a
+  card's validity does not say when its owner made or rotated it. A card
+  is valid from `CLOCK_GRID_BACKDATE` (1 day) before its epoch starts until
+  the epoch ends. The chain stamps a request's `created_at` as the start of
+  its clock-grid window (P11, at most 24 hours wide), which can lie before
+  the moment a fresh card was made; backdating by a day keeps a fresh card
+  valid there, and absorbs a sender clock up to a day ahead (tested with
+  6-second, 1-hour and 1-day windows across an epoch boundary).
+  `card_within` narrows a validity but never beyond the epoch's.
+- *Two slots:* `ContactIdentity` holds the active `InboxEpoch` (on the
+  card) and at most one draining epoch. `rotate_inbox(now)` makes a fresh
+  active epoch for `now`'s place on the grid, moves the old active one to
+  draining, and drops an older draining epoch at once, whatever grace it
+  had left (rotating twice in a row loses the oldest epoch's notes; tested).
+- *Grace and purge:* `DRAIN_GRACE` = 26 hours: the 24-hour request
+  lifetime (D2) plus 2 hours for gateway delivery and clock skew, counted
+  from the draining epoch's `not_after` (a request created at the card's
+  last valid second can still be read). `purge_expired_inbox(now)` drops
+  the draining epoch once `now >= not_after + DRAIN_GRACE`; `open_note(...,
+  now_secs)` tries the active keys, then the draining keys only while
+  `now_secs < not_after + DRAIN_GRACE`, so an expired epoch is not used
+  even before it is purged. A note that decrypts under the active keys but
+  fails a later check is not retried.
+- *Wiping:* both secrets of an epoch sit in `Zeroizing` buffers, wiped when
+  the epoch is dropped; the ML-KEM decapsulation key is rebuilt per use
+  from the seed and wiped on drop (`ml-kem`'s `zeroize` feature). Not
+  covered: copies inside `snow`'s handshake state while a note is opened,
+  copies the operating system makes (swap, hibernation), and the caller's
+  stored copy. `ContactIdentity::to_secret_bytes` (version 1: signing,
+  handshake, active epoch, draining flag, draining epoch; 178 or 290 bytes,
+  decoded strictly) returns a zeroizing buffer, and after a purge it no
+  longer contains the dropped epoch, but an older stored copy still does:
+  the caller must overwrite it (for example with `write_atomically`).
+- *Tests* (`tests/rotation.rs`, 7): (a) a note to epoch E-1 opens after
+  rotating to E, to the last second of the grace, and only through the
+  draining slot; (b) after a purge at `not_after + 26 h` it no longer
+  opens, at any clock, and not after a store and restore; (c) rotating
+  twice drops the oldest epoch; (d) a fresh card opens at the floored
+  start of its window; the shared grid, the clamped card validity and the
+  strict storage format. 15 mutations of the new rules were each caught.
+- *Not done:* nothing rotates automatically (the caller decides when, and
+  must publish the new card); `seal_note` does not refuse a recipient card
+  that has expired, so a sender with a stale card can pay for a note that
+  will not be read after the grace (the demo's `seal` checks the card
+  first); the handshake key does not rotate, so callbacks still have no
+  forward secrecy; the stored identity format is not yet encrypted by this
+  crate (the demo writes it in the clear to a dev wallet file).
 

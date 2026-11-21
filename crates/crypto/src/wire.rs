@@ -941,7 +941,7 @@ mod tests {
     }
 
     fn setup() -> (Responder<u32>, Initiator, Vec<u8>) {
-        let bob = ContactIdentity::generate();
+        let bob = ContactIdentity::generate_at(0);
         let mut side = Responder::for_identity(&bob, NET);
         let key = StaticKey::generate();
         let invitation = bob.invite(NET, key.public(), Purpose::Contact, 5_000);

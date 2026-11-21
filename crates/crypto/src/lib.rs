@@ -27,7 +27,10 @@ pub mod snapshot;
 mod session;
 pub mod wire;
 
-pub use contact::{is_contributory_key, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, Invitation, Network, Purpose, StaticKey};
+pub use contact::{
+    epoch_start, is_contributory_key, random_bytes, CardSummary, ContactCard, ContactError, ContactIdentity, InboxEpoch,
+    Invitation, Network, Purpose, StaticKey, CLOCK_GRID_BACKDATE, DRAIN_GRACE, EPOCH_LEN,
+};
 pub use gate::{Gate, Grant, Now, CLOCK_SKEW_SECS};
 pub use snapshot::{write_atomically, SnapshotError, StorageKey, GATE_SNAPSHOT_VERSION};
 pub use identity::Identity;

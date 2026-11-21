@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn session_round_trip_and_mutual_authentication() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (mut a, mut b) = connect(&alice, &bob);
         assert_eq!(a.peer(), bob.handshake_key().public());
         assert_eq!(b.peer(), alice.public(), "the answerer learns the caller's key from message 1");
@@ -302,12 +302,12 @@ mod tests {
 
     #[test]
     fn the_answerer_reads_caller_and_reference_before_writing_anything() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (_hs, m1) = Handshake::initiate(&alice, &bob.handshake_key().public(), &NET, &CTX, &REF).unwrap();
         let incoming = Incoming::read(bob.handshake_key(), &NET, &CTX, &m1).unwrap();
         assert_eq!((incoming.caller(), incoming.reference()), (alice.public(), REF));
         // Another key, another network, or other call/attempt labels: no read.
-        assert!(Incoming::read(ContactIdentity::generate().handshake_key(), &NET, &CTX, &m1).is_err());
+        assert!(Incoming::read(ContactIdentity::generate_at(0).handshake_key(), &NET, &CTX, &m1).is_err());
         assert!(Incoming::read(bob.handshake_key(), &[0; 32], &CTX, &m1).is_err());
         assert!(Incoming::read(bob.handshake_key(), &NET, &[0, 0, 0, 8, 0, 0, 0, 1], &m1).is_err());
         assert!(Incoming::read(bob.handshake_key(), &NET, &[0, 0, 0, 7, 0, 0, 0, 2], &m1).is_err());
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn ciphertext_reveals_nothing_recognisable_and_outsiders_cannot_open_it() {
-        let (alice, bob, eve) = (StaticKey::generate(), ContactIdentity::generate(), ContactIdentity::generate());
+        let (alice, bob, eve) = (StaticKey::generate(), ContactIdentity::generate_at(0), ContactIdentity::generate_at(0));
         let (mut a, _b) = connect(&alice, &bob);
         let secret = b"the launch code is 0000";
         let sealed = a.seal(secret).unwrap();
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn handshake_exposes_no_static_key_reference_or_wallet() {
-        let (alice, bob, wallet) = (StaticKey::generate(), ContactIdentity::generate(), Identity::generate());
+        let (alice, bob, wallet) = (StaticKey::generate(), ContactIdentity::generate_at(0), Identity::generate());
         let (hs, m1) = Handshake::initiate(&alice, &bob.handshake_key().public(), &NET, &CTX, &REF).unwrap();
         let (_s, m2) = Incoming::read(bob.handshake_key(), &NET, &CTX, &m1).unwrap().accept().unwrap();
         hs.finish(&m2).unwrap();
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn messages_survive_reordering_but_not_replay() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (mut a, mut b) = connect(&alice, &bob);
         let sealed: Vec<Vec<u8>> = (0..5u8).map(|i| a.seal(&[i]).unwrap()).collect();
         for i in [3usize, 0, 4, 1, 2] {
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_refused_record_does_not_use_up_its_counter() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (mut a, mut b) = connect(&alice, &bob);
         let sealed = a.seal(b"x").unwrap();
         assert!(matches!(b.open_if(&sealed, |_| false), Err(SessionError::Refused)));
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn tampered_message_is_rejected_and_does_not_block_the_real_one() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (mut a, mut b) = connect(&alice, &bob);
         let sealed = a.seal(b"pay 10").unwrap();
         let mut forged = sealed.clone();
@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn a_caller_reaching_the_wrong_answerer_cannot_finish() {
-        let (alice, bob, mallory) = (StaticKey::generate(), ContactIdentity::generate(), ContactIdentity::generate());
+        let (alice, bob, mallory) = (StaticKey::generate(), ContactIdentity::generate_at(0), ContactIdentity::generate_at(0));
         let (hs, m1) = Handshake::initiate(&alice, &bob.handshake_key().public(), &NET, &CTX, &REF).unwrap();
         assert!(Incoming::read(mallory.handshake_key(), &NET, &CTX, &m1).is_err());
         let (_other, m1m) = Handshake::initiate(&alice, &mallory.handshake_key().public(), &NET, &CTX, &REF).unwrap();
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_hello_from_a_small_order_caller_key_is_refused_after_reading() {
-        let bob = ContactIdentity::generate();
+        let bob = ContactIdentity::generate_at(0);
         let prologue = prologue(&NET, &CTX);
         for weak in crate::contact::tests::SMALL_ORDER {
             let mut caller = snow::Builder::with_resolver(
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn the_send_counter_refuses_to_wrap() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (mut a, mut b) = connect(&alice, &bob);
         // u64::MAX is reserved by Noise; the last usable nonce is MAX - 1.
         a.next_send = u64::MAX - 2;
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn oversized_message_is_refused() {
-        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate());
+        let (alice, bob) = (StaticKey::generate(), ContactIdentity::generate_at(0));
         let (mut a, _b) = connect(&alice, &bob);
         assert!(matches!(a.seal(&vec![0u8; MAX_PLAINTEXT + 1]), Err(SessionError::TooLarge)));
         assert!(a.seal(&vec![0u8; MAX_PLAINTEXT]).is_ok());

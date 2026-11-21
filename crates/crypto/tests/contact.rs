@@ -20,8 +20,8 @@ fn now() -> Now {
 }
 
 fn bob_with_card() -> (ContactIdentity, ContactCard, Responder<u32>) {
-    let bob = ContactIdentity::generate();
-    let card = bob.card(NET, 1_000_000, 0, NOW + 86_400);
+    let bob = ContactIdentity::generate_at(NOW);
+    let card = bob.card_within(NET, 1_000_000, 0, NOW + 86_400);
     let side = Responder::for_identity(&bob, NET);
     (bob, card, side)
 }
@@ -58,8 +58,8 @@ fn connect(
 #[test]
 fn a_card_holds_three_contact_keys_and_no_wallet_key() {
     let wallet = Identity::generate();
-    let bob = ContactIdentity::generate();
-    let card = bob.card(NET, 5, 10, 20);
+    let bob = ContactIdentity::generate_at(NOW);
+    let card = bob.card_within(NET, 5, 10, 20);
     assert_eq!(card.verify(&NET, 10), Ok(()));
     assert_eq!(ContactCard::from_bytes(&card.to_bytes()).unwrap(), card);
     let keys = [card.signing_key, card.handshake_key, card.inbox_key];
@@ -71,21 +71,21 @@ fn a_card_holds_three_contact_keys_and_no_wallet_key() {
     forged.price = 1;
     assert_eq!(forged.verify(&NET, 15), Err(ContactError::BadSignature));
     let mut swapped = card.clone();
-    swapped.inbox_key = ContactIdentity::generate().inbox_key().public();
+    swapped.inbox_key = ContactIdentity::generate_at(NOW).inbox_key().public();
     assert_eq!(swapped.verify(&NET, 15), Err(ContactError::BadSignature));
     assert_eq!(ContactCard::from_bytes(&card.to_bytes()[1..]), Err(ContactError::Malformed));
 }
 
 #[test]
 fn a_card_carries_one_post_quantum_inbox_key_covered_by_its_signature() {
-    let bob = ContactIdentity::generate();
-    let card = bob.card(NET, 5, 10, 20);
+    let bob = ContactIdentity::generate_at(NOW);
+    let card = bob.card_within(NET, 5, 10, 20);
     assert_eq!((ContactCard::LEN, card.to_bytes().len()), (1_408, 1_408));
     assert_eq!(card.pq_inbox_key, bob.pq_inbox_key());
     assert_eq!(card.summary().pq_inbox_hash, anonymum_crypto::contact::pq_key_hash(&bob.pq_inbox_key()));
     // Another valid ML-KEM key swapped in: the signature (over its hash) fails.
     let mut swapped = card.clone();
-    swapped.pq_inbox_key = ContactIdentity::generate().pq_inbox_key();
+    swapped.pq_inbox_key = ContactIdentity::generate_at(NOW).pq_inbox_key();
     assert_eq!(swapped.verify(&NET, 15), Err(ContactError::BadSignature));
     let mut flipped = card.clone();
     flipped.pq_inbox_key[1_000] ^= 1;
@@ -94,14 +94,14 @@ fn a_card_carries_one_post_quantum_inbox_key_covered_by_its_signature() {
     assert_eq!(card.summary().verify(&NET, 15), Ok(()));
     assert_eq!(swapped.summary().verify(&NET, 15), Err(ContactError::BadSignature));
     // Restoring an identity restores its post-quantum key.
-    let (s, h, i, pq) = bob.to_secret_bytes();
-    assert_eq!(ContactIdentity::from_secret_bytes(s, h, i, pq).card(NET, 5, 10, 20), card);
+    let saved = bob.to_secret_bytes();
+    assert_eq!(ContactIdentity::from_secret_bytes(&saved).unwrap().card_within(NET, 5, 10, 20), card);
 }
 
 #[test]
 fn a_card_for_another_network_is_refused() {
-    let bob = ContactIdentity::generate();
-    let card = bob.card(NET, 5, 10, 20);
+    let bob = ContactIdentity::generate_at(NOW);
+    let card = bob.card_within(NET, 5, 10, 20);
     assert_eq!(card.network, NET);
     // Shown on another network, the genuine card is refused.
     assert_eq!(card.verify(&[1; 32], 15), Err(ContactError::WrongNetwork));
@@ -110,7 +110,7 @@ fn a_card_for_another_network_is_refused() {
     relabelled.network = [1; 32];
     assert_eq!(relabelled.verify(&[1; 32], 15), Err(ContactError::BadSignature));
     // A card Bob signs for the other network is valid there and only there.
-    let other = bob.card([1; 32], 5, 10, 20);
+    let other = bob.card_within([1; 32], 5, 10, 20);
     assert_eq!(other.verify(&[1; 32], 15), Ok(()));
     assert_eq!(other.verify(&NET, 15), Err(ContactError::WrongNetwork));
     assert_eq!(ContactCard::from_bytes(&other.to_bytes()).unwrap(), other);
@@ -118,7 +118,7 @@ fn a_card_for_another_network_is_refused() {
 
 #[test]
 fn an_invitation_names_issuer_holder_network_purpose_and_expiry() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let holder = StaticKey::generate().public();
     let invitation = bob.invite(NET, holder, Purpose::Contact, NOW + 60);
     assert_eq!(invitation.verify(&bob.signing_key(), &NET, NOW), Ok(()));
@@ -303,8 +303,8 @@ fn a_replayed_first_message_cannot_reopen_a_blocked_contact() {
 #[test]
 fn offline_carol_accepts_only_bobs_callback() {
     let (bob, card, _) = bob_with_card();
-    let carol = ContactIdentity::generate();
-    let carol_card = carol.card(NET, 1_000, 0, NOW + 86_400);
+    let carol = ContactIdentity::generate_at(NOW);
+    let carol_card = carol.card_within(NET, 1_000, 0, NOW + 86_400);
     let route = [0x77; ROUTE_LEN];
     let admission = [0xAD; 32];
     let note = seal_note(&NET, &card, &carol, &carol_card, &route, "Carol here", &admission).unwrap();
@@ -328,7 +328,7 @@ fn offline_carol_accepts_only_bobs_callback() {
     }
     // Bob's other identity, or Bob about another request: nothing either.
     let (_, hello) =
-        Initiator::start_with(ContactIdentity::generate().handshake_key(), callback.public(), NET, admission, POLICY)
+        Initiator::start_with(ContactIdentity::generate_at(NOW).handshake_key(), callback.public(), NET, admission, POLICY)
             .unwrap();
     gateway.push_back((51, hello));
     let (_, hello) = Initiator::start_with(bob.handshake_key(), callback.public(), NET, [1; 32], POLICY).unwrap();
@@ -337,7 +337,7 @@ fn offline_carol_accepts_only_bobs_callback() {
     // Bob opens the note with his inbox key alone; once his claim is final
     // he calls the callback key, naming the request inside the encrypted
     // first message.
-    let opened = open_note(&bob, &NET, &note, NOW).unwrap();
+    let opened = open_note(&bob, &NET, &note, NOW, NOW).unwrap();
     assert_eq!((opened.sender(), opened.callback(), opened.route), (carol.signing_key(), callback.public(), route));
     let (mut call, hello) =
         Initiator::start_with(bob.handshake_key(), opened.callback(), NET, opened.admission, POLICY).unwrap();
@@ -371,7 +371,7 @@ fn record_invitation_checks_what_it_is_given() {
     let (bob, _, mut bob_side) = bob_with_card();
     let holder = StaticKey::generate().public();
     // Issued by someone else.
-    let other = ContactIdentity::generate().invite(NET, holder, Purpose::Contact, NOW + 60);
+    let other = ContactIdentity::generate_at(NOW).invite(NET, holder, Purpose::Contact, NOW + 60);
     assert_eq!(bob_side.record_invitation(other, now()), Err(ContactError::WrongIssuer));
     // Tampered after signing.
     let mut tampered = bob.invite(NET, holder, Purpose::Contact, NOW + 60);
@@ -405,7 +405,7 @@ fn responder_and_gate_share_one_network() {
 
 #[test]
 fn a_callback_grant_expires_at_its_deadline_and_nothing_is_sent() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let callback = StaticKey::generate();
     let deadline = NOW + 600;
     let mut carol_side: Responder<u32> =
@@ -500,7 +500,7 @@ fn blocking_cancels_grants_and_unblocking_restores_none() {
 
 #[test]
 fn removing_the_recipient_cancels_an_outstanding_callback_grant() {
-    let bob = ContactIdentity::generate();
+    let bob = ContactIdentity::generate_at(NOW);
     let callback = StaticKey::generate();
     let deadline = NOW + 3_600;
     let mut carol_side: Responder<u32> =
