@@ -118,7 +118,12 @@ rerun.
 
 The signed card sequence number (2026-11-21) makes cards 1,416 bytes and
 notes 1,795 bytes (runtime `spec_version` 7). The unit tests cover it;
-`smoke.mjs`, `e2e.mjs` and the live demo have **not** been rerun with it.
+on 2026-11-22, at `ddbbf73`, the release WebAssembly runtime ran on a local
+dev node and `smoke.mjs` and `e2e.mjs` both passed. In `e2e.mjs` a real
+1,795-byte note went through chain state unchanged, was opened, and the
+callback completed over the live Nym mixnet. These runs are manual: CI does
+not build the runtime or start a node. The standalone live demo was not
+rerun.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
