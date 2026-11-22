@@ -250,6 +250,46 @@ escrow locks a fee ceiling, the unused part returns to the sender on every
 outcome, and a fee above the reserve is paid with a top-up note. Not
 reviewed.
 
+### Prototype circuit (`crates/shielded-circuit`)
+
+> **Unreviewed prototype. Not audited. Not for real value.** Its keys come
+> from a single-process development setup, so whoever runs it could forge
+> proofs and mint coins. Nothing in `substrate/` uses it.
+
+One Groth16 circuit over BLS12-381 (arkworks 0.4) proves all six branches
+of the spec, with domain-separated Poseidon and a depth-20 Merkle tree. It
+has 11 public inputs. Decoding a proof checks curve and prime-order subgroup
+membership.
+
+| Measured 2026-11-22 (release build, 8 threads, this Windows machine) | |
+|---|---|
+| R1CS constraints | 20,700 |
+| Proof size | 192 bytes |
+| Setup | 1.95 s |
+| Proving (mean of 10 transactions) | 1.88 s |
+| Verifying, with strict decoding and sighash | 5.89 ms |
+| Proving key / verifying key | 6.2 MiB / 920 bytes |
+
+    cargo test -p anonymum-shielded-circuit
+    cargo run --release --locked -p anonymum-shielded-circuit --example bench
+
+The 115 tests prove and verify every branch and both fee paths, and refuse
+altered witnesses and malformed proofs. Of 80 mutations that each removed
+or changed one rule, 76 were caught; the other 4 remove constraints that
+other rules already imply. Limits to know about:
+
+- The chain-side checks (accepted root, unused and distinct nullifiers,
+  window grid, payload lengths) are not wired up.
+- Depth 20 holds about 1 million notes, or about 350,000 transactions at
+  three outputs each. `TREE_DEPTH` is one constant, but changing it needs
+  new keys.
+- The surcharge `S` is compiled into the circuit, so changing it needs new
+  keys too.
+- Slots are fixed as in the model's builder, so the circuit is stricter than
+  the model, which accepts outputs in any order.
+- Groth16 proof bytes can be re-randomised by anyone for the same public
+  inputs, so they must never identify a transaction.
+
 ## What is real and what is not
 
 | Piece | Status |
@@ -262,7 +302,7 @@ reviewed.
 | Out-of-order delivery, replay protection | Built, tested (a mixnet reorders on purpose; the ratchet caches up to 1,024 skipped keys, at most 256 per step) |
 | Mixnet transport | Nym SDK; replies go through single-use reply blocks, so the recipient never learns the caller's network location. Ran once live; no automated test |
 | The chain itself | Rules run as a Substrate pallet on a local single-node dev chain (manual seal, 6 s blocks). No real network, consensus or validators yet |
-| Shielded payments | Specified (`docs/shielded-spec-v0.md`, draft for review) and modelled in plain Rust (`crates/shielded-model`, rules only, not private). No circuit or pallet yet; the channel table is still public |
+| Shielded payments | Specified (`docs/shielded-spec-v0.md`, draft for review) and modelled in plain Rust (`crates/shielded-model`, rules only, not private). A Groth16 circuit exists as an **unreviewed prototype with an insecure development setup** (`crates/shielded-circuit`). No pallet or wallet uses it; the channel table is still public |
 | Node staking and rewards | Pool accumulates; payout not started |
 | Post-quantum key exchange in sessions | Not started |
 
@@ -383,6 +423,7 @@ reviewed.
    with real transactions. Not done: benchmarked weights, a real network
    with consensus, our own node binary.
 5. Shielded channel opening, so the chain no longer reveals the contact graph.
+   Prototype circuit done 2026-11-22 (unreviewed, not wired to any chain).
 6. Double ratchet (prototyped 2026-11-21, unreviewed) and post-quantum key
    exchange.
 7. Node staking, reward payout, fee simulation, external audit.

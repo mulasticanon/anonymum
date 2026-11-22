@@ -1,0 +1,33 @@
+[package]
+name = "anonymum-shielded-circuit"
+version = "0.1.0"
+edition = "2021"
+description = "UNREVIEWED PROTOTYPE: Groth16 / BLS12-381 circuit for the shielded rules in docs/shielded-spec-v0.md. Not audited. Not for real value."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The 0.4 line is the arkworks version already pinned in the workspace
+# lockfile (via the Nym dependency tree), so no existing pin moves.
+[dependencies]
+ark-bls12-381 = { version = "=0.4.0", default-features = false, features = ["curve"] }
+ark-crypto-primitives = { version = "=0.4.0", default-features = false, features = ["std", "parallel", "sponge", "r1cs"] }
+ark-ec = { version = "=0.4.2", default-features = false }
+ark-ff = { version = "=0.4.2", default-features = false }
+ark-groth16 = { version = "=0.4.0", default-features = false, features = ["std", "parallel"] }
+ark-r1cs-std = { version = "=0.4.0", default-features = false, features = ["std"] }
+ark-relations = { version = "=0.4.0", default-features = false, features = ["std"] }
+ark-serialize = { version = "=0.4.2", default-features = false, features = ["std"] }
+ark-snark = { version = "=0.4.0", default-features = false }
+ark-std = { version = "=0.4.0", default-features = false, features = ["std"] }
+# Already in the lockfile, used by the other crates.
+blake2 = "=0.10.6"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+
+[dev-dependencies]
+# Only to check that this crate's constants and rule arithmetic match the
+# reference model.
+anonymum-shielded-model = { path = "../shielded-model" }
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"

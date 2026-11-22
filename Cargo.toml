@@ -1,7 +1,28 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/crypto", "crates/nym", "crates/shielded-model"]
+members = ["crates/core", "crates/crypto", "crates/nym", "crates/shielded-model", "crates/shielded-circuit"]
 # The Substrate port is its own workspace (own Cargo.lock).
 exclude = ["substrate"]
 # The Nym crate pulls in several hundred dependencies; keep everyday builds fast.
-default-members = ["crates/core", "crates/crypto", "crates/shielded-model"]
+default-members = ["crates/core", "crates/crypto", "crates/shielded-model", "crates/shielded-circuit"]
+
+# Proving is unusably slow unoptimised. These overrides only change how the
+# arkworks crates and the circuit crate are compiled in dev and test builds.
+[profile.dev.package.ark-ff]
+opt-level = 3
+[profile.dev.package.ark-ec]
+opt-level = 3
+[profile.dev.package.ark-poly]
+opt-level = 3
+[profile.dev.package.ark-bls12-381]
+opt-level = 3
+[profile.dev.package.ark-groth16]
+opt-level = 3
+[profile.dev.package.ark-relations]
+opt-level = 3
+[profile.dev.package.ark-r1cs-std]
+opt-level = 3
+[profile.dev.package.ark-crypto-primitives]
+opt-level = 3
+[profile.dev.package.anonymum-shielded-circuit]
+opt-level = 2
