@@ -7,6 +7,7 @@
 //   cd substrate/scripts && node shielded-smoke.mjs
 
 import { ApiPromise, WsProvider } from '@polkadot/api';
+import { compactAddLength, u8aConcat, u8aToHex } from '@polkadot/util';
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const TOOL = resolve(here, '../../target/release/examples', process.platform === 'win32' ? 'dev_tool.exe' : 'dev_tool');
 const [CHAIN_ID, VERSION, WINDOW, FEE] = [4242, 1, 60, 1000n];
+const SPEC_VERSION = 9;
 
 function check(ok, message) {
   if (!ok) {
@@ -23,38 +25,55 @@ function check(ok, message) {
   console.log(`  ok: ${message}`);
 }
 
-const api = await ApiPromise.create({ provider: new WsProvider('ws://127.0.0.1:9944'), noInitWarn: true });
+const provider = new WsProvider('ws://127.0.0.1:9944');
+const api = await ApiPromise.create({ provider, noInitWarn: true });
 const q = api.query.anonymumShielded;
 const nowSecs = async () => Math.floor(Number((await api.query.timestamp.now()).toBigInt()) / 1000);
+const head = async () => (await api.rpc.chain.getHeader()).number.toNumber();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function callOf(t, note = t.note, proof = t.proof) {
-  return api.tx.anonymumShielded.submitShielded(
+/**
+ * A general transaction (extrinsic format 5), which Polkadot.js does not
+ * build itself. No signer, so nothing identifies a sender:
+ * 0x45 (format 5, general), 0x00 (extension version), then the extensions
+ * that carry data, in pipeline order: era 0x00 (immortal), nonce 0, tip 0.
+ */
+function general(t, note = t.note, proof = t.proof) {
+  const method = api.tx.anonymumShielded.submitShielded(
     t.root, t.nullifiers, t.commitments, t.admission, t.notBefore, t.notAfter, t.coin, note, proof,
-  );
+  ).method.toU8a();
+  return u8aToHex(compactAddLength(u8aConcat(new Uint8Array([0x45, 0x00, 0x00, 0x00, 0x00]), method)));
 }
 
-/** Resolve with the events once finalized; reject if the pool refuses it. */
-function submit(tx) {
-  return new Promise((resolvePromise, reject) => {
-    tx.send((result) => {
-      if (result.isError || result.status.isInvalid || result.status.isDropped) reject(new Error(result.status.type));
-      if (result.status.isFinalized || result.status.isInBlock) resolvePromise(result);
-    }).catch(reject);
-  });
-}
+const send = (hex) => provider.send('author_submitExtrinsic', [hex]);
 
-async function refused(tx) {
+/** The node's refusal message, or null if it accepted the transaction. */
+async function refused(hex) {
   try {
-    await Promise.race([submit(tx), sleep(20_000).then(() => { throw new Error('timeout'); })]);
+    await send(hex);
     return null;
   } catch (e) {
     return e.message;
   }
 }
 
+/** The `Shielded` event of the first block after `from` that has one. */
+async function shieldedEvent(from) {
+  for (let tries = 0; tries < 60; tries++) {
+    const top = await head();
+    for (let n = from + 1; n <= top; n++) {
+      const at = await api.at(await api.rpc.chain.getBlockHash(n));
+      const events = await at.query.system.events();
+      const found = events.find(({ event: e }) => e.section === 'anonymumShielded' && e.method === 'Shielded');
+      if (found) return { found, failed: events.find(({ event: e }) => e.method === 'ExtrinsicFailed') };
+    }
+    await sleep(1000);
+  }
+  return {};
+}
+
 console.log(`Connected, spec_version ${api.runtimeVersion.specVersion}`);
-check(api.runtimeVersion.specVersion.toNumber() === 8, 'runtime spec_version is 8');
+check(api.runtimeVersion.specVersion.toNumber() === SPEC_VERSION, `runtime spec_version is ${SPEC_VERSION}`);
 check((await q.baseFee()).toBigInt() === FEE, 'dev base fee is in genesis');
 check((await q.nextIndex()).toNumber() === 4, 'the tree starts with the 4 fixture leaves');
 const startRoot = (await q.currentRoot()).toHex();
@@ -66,17 +85,29 @@ const t = JSON.parse(execFileSync(TOOL, ['tx', CHAIN_ID, VERSION, await nowSecs(
 console.log(`\nProved a Transfer in ${Date.now() - started} ms (includes regenerating the dev keys).`);
 check(t.root === startRoot, 'proved against the on-chain root');
 
+// Refusals by authorization, before anything is pooled.
 const tampered = `0x${t.note.startsWith('0xff') ? '00' : 'ff'}${t.note.slice(4)}`;
-const bad = await refused(callOf(t, tampered));
-check(bad !== null, `the pool refuses a tampered stranger note (${bad})`);
+let why = await refused(general(t, tampered));
+check(why?.includes('Custom error: 12'), `the pool refuses a tampered stranger note (${why})`);
+const garbage = `0x${'ff'.repeat(192)}`;
+why = await refused(general(t, t.note, garbage));
+check(why?.includes('Custom error: 11'), `the pool refuses malformed proof bytes (${why})`);
+why = await refused(general(t, t.note.slice(0, -2)));
+check(why !== null, `the pool refuses a short note (${why})`);
 
-const result = await submit(callOf(t));
-const event = result.events.find(({ event: e }) => e.section === 'anonymumShielded' && e.method === 'Shielded');
-const failed = result.events.find(({ event: e }) => e.section === 'system' && e.method === 'ExtrinsicFailed');
-check(!failed && event, 'the WebAssembly runtime verified the proof and accepted the transaction');
-check(result.txHash && !JSON.stringify(event.event.data.toHuman()).includes(t.proof), 'the event does not carry the proof');
+const before = await head();
+await send(general(t));
+check(true, 'the pool accepted the general transaction, with no signer');
+// Same nullifiers, different proof bytes: refused while the first is pooled
+// (a tag conflict) or once it is included (a spent nullifier).
+why = await refused(general(t, t.note, t.rerandomised));
+check(why !== null, `a re-randomised copy is refused at once (${why})`);
 
-const [sighash, noteHash, windowStart] = event.event.data;
+const { found, failed } = await shieldedEvent(before);
+check(found && !failed, 'the WebAssembly runtime verified the proof and accepted the transaction');
+check(!JSON.stringify(found.event.data.toJSON()).includes(t.proof.slice(2)), 'the event does not carry the proof');
+
+const [sighash, noteHash, windowStart] = found.event.data;
 check((await q.nextIndex()).toNumber() === 7, 'three leaves were appended');
 const newRoot = (await q.currentRoot()).toHex();
 check(newRoot !== startRoot && (await q.acceptedRoots(newRoot)).isSome, 'the new root is accepted');
@@ -86,17 +117,14 @@ const stored = await q.strangerNotes(windowStart, sighash);
 check(stored.isSome && stored.unwrap().length === 1795, 'the 1,795-byte note is in the 24-hour buffer');
 check(noteHash.toHex().length === 66, 'the note hash is in the event');
 
-// A valid proof of the same statement, with different bytes and so a
-// different transaction hash: only the nullifiers can stop it.
-check(t.rerandomised !== t.proof, 'the re-randomised proof has different bytes');
-const replay = await refused(callOf(t, t.note, t.rerandomised));
-check(replay !== null && replay.includes('Custom error: 7'), `a re-randomised replay is refused as a spent nullifier (${replay})`);
+why = await refused(general(t, t.note, t.rerandomised));
+check(why?.includes('Custom error: 7'), `a re-randomised replay is refused as a spent nullifier (${why})`);
 
-// The pool may answer an identical resubmission with the first inclusion's
-// status, so the check that matters is that nothing happened twice.
-await refused(callOf(t));
-const blockBefore = (await api.rpc.chain.getHeader()).number.toNumber();
-while ((await api.rpc.chain.getHeader()).number.toNumber() < blockBefore + 2) await sleep(1000);
+// The pool may answer an identical resubmission in its own way, so the check
+// that matters is that nothing happened twice.
+await refused(general(t));
+const after = await head();
+while ((await head()) < after + 2) await sleep(1000);
 check((await q.nextIndex()).toNumber() === 7, 'after two more blocks the tree has not grown');
 check((await q.currentRoot()).toHex() === newRoot, 'the root has not moved');
 check((await q.burnedFees()).toBigInt() === FEE / 2n, 'no second fee was counted');

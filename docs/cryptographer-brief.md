@@ -392,9 +392,10 @@ wallet synchronisation, and from the small population at launch.
   Groth16's binding of public inputs, given that proofs can be
   re-randomised for the same inputs. Its setup is insecure by design, and
   the shielded pallet (below) is its only verifier.
-- The shielded pallet is unreviewed. Points we most want checked: unsigned
-  submission, where nobody pays for a bad proof, so a peer can make nodes
-  run pairings for free; verifying with arkworks 0.4 inside the runtime
+- The shielded pallet is unreviewed. Points we most want checked:
+  submission as a general transaction with no signer, authorized by
+  `#[pallet::authorize]` in the pool and at inclusion, where nobody pays for
+  a bad proof, so a peer can make nodes run pairings for free; verifying with arkworks 0.4 inside the runtime
   rather than through host functions; whether nullifier tags in the pool
   and the strict scalar and point decoding are sufficient; and storing the
   verifying key uncompressed after validating it once at genesis. Shielded

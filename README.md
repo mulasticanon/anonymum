@@ -121,9 +121,10 @@ notes 1,795 bytes (runtime `spec_version` 7). The unit tests cover it;
 on 2026-11-22, at `ddbbf73`, the release WebAssembly runtime ran on a local
 dev node and `smoke.mjs` and `e2e.mjs` both passed. In `e2e.mjs` a real
 1,795-byte note went through chain state unchanged, was opened, and the
-callback completed over the live Nym mixnet. These runs are manual: CI does
-not build the runtime or start a node. The standalone live demo was not
-rerun.
+callback completed over the live Nym mixnet. CI builds the release
+WebAssembly runtime on every push and pull request touching `substrate/`
+(since 2026-11-22), but it does not start a node, so these live runs are
+still manual. The standalone live demo was not rerun.
 
 **How long gateways hold messages:** Nym nodes delete stored messages for an
 offline client after 24 hours by default (`stale_messages.max_age` in
@@ -295,19 +296,24 @@ other rules already imply. Limits to know about:
 > forge proofs under it and mint shielded value. The fixture notes in
 > genesis have their secrets in this repository.
 
-`submit_shielded` is an unsigned call, so no account appears on chain. Before
-any write it checks the note length, clock grid, block time, accepted root
-and nullifiers, recomputes the stranger-note hash and the sighash, strictly
-decodes the 192-byte proof, and verifies it inside the runtime. It then
-records the nullifiers, appends three leaves to a depth-20 Poseidon tree,
-keeps the stranger note for 24 hours, and splits the base fee between two
-counters.
+`submit_shielded` is a general transaction (extrinsic format 5) authorized
+by `#[pallet::authorize]`, so it has no signer and no account appears on
+chain. Authorization runs in the transaction pool and again at inclusion,
+cheapest check first: note length, clock grid and time, accepted root,
+nullifiers, strict decoding of the 192-byte proof, and only then the sighash
+and the Groth16 pairing. Pool tags are the two nullifiers, never the proof
+bytes, so a re-randomised copy conflicts with the original. Dispatch repeats
+the cheap checks without a second pairing, then records the nullifiers,
+appends three leaves to a depth-20 Poseidon tree, keeps the stranger note for
+24 hours, and splits the base fee between two counters.
 
-Measured 2026-11-22: the runtime grew from 384,816 to 476,726 bytes
-compressed (+91,910, +23.9%). A dev-node block holding one shielded
-transaction took 92 to 162 ms to build (two samples). `shielded-smoke.mjs`
-passed on the dev node: the WebAssembly runtime verified a real proof,
-and a tampered note and a re-randomised replay were refused.
+Measured 2026-11-22 (runtime `spec_version` 9): the runtime is 477,931 bytes
+compressed, up from 384,816 before the shielded pallet (+93,115, +24.2%).
+`shielded-smoke.mjs`, `smoke.mjs` and `e2e.mjs` passed on a dev node: the
+WebAssembly runtime verified a real proof, and a tampered note, malformed
+proof bytes, a short note and a re-randomised replay were refused.
+Polkadot.js cannot build a general transaction, so `shielded-smoke.mjs`
+encodes it itself.
 
     cargo build --release --locked -p anonymum-shielded-circuit --example dev_tool
     bash substrate/scripts/run-node.sh                    # in WSL
@@ -321,10 +327,9 @@ Not solved, and each blocks any public network:
 - **Shielded value is not connected to balances.** Genesis notes are not
   backed by `pallet-balances`, and `BurnedFees` and `NodeRewardPool` are
   counters that pay nothing out.
-- **The weight is a placeholder** (300 ms), not a benchmark, which allows
-  about five shielded transactions per block.
-- **`ValidateUnsigned` is deprecated** by the Polkadot SDK, with removal after
-  April 2027. `#[pallet::authorize]` is the replacement.
+- **The weights are placeholders** (240 ms to authorize plus 60 ms to
+  dispatch), not benchmarks, which allow about five shielded transactions
+  per block.
 - **Unchecked by a specialist:** the pallet, the circuit and the spec.
 
 ## What is real and what is not

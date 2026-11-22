@@ -1,9 +1,10 @@
 name: Substrate pallet
 
 # The Polkadot SDK build is large, so this runs only when the Substrate port
-# changes. It runs both pallets' unit tests; the WebAssembly runtime and the
-# live dev node are checked manually (see README, "Local node"). The shielded
-# pallet's tests prove with crates/shielded-circuit, so those paths count too.
+# changes. It runs both pallets' unit tests and builds the release WebAssembly
+# runtime, so no_std regressions are caught. The live dev node is checked
+# manually (see README, "Local node"). The shielded pallet's tests prove with
+# crates/shielded-circuit, so those paths count too.
 on:
   push:
     paths: ["substrate/**", "crates/shielded-circuit/**", "crates/shielded-model/**", ".github/workflows/substrate.yml"]
@@ -30,3 +31,25 @@ jobs:
           workspaces: substrate
       - run: cargo test --locked -p pallet-anonymum
       - run: cargo test --locked -p pallet-anonymum-shielded
+
+  wasm-runtime:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: substrate
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: substrate
+          key: wasm-runtime
+      - run: cargo build --locked --release -p anonymum-runtime
+      - name: Check the WebAssembly blob exists
+        run: |
+          blob=target/release/wbuild/anonymum-runtime/anonymum_runtime.compact.compressed.wasm
+          test -s "$blob"
+          echo "compressed runtime: $(wc -c < "$blob") bytes"

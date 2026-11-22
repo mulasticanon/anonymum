@@ -9,12 +9,15 @@
 //!   Anyone can forge proofs under it and mint shielded value.
 //! - Shielded value is not connected to `pallet-balances`. `BurnedFees` and
 //!   `NodeRewardPool` are counters; nothing pays out.
-//! - `submit_shielded` is unsigned, so nobody pays to have a *bad* proof
+//! - `submit_shielded` has no signer, so nobody pays to have a *bad* proof
 //!   checked. Cheap checks run first, but a peer can still make nodes do a
 //!   pairing for free. This needs rate limiting before any public network.
-//! - The weight is a measured placeholder, not a benchmark.
-//! - `ValidateUnsigned` is deprecated by the SDK (removal after April 2027);
-//!   `#[pallet::authorize]` is its replacement.
+//! - The weights are placeholders, not benchmarks.
+//!
+//! The call is a *general* transaction (extrinsic format 5) authorized by
+//! `#[pallet::authorize]` through `frame_system::AuthorizeCall`. That runs
+//! in the pool and again at inclusion, so the pairing lives there alone; the
+//! dispatch repeats only the cheap state checks.
 //!
 //! Proof bytes are never a key, index or identifier: Groth16 proofs can be
 //! re-randomised, and replay is stopped by the nullifiers alone.
@@ -42,9 +45,11 @@ pub mod pallet {
     use alloc::vec::Vec;
     use ark_bls12_381::Fr;
     use frame::deps::frame_support::traits::Time;
+    use frame::deps::frame_support::pallet_prelude::TransactionValidityWithRefund;
     use frame::deps::sp_runtime::transaction_validity::{
-        InvalidTransaction, TransactionSource, TransactionValidity, ValidTransaction,
+        InvalidTransaction, TransactionSource, TransactionValidityError, ValidTransaction,
     };
+    use polkadot_sdk::frame_system::ensure_authorized;
     use frame::deps::sp_runtime::Percent;
     use frame::prelude::*;
 
@@ -77,10 +82,13 @@ pub mod pallet {
         type MaxPruneWindows: Get<u32>;
         /// How many blocks a valid transaction may wait in the pool.
         #[pallet::constant]
-        type UnsignedLongevity: Get<u64>;
-        /// Placeholder weight of `submit_shielded` (not benchmarked).
+        type PoolLongevity: Get<u64>;
+        /// Placeholder weight of the dispatch: the state updates.
         #[pallet::constant]
         type SubmitWeight: Get<Weight>;
+        /// Placeholder weight of authorization: decoding and the pairing.
+        #[pallet::constant]
+        type AuthorizeWeight: Get<Weight>;
     }
 
     #[pallet::pallet]
@@ -274,9 +282,12 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Submit one shielded transaction. Unsigned: no account appears.
+        /// Submit one shielded transaction. No account appears: the call
+        /// authorizes itself with its proof.
         #[pallet::call_index(0)]
         #[pallet::weight((T::SubmitWeight::get(), DispatchClass::Normal, Pays::No))]
+        #[pallet::authorize(Self::authorize_submit)]
+        #[pallet::weight_of_authorize(T::AuthorizeWeight::get())]
         #[allow(clippy::too_many_arguments)]
         pub fn submit_shielded(
             origin: OriginFor<T>,
@@ -290,7 +301,7 @@ pub mod pallet {
             stranger_note: StrangerNote,
             proof: [u8; PROOF_LEN],
         ) -> DispatchResult {
-            ensure_none(origin)?;
+            ensure_authorized(origin)?;
             let tx = TxRef {
                 root: &root,
                 nullifiers: &nullifiers,
@@ -302,48 +313,13 @@ pub mod pallet {
                 stranger_note: &stranger_note,
                 proof: &proof,
             };
-            // Every check runs before the first write.
+            // The authorized origin means this transaction's proof verified at
+            // inclusion. Repeat the cheap checks, never the pairing, and do all
+            // of it before the first write.
             let checked = Self::check_cheap(&tx, TimeRule::InBlock(Self::now_secs()))?;
-            Self::check_proof(&tx, &checked)?;
-            Self::apply(&tx, checked, stranger_note.clone());
+            let digests = Self::digests(&tx, &checked);
+            Self::apply(&tx, checked, digests, stranger_note.clone());
             Ok(())
-        }
-    }
-
-    #[pallet::validate_unsigned]
-    #[allow(deprecated)]
-    impl<T: Config> ValidateUnsigned for Pallet<T> {
-        type Call = Call<T>;
-
-        fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
-            let Some(tx) = TxRef::from_call(call) else {
-                return InvalidTransaction::Call.into();
-            };
-            let checked = Self::check_cheap(&tx, TimeRule::InPool(Self::now_secs())).map_err(Self::refusal)?;
-            Self::check_proof(&tx, &checked).map_err(Self::refusal)?;
-            ValidTransaction::with_tag_prefix("AnonymumShielded")
-                .priority(1)
-                // Two transactions spending one note can never both be pooled.
-                .and_provides(tx.nullifiers[0])
-                .and_provides(tx.nullifiers[1])
-                .longevity(T::UnsignedLongevity::get())
-                .propagate(true)
-                .build()
-        }
-
-        // Inclusion repeats only the cheap checks: the call itself verifies
-        // the proof, so a block does not pay for two pairings per transaction.
-        fn pre_dispatch(call: &Self::Call) -> Result<(), TransactionValidityError> {
-            let Some(tx) = TxRef::from_call(call) else {
-                return Err(InvalidTransaction::Call.into());
-            };
-            let now = Self::now_secs();
-            // The pool also holds transactions for the next window. `Future`
-            // leaves one there for a later block instead of dropping it.
-            if now < tx.not_before {
-                return Err(InvalidTransaction::Future.into());
-            }
-            Self::check_cheap(&tx, TimeRule::InBlock(now)).map(|_| ()).map_err(|e| Self::refusal(e).into())
         }
     }
 
@@ -360,35 +336,6 @@ pub mod pallet {
         proof: &'a [u8; PROOF_LEN],
     }
 
-    impl<'a> TxRef<'a> {
-        fn from_call<T: Config>(call: &'a Call<T>) -> Option<Self> {
-            match call {
-                Call::submit_shielded {
-                    root,
-                    nullifiers,
-                    commitments,
-                    admission_commitment,
-                    not_before,
-                    not_after,
-                    coin_payloads,
-                    stranger_note,
-                    proof,
-                } => Some(TxRef {
-                    root,
-                    nullifiers,
-                    commitments,
-                    admission: admission_commitment,
-                    not_before: *not_before,
-                    not_after: *not_after,
-                    coin_payloads,
-                    stranger_note,
-                    proof,
-                }),
-                _ => None,
-            }
-        }
-    }
-
     /// Which clock rule applies.
     #[derive(Clone, Copy)]
     pub(crate) enum TimeRule {
@@ -399,14 +346,20 @@ pub mod pallet {
         InPool(u64),
     }
 
-    /// What the cheap checks computed, for the proof check and the update.
+    /// What the cheap checks computed.
     pub(crate) struct Checked {
-        inputs: [Fr; N_PUBLIC],
-        sighash: Bytes32,
-        note_hash: Bytes32,
+        /// The public inputs before the sighash, in circuit order.
+        fields: [Fr; N_PUBLIC - 1],
         burned: u128,
         reward: u128,
         first_position: u64,
+    }
+
+    /// The transaction's digests, computed outside the circuit.
+    pub(crate) struct Digests {
+        inputs: [Fr; N_PUBLIC],
+        sighash: Bytes32,
+        note_hash: Bytes32,
     }
 
     impl<T: Config> Pallet<T> {
@@ -414,11 +367,69 @@ pub mod pallet {
             T::TimeProvider::now() / 1_000
         }
 
-        fn refusal(error: Error<T>) -> InvalidTransaction {
-            InvalidTransaction::Custom(error.code())
+        /// Authorization, in strict order: (1) note length, (2) clock grid
+        /// and block time, (3) root, (4) nullifiers, each in `check_cheap`;
+        /// (5) strict proof decoding; (6) only then the sighash and pairing.
+        /// Tags are the nullifiers, never the proof, so a re-randomised copy
+        /// conflicts with the original in the pool.
+        #[allow(clippy::too_many_arguments)]
+        fn authorize_submit(
+            source: TransactionSource,
+            root: &Bytes32,
+            nullifiers: &[Bytes32; 2],
+            commitments: &[Bytes32; 3],
+            admission_commitment: &Bytes32,
+            not_before: &u64,
+            not_after: &u64,
+            coin_payloads: &[[u8; COIN_PAYLOAD_LEN]; 2],
+            stranger_note: &StrangerNote,
+            proof: &[u8; PROOF_LEN],
+        ) -> TransactionValidityWithRefund {
+            let tx = TxRef {
+                root,
+                nullifiers,
+                commitments,
+                admission: admission_commitment,
+                not_before: *not_before,
+                not_after: *not_after,
+                coin_payloads,
+                stranger_note,
+                proof,
+            };
+            let now = Self::now_secs();
+            let in_block = source == TransactionSource::InBlock;
+            let rule = if in_block { TimeRule::InBlock(now) } else { TimeRule::InPool(now) };
+            let refuse = |error: Error<T>| -> TransactionValidityError {
+                // The pool also holds transactions for the next window. `Future`
+                // leaves one there for a later block instead of dropping it.
+                if in_block && now < *not_before && matches!(error, Error::OutsideWindow) {
+                    InvalidTransaction::Future.into()
+                } else {
+                    InvalidTransaction::Custom(error.code()).into()
+                }
+            };
+
+            let checked = Self::check_cheap(&tx, rule).map_err(refuse)?;
+            let key = DevVerifyingKey::<T>::get().ok_or(Error::<T>::NoVerifyingKey).map_err(refuse)?;
+            let decoded = decode_proof(tx.proof).ok_or(Error::<T>::MalformedProof).map_err(refuse)?;
+            let digests = Self::digests(&tx, &checked);
+            if !verify(&key, &decoded, &digests.inputs) {
+                return Err(refuse(Error::<T>::InvalidProof));
+            }
+
+            let validity = ValidTransaction::with_tag_prefix("AnonymumShielded")
+                .priority(1)
+                // Two transactions spending one note can never both be pooled.
+                .and_provides(tx.nullifiers[0])
+                .and_provides(tx.nullifiers[1])
+                .longevity(T::PoolLongevity::get())
+                .propagate(true)
+                .build()?;
+            Ok((validity, Weight::zero()))
         }
 
-        /// Everything except the pairing, cheapest first. Reads only.
+        /// Steps 1 to 4 and the other checks that need no curve arithmetic.
+        /// Reads only.
         pub(crate) fn check_cheap(tx: &TxRef, time: TimeRule) -> Result<Checked, Error<T>> {
             ensure!(tx.stranger_note.len() == STRANGER_NOTE_LEN as usize, Error::<T>::WrongNoteLength);
 
@@ -464,35 +475,32 @@ pub mod pallet {
                 Fr::from(tx.not_before),
                 Fr::from(tx.not_after),
             ];
+            Ok(Checked { fields, burned, reward, first_position })
+        }
+
+        /// The stranger-note hash and the sighash, computed outside the circuit.
+        pub(crate) fn digests(tx: &TxRef, checked: &Checked) -> Digests {
             let note_hash = stranger_note_hash(tx.stranger_note);
             let sighash = compute_sighash(&SighashInputs {
                 chain_id: T::ChainId::get(),
                 version: T::TxVersion::get(),
-                fields: &fields,
+                fields: &checked.fields,
                 coin_slots: tx.coin_payloads,
                 stranger_note_hash: &note_hash,
             });
             let mut inputs = [sighash; N_PUBLIC];
-            inputs[..N_PUBLIC - 1].copy_from_slice(&fields);
-            Ok(Checked { inputs, sighash: encode_fr(&sighash), note_hash, burned, reward, first_position })
-        }
-
-        /// Strict decoding, then the pairing check.
-        pub(crate) fn check_proof(tx: &TxRef, checked: &Checked) -> Result<(), Error<T>> {
-            let proof = decode_proof(tx.proof).ok_or(Error::<T>::MalformedProof)?;
-            let key = DevVerifyingKey::<T>::get().ok_or(Error::<T>::NoVerifyingKey)?;
-            ensure!(verify(&key, &proof, &checked.inputs), Error::<T>::InvalidProof);
-            Ok(())
+            inputs[..N_PUBLIC - 1].copy_from_slice(&checked.fields);
+            Digests { inputs, sighash: encode_fr(&sighash), note_hash }
         }
 
         /// All values are computed first, so no write can be left half done.
-        fn apply(tx: &TxRef, checked: Checked, note: StrangerNote) {
+        fn apply(tx: &TxRef, checked: Checked, digests: Digests, note: StrangerNote) {
             let poseidon = Poseidon::new();
             let window_start = tx.not_before;
             let zero = EmptySubtrees::<T>::get().map(|b| decode_fr(&b).expect("stored canonically; qed"));
             let mut frontier = Frontier::<T>::get().map(|b| decode_fr(&b).expect("stored canonically; qed"));
-            let mut root = checked.inputs[0];
-            for (offset, commitment) in checked.inputs[3..6].iter().enumerate() {
+            let mut root = checked.fields[0];
+            for (offset, commitment) in checked.fields[3..6].iter().enumerate() {
                 let leaf = poseidon.leaf(*commitment, window_start);
                 root = poseidon.append(&mut frontier, &zero, checked.first_position + offset as u64, leaf);
             }
@@ -504,7 +512,7 @@ pub mod pallet {
             Frontier::<T>::put(frontier.map(|x| encode_fr(&x)));
             NextIndex::<T>::put(checked.first_position + 3);
             Self::accept_root(new_root);
-            StrangerNotes::<T>::insert(window_start, checked.sighash, note);
+            StrangerNotes::<T>::insert(window_start, digests.sighash, note);
             if !PruneCursor::<T>::exists() {
                 PruneCursor::<T>::put(window_start);
             }
@@ -512,8 +520,8 @@ pub mod pallet {
             NodeRewardPool::<T>::put(checked.reward);
 
             Self::deposit_event(Event::Shielded {
-                sighash: checked.sighash,
-                stranger_note_hash: checked.note_hash,
+                sighash: digests.sighash,
+                stranger_note_hash: digests.note_hash,
                 window_start,
                 nullifiers: *tx.nullifiers,
                 commitments: *tx.commitments,

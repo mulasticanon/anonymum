@@ -118,7 +118,9 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 7: contact notes grow to 1,795 bytes (the embedded card carries a signed
 	// sequence number, card format v4); 1,787-byte notes are refused.
 	// 8: adds pallet-anonymum-shielded (unreviewed prototype, dev key only).
-	spec_version: 8,
+	// 9: shielded transactions are general transactions authorized through
+	// `AuthorizeCall`; the bare (unsigned) form is no longer accepted.
+	spec_version: 9,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -290,8 +292,10 @@ pub const SHIELDED_BASE_FEE: u64 = 1_000;
 
 parameter_types! {
 	pub const ShieldedBurnShare: sp_runtime::Percent = sp_runtime::Percent::from_percent(50);
-	/// Placeholder, not a benchmark (see README).
-	pub const ShieldedSubmitWeight: Weight = Weight::from_parts(300_000_000_000, 64 * 1024);
+	/// Placeholders, not benchmarks (see README). Together they keep the
+	/// 300 ms per transaction set from the dev-node measurements.
+	pub const ShieldedSubmitWeight: Weight = Weight::from_parts(60_000_000_000, 32 * 1024);
+	pub const ShieldedAuthorizeWeight: Weight = Weight::from_parts(240_000_000_000, 32 * 1024);
 }
 
 impl pallet_anonymum_shielded::Config for Runtime {
@@ -303,8 +307,9 @@ impl pallet_anonymum_shielded::Config for Runtime {
 	type RootHistory = ConstU32<128>;
 	type MaxPrunePerBlock = ConstU32<64>;
 	type MaxPruneWindows = ConstU32<64>;
-	type UnsignedLongevity = ConstU64<10>;
+	type PoolLongevity = ConstU64<10>;
 	type SubmitWeight = ShieldedSubmitWeight;
+	type AuthorizeWeight = ShieldedAuthorizeWeight;
 }
 
 type Block = frame::runtime::types_common::BlockOf<Runtime, TxExtension>;

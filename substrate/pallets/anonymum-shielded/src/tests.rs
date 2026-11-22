@@ -1,8 +1,6 @@
 //! Real Groth16 proofs from `crates/shielded-circuit`, submitted to the
 //! pallet. Every refusal is `assert_noop!`, which compares the storage root.
 
-#![allow(deprecated)] // ValidateUnsigned, see the crate docs
-
 use crate::mock::*;
 use crate::pallet::*;
 use crate::primitives::*;
@@ -18,7 +16,13 @@ use ark_groth16::Groth16;
 use ark_serialize::CanonicalSerialize;
 use frame::deps::frame_support::{assert_noop, assert_ok, traits::Hooks};
 use frame::deps::sp_runtime::transaction_validity::{InvalidTransaction, TransactionSource};
-use frame::deps::sp_runtime::{traits::ValidateUnsigned, DispatchError};
+use frame::deps::frame_support::dispatch::GetDispatchInfo;
+use frame::deps::frame_support::traits::Authorize;
+use frame::deps::frame_support::weights::Weight;
+use frame::deps::sp_runtime::traits::DispatchTransaction;
+use frame::deps::sp_runtime::transaction_validity::{TransactionValidityError, ValidTransaction};
+use frame::deps::sp_runtime::DispatchError;
+use polkadot_sdk::frame_system::AuthorizeCall;
 use polkadot_sdk::polkadot_sdk_frame as frame;
 use rand_core::OsRng;
 use std::sync::OnceLock;
@@ -44,19 +48,21 @@ impl Tx {
         self.note.clone().try_into().expect("test notes fit the bound")
     }
 
+    /// Through the real pipeline: `AuthorizeCall` at inclusion, then the
+    /// dispatch. An authorization refusal is reported as the pallet's error.
     fn submit(&self) -> frame::prelude::DispatchResult {
-        Shielded::submit_shielded(
-            RuntimeOrigin::none(),
-            self.root,
-            self.nullifiers,
-            self.commitments,
-            self.admission,
-            self.not_before,
-            self.not_after,
-            self.coin,
-            self.bounded_note(),
-            self.proof,
-        )
+        let call = RuntimeCall::Shielded(self.call());
+        let info = call.get_dispatch_info();
+        let len = codec::Encode::encoded_size(&call);
+        match AuthorizeCall::<Test>::new().dispatch_transaction(RuntimeOrigin::none(), call, &info, len, 0) {
+            Ok(result) => result.map(|_| ()).map_err(|e| e.error),
+            Err(refused) => Err(pallet_error(refused).into()),
+        }
+    }
+
+    /// What the pool sees.
+    fn authorize(&self, source: TransactionSource) -> Result<ValidTransaction, TransactionValidityError> {
+        self.call().authorize(source).expect("this call authorizes itself").map(|(valid, _)| valid)
     }
 
     fn call(&self) -> Call<Test> {
@@ -71,6 +77,30 @@ impl Tx {
             stranger_note: self.bounded_note(),
             proof: self.proof,
         }
+    }
+}
+
+/// The pallet error behind an authorization refusal. `Future` is the
+/// too-early case of `OutsideWindow`.
+fn pallet_error(refused: TransactionValidityError) -> E {
+    match refused {
+        TransactionValidityError::Invalid(InvalidTransaction::Future) => E::OutsideWindow,
+        TransactionValidityError::Invalid(InvalidTransaction::Custom(code)) => match code {
+            1 => E::WrongNoteLength,
+            2 => E::NonCanonicalField,
+            3 => E::WindowNotOnGrid,
+            4 => E::OutsideWindow,
+            5 => E::UnknownRoot,
+            6 => E::DuplicateNullifier,
+            7 => E::NullifierUsed,
+            8 => E::TreeFull,
+            9 => E::FeeOverflow,
+            10 => E::NoVerifyingKey,
+            11 => E::MalformedProof,
+            12 => E::InvalidProof,
+            other => panic!("unknown refusal code {other}"),
+        },
+        other => panic!("unexpected refusal {other:?}"),
     }
 }
 
@@ -208,7 +238,7 @@ fn accepts(case: Case) {
     let tx = real_tx(case);
     new_test_ext(case).execute_with(|| {
         assert_eq!(CurrentRoot::<Test>::get(), fr_bytes(&circuit_tree(case).root()));
-        assert_ok!(<Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call()));
+        assert_ok!(tx.authorize(TransactionSource::External));
         assert_ok!(tx.submit());
 
         for n in &tx.nullifiers {
@@ -557,7 +587,7 @@ fn a_rerandomised_proof_verifies_but_cannot_replay() {
     replay.proof = rerandomised(&tx);
     assert_ne!(replay.proof, tx.proof);
     new_test_ext(Case::Transfer).execute_with(|| {
-        assert_ok!(<Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &replay.call()));
+        assert_ok!(replay.authorize(TransactionSource::External));
         assert_ok!(tx.submit());
         assert_noop!(replay.submit(), E::NullifierUsed);
     });
@@ -588,24 +618,26 @@ fn no_verifying_key_refuses_everything() {
 }
 
 #[test]
-fn a_signed_origin_is_refused() {
+fn only_the_authorized_origin_can_dispatch() {
     let tx = transfer();
     new_test_ext(Case::Transfer).execute_with(|| {
-        assert_noop!(
-            Shielded::submit_shielded(
-                RuntimeOrigin::signed(1),
-                tx.root,
-                tx.nullifiers,
-                tx.commitments,
-                tx.admission,
-                tx.not_before,
-                tx.not_after,
-                tx.coin,
-                tx.bounded_note(),
-                tx.proof,
-            ),
-            DispatchError::BadOrigin
-        );
+        for origin in [RuntimeOrigin::signed(1), RuntimeOrigin::root(), RuntimeOrigin::none()] {
+            assert_noop!(
+                Shielded::submit_shielded(
+                    origin,
+                    tx.root,
+                    tx.nullifiers,
+                    tx.commitments,
+                    tx.admission,
+                    tx.not_before,
+                    tx.not_after,
+                    tx.coin,
+                    tx.bounded_note(),
+                    tx.proof,
+                ),
+                DispatchError::BadOrigin
+            );
+        }
     });
 }
 
@@ -655,36 +687,182 @@ fn the_burn_rounds_down_and_nothing_is_lost() {
     }
 }
 
-// ---- the transaction pool ---------------------------------------------------------
+// ---- authorization: the transaction pool and inclusion ---------------------------
 
-#[test]
-fn the_pool_gets_nullifier_tags_and_no_account() {
-    let tx = transfer();
-    new_test_ext(Case::Transfer).execute_with(|| {
-        let valid = <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call()).unwrap();
-        assert_eq!(valid.provides.len(), 2);
-        assert!(valid.requires.is_empty());
-        assert!(valid.propagate);
-        assert_eq!(valid.longevity, 10);
-        let same = <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::Local, &{
-            let mut replay = tx.clone();
-            replay.proof = rerandomised(&tx);
-            replay.call()
-        })
-        .unwrap();
-        assert_eq!(valid.provides, same.provides, "a re-randomised copy conflicts in the pool");
+fn refused_by_pool(tx: &Tx, code: u8) {
+    for source in [TransactionSource::External, TransactionSource::Local, TransactionSource::InBlock] {
+        assert_eq!(tx.authorize(source), Err(InvalidTransaction::Custom(code).into()), "{source:?}");
+    }
+}
+
+fn authorizes(case: Case) {
+    let tx = real_tx(case);
+    new_test_ext(case).execute_with(|| {
+        for source in [TransactionSource::External, TransactionSource::Local, TransactionSource::InBlock] {
+            let valid = tx.authorize(source).unwrap_or_else(|e| panic!("{case:?} {source:?}: {e:?}"));
+            assert_eq!(valid.provides.len(), 2);
+        }
+        assert_eq!(NextIndex::<Test>::get(), 4, "authorization writes nothing");
     });
 }
 
 #[test]
-fn the_pool_refuses_a_bad_proof() {
+fn authorizes_transfer() {
+    authorizes(Case::Transfer);
+}
+#[test]
+fn authorizes_invited_request() {
+    authorizes(Case::Invited);
+}
+#[test]
+fn authorizes_open() {
+    authorizes(Case::Open);
+}
+#[test]
+fn authorizes_claim_with_surplus() {
+    authorizes(Case::ClaimSurplus);
+}
+#[test]
+fn authorizes_claim_at_exact_fee() {
+    authorizes(Case::ClaimExactFee);
+}
+#[test]
+fn authorizes_claim_with_top_up() {
+    authorizes(Case::ClaimTopUp);
+}
+#[test]
+fn authorizes_decline_with_surplus() {
+    authorizes(Case::DeclineSurplus);
+}
+#[test]
+fn authorizes_decline_with_top_up() {
+    authorizes(Case::DeclineTopUp);
+}
+#[test]
+fn authorizes_sender_refund_with_surplus() {
+    authorizes(Case::RefundSurplus);
+}
+#[test]
+fn authorizes_sender_refund_with_top_up() {
+    authorizes(Case::RefundTopUp);
+}
+
+#[test]
+fn authorization_refuses_a_bad_note_length() {
+    let mut tx = transfer();
+    tx.note.truncate(1_794);
+    new_test_ext(Case::Transfer).execute_with(|| refused_by_pool(&tx, 1));
+}
+
+#[test]
+fn authorization_refuses_a_bad_window() {
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let mut off_grid = base.clone();
+        off_grid.not_before += 1;
+        off_grid.not_after += 1;
+        refused_by_pool(&off_grid, 3);
+        let mut wide = base.clone();
+        wide.not_after += WINDOW;
+        refused_by_pool(&wide, 3);
+        set_time(base.not_after);
+        refused_by_pool(&base, 4);
+    });
+}
+
+#[test]
+fn authorization_refuses_an_unknown_root() {
+    let mut tx = transfer();
+    tx.root[0] ^= 1;
+    new_test_ext(Case::Transfer).execute_with(|| refused_by_pool(&tx, 5));
+}
+
+#[test]
+fn authorization_refuses_duplicate_and_spent_nullifiers() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let mut duplicate = tx.clone();
+        duplicate.nullifiers[1] = duplicate.nullifiers[0];
+        refused_by_pool(&duplicate, 6);
+        for slot in 0..2 {
+            Nullifiers::<Test>::insert(tx.nullifiers[slot], ());
+            refused_by_pool(&tx, 7);
+            Nullifiers::<Test>::remove(tx.nullifiers[slot]);
+        }
+    });
+}
+
+#[test]
+fn authorization_refuses_malformed_proof_bytes() {
+    let g1 = (1u64..)
+        .find_map(|x| {
+            G1Affine::get_point_from_x_unchecked(Fq::from(x), false)
+                .filter(|p| !p.is_in_correct_subgroup_assuming_on_curve())
+        })
+        .unwrap();
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let mut garbage = base.clone();
+        garbage.proof = [0xFF; 192];
+        refused_by_pool(&garbage, 11);
+        let mut outside_subgroup = base.clone();
+        outside_subgroup.proof[..48].copy_from_slice(&compressed(&g1));
+        refused_by_pool(&outside_subgroup, 11);
+        let mut identity = base.clone();
+        identity.proof[144..].copy_from_slice(&compressed(&G1Affine::zero()));
+        refused_by_pool(&identity, 11);
+    });
+}
+
+#[test]
+fn authorization_refuses_a_bad_proof() {
     let mut tx = transfer();
     tx.note[1] ^= 1;
+    new_test_ext(Case::Transfer).execute_with(|| refused_by_pool(&tx, 12));
+}
+
+#[test]
+fn the_checks_run_cheapest_first() {
+    // Every check fails at once; fixing one at a time reveals the next.
+    let good = transfer();
     new_test_ext(Case::Transfer).execute_with(|| {
-        assert_eq!(
-            <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call()),
-            Err(InvalidTransaction::Custom(12).into())
-        );
+        Nullifiers::<Test>::insert(good.nullifiers[1], ());
+        let mut tx = good.clone();
+        tx.note.truncate(10);
+        tx.not_before += 1;
+        tx.root[0] ^= 1;
+        tx.proof = [0xFF; 192];
+        refused_by_pool(&tx, 1); // length
+        tx.note = good.note.clone();
+        refused_by_pool(&tx, 3); // grid
+        tx.not_before = good.not_before;
+        refused_by_pool(&tx, 5); // root
+        tx.root = good.root;
+        refused_by_pool(&tx, 7); // nullifiers
+        Nullifiers::<Test>::remove(good.nullifiers[1]);
+        refused_by_pool(&tx, 11); // proof encoding
+        tx.proof = good.proof;
+        tx.coin[0][0] ^= 1;
+        refused_by_pool(&tx, 12); // sighash and pairing
+    });
+}
+
+#[test]
+fn tags_are_the_nullifiers_and_never_the_proof() {
+    use codec::Encode;
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let valid = tx.authorize(TransactionSource::External).unwrap();
+        let tag = |n: &Bytes32| ("AnonymumShielded", n).encode();
+        assert_eq!(valid.provides, vec![tag(&tx.nullifiers[0]), tag(&tx.nullifiers[1])]);
+        assert!(valid.requires.is_empty(), "a spend depends on no other pooled transaction");
+        assert!(valid.propagate);
+        assert_eq!(valid.longevity, 10);
+
+        let mut copy = tx.clone();
+        copy.proof = rerandomised(&tx);
+        let other = copy.authorize(TransactionSource::Local).unwrap();
+        assert_eq!(valid.provides, other.provides, "a re-randomised copy conflicts in the pool");
     });
 }
 
@@ -692,7 +870,7 @@ fn the_pool_refuses_a_bad_proof() {
 fn the_pool_allows_the_next_window_and_no_later() {
     let tx = transfer();
     new_test_ext(Case::Transfer).execute_with(|| {
-        let check = || <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call());
+        let check = || tx.authorize(TransactionSource::External);
         set_time(tx.not_before - WINDOW);
         assert!(check().is_ok());
         set_time(tx.not_before - WINDOW - 1);
@@ -706,26 +884,56 @@ fn the_pool_allows_the_next_window_and_no_later() {
 fn inclusion_uses_the_strict_clock_and_sees_spent_nullifiers() {
     let tx = transfer();
     new_test_ext(Case::Transfer).execute_with(|| {
+        let check = || tx.authorize(TransactionSource::InBlock);
         set_time(tx.not_before - 1);
-        assert_eq!(
-            <Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()),
-            Err(InvalidTransaction::Future.into()),
-            "too early: stays in the pool"
-        );
+        assert_eq!(check(), Err(InvalidTransaction::Future.into()), "too early: stays in the pool");
         set_time(tx.not_after);
-        assert_eq!(
-            <Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()),
-            Err(InvalidTransaction::Custom(4).into()),
-            "too late: dropped"
-        );
+        assert_eq!(check(), Err(InvalidTransaction::Custom(4).into()), "too late: dropped");
         set_time(tx.not_before);
-        assert_ok!(<Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()));
+        assert!(check().is_ok());
         assert_ok!(tx.submit());
-        assert_eq!(
-            <Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()),
-            Err(InvalidTransaction::Custom(7).into())
-        );
+        assert_eq!(check(), Err(InvalidTransaction::Custom(7).into()));
     });
+}
+
+#[test]
+fn the_dispatch_repeats_the_state_checks() {
+    // If state changed after authorization, the dispatch itself refuses.
+    let tx = transfer();
+    let authorized = || RuntimeOrigin::from(polkadot_sdk::frame_system::Origin::<Test>::Authorized);
+    let dispatch = || {
+        Shielded::submit_shielded(
+            authorized(),
+            tx.root,
+            tx.nullifiers,
+            tx.commitments,
+            tx.admission,
+            tx.not_before,
+            tx.not_after,
+            tx.coin,
+            tx.bounded_note(),
+            tx.proof,
+        )
+    };
+    new_test_ext(Case::Transfer).execute_with(|| {
+        Nullifiers::<Test>::insert(tx.nullifiers[0], ());
+        assert_noop!(dispatch(), E::NullifierUsed);
+        Nullifiers::<Test>::remove(tx.nullifiers[0]);
+        set_time(tx.not_after);
+        assert_noop!(dispatch(), E::OutsideWindow);
+        // The pool may hold a transaction for the next window; a block may not.
+        set_time(tx.not_before - 1);
+        assert_noop!(dispatch(), E::OutsideWindow);
+    });
+}
+
+#[test]
+fn authorization_and_dispatch_carry_their_own_weights() {
+    let tx = transfer();
+    let call = tx.call();
+    assert_eq!(call.weight_of_authorize(), Weight::from_parts(1_000_000, 0));
+    let info = call.get_dispatch_info();
+    assert_eq!(info.call_weight, Weight::from_parts(1_000_000, 0));
 }
 
 // ---- 24-hour pruning ---------------------------------------------------------------

@@ -68,8 +68,9 @@ impl pallet_anonymum_shielded::Config for Test {
     type RootHistory = ConstU32<ROOT_HISTORY>;
     type MaxPrunePerBlock = ConstU32<2>;
     type MaxPruneWindows = ConstU32<8>;
-    type UnsignedLongevity = ConstU64<10>;
+    type PoolLongevity = ConstU64<10>;
     type SubmitWeight = TestWeight;
+    type AuthorizeWeight = TestWeight;
 }
 
 pub struct Keys {
