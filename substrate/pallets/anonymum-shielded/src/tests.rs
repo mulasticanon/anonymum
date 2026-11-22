@@ -1,0 +1,857 @@
+//! Real Groth16 proofs from `crates/shielded-circuit`, submitted to the
+//! pallet. Every refusal is `assert_noop!`, which compares the storage root.
+
+#![allow(deprecated)] // ValidateUnsigned, see the crate docs
+
+use crate::mock::*;
+use crate::pallet::*;
+use crate::primitives::*;
+use anonymum_shielded_circuit as circuit;
+use anonymum_shielded_circuit::fixtures::{self, Built, Case};
+use anonymum_shielded_circuit::verifier::{encode_proof, prove};
+use anonymum_shielded_circuit::{Bls12_381, Fr, MerkleTree};
+use anonymum_shielded_model as model;
+use ark_bls12_381::{Fq, Fq2, G1Affine, G2Affine};
+use ark_ec::AffineRepr;
+use ark_ff::{BigInteger, One, PrimeField};
+use ark_groth16::Groth16;
+use ark_serialize::CanonicalSerialize;
+use frame::deps::frame_support::{assert_noop, assert_ok, traits::Hooks};
+use frame::deps::sp_runtime::transaction_validity::{InvalidTransaction, TransactionSource};
+use frame::deps::sp_runtime::{traits::ValidateUnsigned, DispatchError};
+use polkadot_sdk::polkadot_sdk_frame as frame;
+use rand_core::OsRng;
+use std::sync::OnceLock;
+
+type E = Error<Test>;
+
+/// One transaction's call arguments.
+#[derive(Clone)]
+struct Tx {
+    root: Bytes32,
+    nullifiers: [Bytes32; 2],
+    commitments: [Bytes32; 3],
+    admission: Bytes32,
+    not_before: u64,
+    not_after: u64,
+    coin: [[u8; 200]; 2],
+    note: Vec<u8>,
+    proof: [u8; 192],
+}
+
+impl Tx {
+    fn bounded_note(&self) -> StrangerNote {
+        self.note.clone().try_into().expect("test notes fit the bound")
+    }
+
+    fn submit(&self) -> frame::prelude::DispatchResult {
+        Shielded::submit_shielded(
+            RuntimeOrigin::none(),
+            self.root,
+            self.nullifiers,
+            self.commitments,
+            self.admission,
+            self.not_before,
+            self.not_after,
+            self.coin,
+            self.bounded_note(),
+            self.proof,
+        )
+    }
+
+    fn call(&self) -> Call<Test> {
+        Call::submit_shielded {
+            root: self.root,
+            nullifiers: self.nullifiers,
+            commitments: self.commitments,
+            admission_commitment: self.admission,
+            not_before: self.not_before,
+            not_after: self.not_after,
+            coin_payloads: self.coin,
+            stranger_note: self.bounded_note(),
+            proof: self.proof,
+        }
+    }
+}
+
+fn from_built(built: &Built, note: Vec<u8>) -> Tx {
+    let p = built.circuit.public;
+    let proof = prove(&keys().pk, built.circuit.clone(), &mut OsRng).unwrap();
+    let int = |x: Fr| x.into_bigint().0[0];
+    Tx {
+        root: fr_bytes(&p.root),
+        nullifiers: p.nullifiers.map(|x| fr_bytes(&x)),
+        commitments: p.commitments.map(|x| fr_bytes(&x)),
+        admission: fr_bytes(&p.admission),
+        not_before: int(p.not_before),
+        not_after: int(p.not_after),
+        coin: [
+            built.envelope.coin_slots[0].clone().try_into().unwrap(),
+            built.envelope.coin_slots[1].clone().try_into().unwrap(),
+        ],
+        note,
+        proof: encode_proof(&proof).try_into().unwrap(),
+    }
+}
+
+fn real_tx(case: Case) -> Tx {
+    let note = note(0x5A);
+    let built = fixtures::build_for_chain(case, CHAIN_ID, TX_VERSION, fixtures::NOT_BEFORE, WINDOW, &note);
+    from_built(&built, note)
+}
+
+/// One proved Transfer, reused by the refusal tests.
+fn transfer() -> Tx {
+    static TX: OnceLock<Tx> = OnceLock::new();
+    TX.get_or_init(|| real_tx(Case::Transfer)).clone()
+}
+
+fn circuit_tree(case: Case) -> MerkleTree {
+    let mut tree = MerkleTree::new();
+    for l in fixtures::world_leaves(case) {
+        tree.append(l).unwrap();
+    }
+    tree
+}
+
+fn rerandomised(tx: &Tx) -> [u8; 192] {
+    let proof = circuit::verifier::decode_proof(&tx.proof).unwrap();
+    let other = Groth16::<Bls12_381>::rerandomize_proof(&keys().vk, &proof, &mut OsRng);
+    encode_proof(&other).try_into().unwrap()
+}
+
+fn compressed(x: &impl CanonicalSerialize) -> Vec<u8> {
+    let mut out = Vec::new();
+    x.serialize_compressed(&mut out).unwrap();
+    out
+}
+
+// ---- agreement with crates/shielded-circuit ----------------------------------
+
+#[test]
+fn poseidon_constants_match_the_circuit() {
+    let ours = Poseidon::new();
+    let theirs = circuit::poseidon::config();
+    assert_eq!(ours.config().ark, theirs.ark);
+    assert_eq!(ours.config().mds, theirs.mds);
+    assert_eq!(
+        (ours.config().full_rounds, ours.config().partial_rounds, ours.config().alpha),
+        (theirs.full_rounds, theirs.partial_rounds, theirs.alpha)
+    );
+    assert_eq!((ours.config().rate, ours.config().capacity), (theirs.rate, theirs.capacity));
+}
+
+#[test]
+fn hashes_match_the_circuit() {
+    let p = Poseidon::new();
+    let x = [Fr::from(3u64), Fr::from(5u64), Fr::from(7u64)];
+    assert_eq!(p.hash("nullifier/escrow", &x), circuit::poseidon::hash("nullifier/escrow", &x));
+    assert_eq!(domain_tag("commit", 8), circuit::poseidon::domain_tag("commit", 8));
+    assert_eq!(p.leaf(x[0], 3_600), circuit::leaf(x[0], 3_600u64.into()));
+    assert_eq!(p.node(4, x[0], x[1]), circuit::merkle::node(4, x[0], x[1]));
+}
+
+#[test]
+fn the_frontier_tracks_the_circuits_tree() {
+    let p = Poseidon::new();
+    let zero = p.empty_subtrees();
+    let mut frontier = [zero[0]; TREE_DEPTH];
+    let mut tree = MerkleTree::new();
+    assert_eq!(zero[TREE_DEPTH], tree.root(), "empty root");
+    for i in 0..70u64 {
+        let leaf = Fr::from(i + 1_000);
+        tree.append(leaf).unwrap();
+        assert_eq!(p.append(&mut frontier, &zero, i, leaf), tree.root(), "after leaf {i}");
+    }
+}
+
+#[test]
+fn the_stranger_note_hash_matches_model_and_circuit() {
+    for slot in [vec![], vec![1u8; 7], note(0xEE)] {
+        assert_eq!(stranger_note_hash(&slot), model::chain::stranger_note_hash(&slot));
+        assert_eq!(stranger_note_hash(&slot), circuit::stranger_note_hash(&slot));
+    }
+}
+
+#[test]
+fn the_sighash_matches_the_circuit() {
+    let n = note(0x11);
+    let built = fixtures::build_for_chain(Case::Open, 9, 3, 4_200, 60, &n);
+    let p = built.circuit.public;
+    let all = p.to_vec();
+    let fields: [Fr; N_PUBLIC - 1] = all[..N_PUBLIC - 1].try_into().unwrap();
+    let coin: [[u8; 200]; 2] =
+        [built.envelope.coin_slots[0].clone().try_into().unwrap(), built.envelope.coin_slots[1].clone().try_into().unwrap()];
+    let ours = compute_sighash(&SighashInputs {
+        chain_id: 9,
+        version: 3,
+        fields: &fields,
+        coin_slots: &coin,
+        stranger_note_hash: &stranger_note_hash(&n),
+    });
+    assert_eq!(ours, p.sighash);
+}
+
+#[test]
+fn constants_match_the_circuit_and_model() {
+    assert_eq!(TREE_DEPTH, circuit::TREE_DEPTH);
+    assert_eq!(N_PUBLIC, circuit::N_PUBLIC);
+    assert_eq!(PROOF_LEN, circuit::verifier::PROOF_LEN);
+    assert_eq!(STRANGER_NOTE_LEN as usize, model::chain::STRANGER_NOTE_LEN);
+    assert_eq!(COIN_PAYLOAD_LEN, model::chain::COIN_PAYLOAD_LEN);
+    assert_eq!(NOTE_TTL_SECS, model::chain::TTL);
+}
+
+// ---- real proofs, all six branches ---------------------------------------------
+
+fn accepts(case: Case) {
+    let tx = real_tx(case);
+    new_test_ext(case).execute_with(|| {
+        assert_eq!(CurrentRoot::<Test>::get(), fr_bytes(&circuit_tree(case).root()));
+        assert_ok!(<Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call()));
+        assert_ok!(tx.submit());
+
+        for n in &tx.nullifiers {
+            assert!(Nullifiers::<Test>::contains_key(n));
+        }
+        // The on-chain root is the circuit's tree with the three new leaves.
+        let mut tree = circuit_tree(case);
+        for c in &tx.commitments {
+            let c = decode_fr(c).unwrap();
+            tree.append(circuit::leaf(c, fixtures::NOT_BEFORE.into())).unwrap();
+        }
+        let root = fr_bytes(&tree.root());
+        assert_eq!(CurrentRoot::<Test>::get(), root);
+        assert!(AcceptedRoots::<Test>::contains_key(root));
+        assert!(AcceptedRoots::<Test>::contains_key(tx.root), "the old root stays usable");
+        assert_eq!(NextIndex::<Test>::get(), 7);
+        assert_eq!(BurnedFees::<Test>::get() + NodeRewardPool::<Test>::get(), u128::from(BASE_FEE));
+    });
+}
+
+#[test]
+fn accepts_transfer() {
+    accepts(Case::Transfer);
+}
+#[test]
+fn accepts_invited_request() {
+    accepts(Case::Invited);
+}
+#[test]
+fn accepts_open() {
+    accepts(Case::Open);
+}
+#[test]
+fn accepts_claim_with_surplus() {
+    accepts(Case::ClaimSurplus);
+}
+#[test]
+fn accepts_claim_at_exact_fee() {
+    accepts(Case::ClaimExactFee);
+}
+#[test]
+fn accepts_claim_with_top_up() {
+    accepts(Case::ClaimTopUp);
+}
+#[test]
+fn accepts_decline_with_surplus() {
+    accepts(Case::DeclineSurplus);
+}
+#[test]
+fn accepts_decline_with_top_up() {
+    accepts(Case::DeclineTopUp);
+}
+#[test]
+fn accepts_sender_refund_with_surplus() {
+    accepts(Case::RefundSurplus);
+}
+#[test]
+fn accepts_sender_refund_with_top_up() {
+    accepts(Case::RefundTopUp);
+}
+
+#[test]
+fn a_new_output_can_be_spent_against_the_new_root() {
+    // Spend a note the pallet itself inserted, with the circuit's own path.
+    let first = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ok!(first.submit());
+        let mut tree = circuit_tree(Case::Transfer);
+        for c in &first.commitments {
+            tree.append(circuit::leaf(decode_fr(c).unwrap(), fixtures::NOT_BEFORE.into())).unwrap();
+        }
+        let spent = circuit::Note::ordinary(1_000, circuit::authority(fixtures::f("funder")), fixtures::f("out1"));
+        assert_eq!(fr_bytes(&spent.commitment()), first.commitments[1]);
+
+        let n = note(0x77);
+        let mut built = fixtures::build_for_chain(Case::Transfer, CHAIN_ID, TX_VERSION, fixtures::NOT_BEFORE, WINDOW, &n);
+        let w = &mut built.circuit.witness;
+        w.inputs[0] = circuit::InputWitness::real(&tree, spent, fixtures::NOT_BEFORE, 5, fixtures::f("funder"));
+        // A dummy secret must be fresh: reusing one repeats its nullifier.
+        w.inputs[1] = circuit::InputWitness::dummy(fixtures::f("second-dummy"));
+        w.outputs = [
+            circuit::Note::retired(0, fixtures::f("a")),
+            circuit::Note::retired(0, fixtures::f("b")),
+            circuit::Note::retired(0, fixtures::f("c")),
+        ];
+        built.circuit.public.root = tree.root();
+        built.reseal();
+        assert_ok!(from_built(&built, n).submit());
+
+        // The second transaction's root needs the frontier the first saved.
+        for c in built.circuit.public.commitments {
+            tree.append(circuit::leaf(c, fixtures::NOT_BEFORE.into())).unwrap();
+        }
+        assert_eq!(CurrentRoot::<Test>::get(), fr_bytes(&tree.root()));
+        assert_eq!(NextIndex::<Test>::get(), 10);
+    });
+}
+
+// ---- refusals, each with no state change ----------------------------------------
+
+#[test]
+fn a_double_spend_is_refused() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ok!(tx.submit());
+        assert_noop!(tx.submit(), E::NullifierUsed);
+    });
+}
+
+#[test]
+fn either_spent_nullifier_blocks_a_transaction() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for slot in 0..2 {
+            let mut other = tx.clone();
+            Nullifiers::<Test>::insert(tx.nullifiers[slot], ());
+            other.nullifiers[1 - slot] = [9; 32];
+            assert_noop!(other.submit(), E::NullifierUsed);
+            Nullifiers::<Test>::remove(tx.nullifiers[slot]);
+        }
+    });
+}
+
+#[test]
+fn duplicate_nullifiers_are_refused() {
+    let mut tx = transfer();
+    tx.nullifiers[1] = tx.nullifiers[0];
+    new_test_ext(Case::Transfer).execute_with(|| { assert_noop!(tx.submit(), E::DuplicateNullifier); });
+}
+
+#[test]
+fn an_unknown_root_is_refused() {
+    let mut tx = transfer();
+    tx.root[0] ^= 1;
+    new_test_ext(Case::Transfer).execute_with(|| { assert_noop!(tx.submit(), E::UnknownRoot); });
+}
+
+#[test]
+fn a_root_evicted_from_the_history_is_refused() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert!(AcceptedRoots::<Test>::contains_key(tx.root));
+        for i in 0..ROOT_HISTORY {
+            let mut root = [0u8; 32];
+            root[0] = i as u8 + 1;
+            Pallet::<Test>::accept_root(root);
+        }
+        assert!(!AcceptedRoots::<Test>::contains_key(tx.root));
+        assert_eq!(AcceptedRoots::<Test>::iter().count(), ROOT_HISTORY as usize);
+        assert_noop!(tx.submit(), E::UnknownRoot);
+    });
+}
+
+#[test]
+fn a_block_time_outside_the_window_is_refused() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        set_time(tx.not_before - 1);
+        assert_noop!(tx.submit(), E::OutsideWindow);
+        set_time(tx.not_after);
+        assert_noop!(tx.submit(), E::OutsideWindow);
+        set_time(tx.not_after - 1);
+        assert_ok!(tx.submit());
+    });
+}
+
+#[test]
+fn a_window_off_the_grid_is_refused() {
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let mut tx = base.clone();
+        tx.not_before += 1;
+        tx.not_after += 1;
+        assert_noop!(tx.submit(), E::WindowNotOnGrid);
+        let mut tx = base.clone();
+        tx.not_after += WINDOW;
+        assert_noop!(tx.submit(), E::WindowNotOnGrid);
+        let mut tx = base.clone();
+        tx.not_before = u64::MAX - u64::MAX % WINDOW;
+        tx.not_after = 0;
+        assert_noop!(tx.submit(), E::WindowNotOnGrid);
+    });
+}
+
+#[test]
+fn a_wrong_note_length_is_refused() {
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for len in [0, 1, 1_787, 1_794] {
+            let mut tx = base.clone();
+            tx.note.truncate(len);
+            assert_noop!(tx.submit(), E::WrongNoteLength);
+        }
+    });
+}
+
+#[test]
+fn an_oversized_note_cannot_even_be_built() {
+    let oversized = vec![0u8; STRANGER_NOTE_LEN as usize + 1];
+    assert!(StrangerNote::try_from(oversized).is_err());
+}
+
+#[test]
+fn a_tampered_stranger_note_is_refused() {
+    let mut tx = transfer();
+    tx.note[900] ^= 1;
+    new_test_ext(Case::Transfer).execute_with(|| { assert_noop!(tx.submit(), E::InvalidProof); });
+}
+
+#[test]
+fn tampered_coin_payloads_are_refused() {
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for slot in 0..2 {
+            let mut tx = base.clone();
+            tx.coin[slot][33] ^= 1;
+            assert_noop!(tx.submit(), E::InvalidProof);
+        }
+    });
+}
+
+#[test]
+fn every_tampered_public_field_is_refused() {
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for slot in 0..3 {
+            let mut tx = base.clone();
+            tx.commitments[slot] = fr_bytes(&(decode_fr(&tx.commitments[slot]).unwrap() + Fr::one()));
+            assert_noop!(tx.submit(), E::InvalidProof);
+        }
+        for slot in 0..2 {
+            let mut tx = base.clone();
+            tx.nullifiers[slot] = fr_bytes(&(decode_fr(&tx.nullifiers[slot]).unwrap() + Fr::one()));
+            assert_noop!(tx.submit(), E::InvalidProof);
+        }
+        let mut tx = base.clone();
+        tx.admission = fr_bytes(&(decode_fr(&tx.admission).unwrap() + Fr::one()));
+        assert_noop!(tx.submit(), E::InvalidProof);
+    });
+}
+
+#[test]
+fn a_different_base_fee_breaks_the_proof() {
+    let tx = transfer();
+    new_test_ext_with(Case::Transfer, BASE_FEE + 1, true).execute_with(|| {
+        assert_noop!(tx.submit(), E::InvalidProof);
+    });
+}
+
+#[test]
+fn a_proof_for_another_chain_is_refused() {
+    let n = note(0x5A);
+    let built = fixtures::build_for_chain(Case::Transfer, CHAIN_ID + 1, TX_VERSION, fixtures::NOT_BEFORE, WINDOW, &n);
+    let other_chain = from_built(&built, n.clone());
+    let built = fixtures::build_for_chain(Case::Transfer, CHAIN_ID, TX_VERSION + 1, fixtures::NOT_BEFORE, WINDOW, &n);
+    let other_version = from_built(&built, n);
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_noop!(other_chain.submit(), E::InvalidProof);
+        assert_noop!(other_version.submit(), E::InvalidProof);
+    });
+}
+
+#[test]
+fn non_canonical_field_encodings_are_refused() {
+    // r + x encodes the same residue as x: it must not be a second nullifier.
+    let base = transfer();
+    let modulus: Bytes32 = Fr::MODULUS.to_bytes_le().try_into().unwrap();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let mut tx = base.clone();
+        tx.nullifiers[0] = modulus;
+        assert_noop!(tx.submit(), E::NonCanonicalField);
+        let mut tx = base.clone();
+        tx.commitments[2] = [0xFF; 32];
+        assert_noop!(tx.submit(), E::NonCanonicalField);
+        let mut tx = base.clone();
+        tx.admission = modulus;
+        assert_noop!(tx.submit(), E::NonCanonicalField);
+    });
+}
+
+#[test]
+fn a_non_subgroup_g1_point_is_refused() {
+    let point = (1u64..)
+        .find_map(|x| {
+            G1Affine::get_point_from_x_unchecked(Fq::from(x), false)
+                .filter(|p| !p.is_in_correct_subgroup_assuming_on_curve())
+        })
+        .unwrap();
+    let bad = compressed(&point);
+    let base = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for offset in [0, 144] {
+            let mut tx = base.clone();
+            tx.proof[offset..offset + 48].copy_from_slice(&bad);
+            assert_noop!(tx.submit(), E::MalformedProof);
+        }
+    });
+}
+
+#[test]
+fn a_non_subgroup_g2_point_is_refused() {
+    let point = (1u64..)
+        .find_map(|x| {
+            G2Affine::get_point_from_x_unchecked(Fq2::new(Fq::from(x), Fq::one()), false)
+                .filter(|p| !p.is_in_correct_subgroup_assuming_on_curve())
+        })
+        .unwrap();
+    let bad = compressed(&point);
+    let mut tx = transfer();
+    tx.proof[48..144].copy_from_slice(&bad);
+    new_test_ext(Case::Transfer).execute_with(|| { assert_noop!(tx.submit(), E::MalformedProof); });
+}
+
+#[test]
+fn malformed_proof_bytes_are_refused() {
+    let base = transfer();
+    let g1 = compressed(&G1Affine::zero());
+    let g2 = compressed(&G2Affine::zero());
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for (offset, point) in [(0usize, &g1), (48, &g2), (144, &g1)] {
+            let mut tx = base.clone();
+            tx.proof[offset..offset + point.len()].copy_from_slice(point);
+            assert_noop!(tx.submit(), E::MalformedProof);
+        }
+        let mut tx = base.clone();
+        tx.proof = [0xFF; 192];
+        assert_noop!(tx.submit(), E::MalformedProof);
+        let mut tx = base.clone();
+        tx.proof[0] &= 0x7F; // clears the "compressed" flag
+        assert_noop!(tx.submit(), E::MalformedProof);
+    });
+}
+
+#[test]
+fn a_well_formed_wrong_proof_is_refused() {
+    let tx = transfer();
+    let mut wrong = tx.clone();
+    wrong.proof = real_tx(Case::Invited).proof;
+    new_test_ext(Case::Transfer).execute_with(|| { assert_noop!(wrong.submit(), E::InvalidProof); });
+}
+
+#[test]
+fn a_rerandomised_proof_verifies_but_cannot_replay() {
+    let tx = transfer();
+    let mut replay = tx.clone();
+    replay.proof = rerandomised(&tx);
+    assert_ne!(replay.proof, tx.proof);
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ok!(<Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &replay.call()));
+        assert_ok!(tx.submit());
+        assert_noop!(replay.submit(), E::NullifierUsed);
+    });
+}
+
+#[test]
+fn storage_does_not_depend_on_the_proof_bytes() {
+    let tx = transfer();
+    let mut other = tx.clone();
+    other.proof = rerandomised(&tx);
+    let root_with = |t: &Tx| {
+        new_test_ext(Case::Transfer).execute_with(|| {
+            assert_ok!(t.submit());
+            frame::deps::sp_io::storage::root(frame::deps::sp_runtime::StateVersion::V1)
+        })
+    };
+    let strip_events = root_with(&tx);
+    assert_ne!(tx.proof, other.proof);
+    assert_eq!(strip_events, root_with(&other), "two proofs of one statement leave identical state");
+}
+
+#[test]
+fn no_verifying_key_refuses_everything() {
+    let tx = transfer();
+    new_test_ext_with(Case::Transfer, BASE_FEE, false).execute_with(|| {
+        assert_noop!(tx.submit(), E::NoVerifyingKey);
+    });
+}
+
+#[test]
+fn a_signed_origin_is_refused() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_noop!(
+            Shielded::submit_shielded(
+                RuntimeOrigin::signed(1),
+                tx.root,
+                tx.nullifiers,
+                tx.commitments,
+                tx.admission,
+                tx.not_before,
+                tx.not_after,
+                tx.coin,
+                tx.bounded_note(),
+                tx.proof,
+            ),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn a_full_tree_is_refused() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        NextIndex::<Test>::put((1u64 << TREE_DEPTH) - 2);
+        assert_noop!(tx.submit(), E::TreeFull);
+        NextIndex::<Test>::put((1u64 << TREE_DEPTH) - 3);
+        assert_ok!(tx.submit());
+        assert_eq!(NextIndex::<Test>::get(), 1 << TREE_DEPTH);
+    });
+}
+
+#[test]
+fn a_fee_counter_overflow_is_refused() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        BurnedFees::<Test>::put(u128::MAX);
+        assert_noop!(tx.submit(), E::FeeOverflow);
+        BurnedFees::<Test>::put(0);
+        NodeRewardPool::<Test>::put(u128::MAX);
+        assert_noop!(tx.submit(), E::FeeOverflow);
+    });
+}
+
+// ---- the fee split ----------------------------------------------------------------
+
+#[test]
+fn the_base_fee_splits_between_burn_and_pool() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ok!(tx.submit());
+        assert_eq!(BurnedFees::<Test>::get(), 300);
+        assert_eq!(NodeRewardPool::<Test>::get(), 700);
+    });
+}
+
+#[test]
+fn the_burn_rounds_down_and_nothing_is_lost() {
+    use frame::deps::sp_runtime::Percent;
+    for fee in [0u64, 1, 3, 99, 101, 1_001, u64::MAX] {
+        let burned = Percent::from_percent(30).mul_floor(fee);
+        assert!(u128::from(burned) * 100 <= u128::from(fee) * 30, "fee {fee}");
+        assert_eq!(burned + (fee - burned), fee);
+    }
+}
+
+// ---- the transaction pool ---------------------------------------------------------
+
+#[test]
+fn the_pool_gets_nullifier_tags_and_no_account() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let valid = <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call()).unwrap();
+        assert_eq!(valid.provides.len(), 2);
+        assert!(valid.requires.is_empty());
+        assert!(valid.propagate);
+        assert_eq!(valid.longevity, 10);
+        let same = <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::Local, &{
+            let mut replay = tx.clone();
+            replay.proof = rerandomised(&tx);
+            replay.call()
+        })
+        .unwrap();
+        assert_eq!(valid.provides, same.provides, "a re-randomised copy conflicts in the pool");
+    });
+}
+
+#[test]
+fn the_pool_refuses_a_bad_proof() {
+    let mut tx = transfer();
+    tx.note[1] ^= 1;
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_eq!(
+            <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call()),
+            Err(InvalidTransaction::Custom(12).into())
+        );
+    });
+}
+
+#[test]
+fn the_pool_allows_the_next_window_and_no_later() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let check = || <Pallet<Test> as ValidateUnsigned>::validate_unsigned(TransactionSource::External, &tx.call());
+        set_time(tx.not_before - WINDOW);
+        assert!(check().is_ok());
+        set_time(tx.not_before - WINDOW - 1);
+        assert_eq!(check(), Err(InvalidTransaction::Custom(4).into()));
+        set_time(tx.not_after);
+        assert_eq!(check(), Err(InvalidTransaction::Custom(4).into()));
+    });
+}
+
+#[test]
+fn inclusion_uses_the_strict_clock_and_sees_spent_nullifiers() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        set_time(tx.not_before - 1);
+        assert_eq!(
+            <Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()),
+            Err(InvalidTransaction::Future.into()),
+            "too early: stays in the pool"
+        );
+        set_time(tx.not_after);
+        assert_eq!(
+            <Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()),
+            Err(InvalidTransaction::Custom(4).into()),
+            "too late: dropped"
+        );
+        set_time(tx.not_before);
+        assert_ok!(<Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()));
+        assert_ok!(tx.submit());
+        assert_eq!(
+            <Pallet<Test> as ValidateUnsigned>::pre_dispatch(&tx.call()),
+            Err(InvalidTransaction::Custom(7).into())
+        );
+    });
+}
+
+// ---- 24-hour pruning ---------------------------------------------------------------
+
+fn finalize_at(seconds: u64) {
+    set_time(seconds);
+    Shielded::on_finalize(System::block_number());
+}
+
+#[test]
+fn a_note_is_pruned_at_24_hours_and_everything_else_stays() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        System::reset_events();
+        assert_ok!(tx.submit());
+        let window = tx.not_before;
+        let (sighash, note_hash) = System::events()
+            .iter()
+            .find_map(|r| match &r.event {
+                RuntimeEvent::Shielded(Event::Shielded { sighash, stranger_note_hash, .. }) => {
+                    Some((*sighash, *stranger_note_hash))
+                }
+                _ => None,
+            })
+            .expect("the event");
+        assert_eq!(note_hash, stranger_note_hash(&tx.note));
+        let stored = StrangerNotes::<Test>::get(window, sighash).expect("kept");
+        assert_eq!(stored.len(), 1_795);
+        let (root, index, fees) = (CurrentRoot::<Test>::get(), NextIndex::<Test>::get(), BurnedFees::<Test>::get());
+
+        finalize_at(window + NOTE_TTL_SECS - 1);
+        assert!(StrangerNotes::<Test>::contains_key(window, sighash), "kept until the last second");
+
+        finalize_at(window + NOTE_TTL_SECS);
+        assert!(!StrangerNotes::<Test>::contains_key(window, sighash), "removed at 24 h");
+        assert!(System::events().iter().any(|r| matches!(
+            r.event,
+            RuntimeEvent::Shielded(Event::StrangerNotesPruned { window_start, removed: 1 }) if window_start == window
+        )));
+
+        assert_eq!(CurrentRoot::<Test>::get(), root);
+        assert!(AcceptedRoots::<Test>::contains_key(root));
+        assert_eq!(NextIndex::<Test>::get(), index);
+        assert_eq!(BurnedFees::<Test>::get(), fees);
+        for n in &tx.nullifiers {
+            assert!(Nullifiers::<Test>::contains_key(n), "a pruned note's nullifier stays spent");
+        }
+        assert!(
+            System::events().iter().any(|r| matches!(
+                &r.event,
+                RuntimeEvent::Shielded(Event::Shielded { stranger_note_hash: h, sighash: s, .. })
+                    if *h == note_hash && *s == sighash
+            )),
+            "the note's hash and the sighash stay in the event log"
+        );
+    });
+}
+
+#[test]
+fn pruning_respects_the_per_block_limit() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let bytes: StrangerNote = note(1).try_into().unwrap();
+        for i in 0..5u8 {
+            StrangerNotes::<Test>::insert(WINDOW, [i; 32], bytes.clone());
+        }
+        PruneCursor::<Test>::put(WINDOW);
+        let later = WINDOW + NOTE_TTL_SECS;
+        Pallet::<Test>::prune_stranger_notes(later);
+        assert_eq!(StrangerNotes::<Test>::iter_prefix(WINDOW).count(), 3);
+        assert_eq!(PruneCursor::<Test>::get(), Some(WINDOW), "the window is not done");
+        Pallet::<Test>::prune_stranger_notes(later);
+        assert_eq!(StrangerNotes::<Test>::iter_prefix(WINDOW).count(), 1);
+        Pallet::<Test>::prune_stranger_notes(later);
+        assert_eq!(StrangerNotes::<Test>::iter_prefix(WINDOW).count(), 0);
+        assert_eq!(PruneCursor::<Test>::get(), Some(2 * WINDOW));
+    });
+}
+
+#[test]
+fn the_cursor_crosses_empty_windows_within_its_limit() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let bytes: StrangerNote = note(1).try_into().unwrap();
+        let far = WINDOW * 20;
+        StrangerNotes::<Test>::insert(far, [1u8; 32], bytes);
+        PruneCursor::<Test>::put(WINDOW);
+        Pallet::<Test>::prune_stranger_notes(far + NOTE_TTL_SECS);
+        assert_eq!(PruneCursor::<Test>::get(), Some(WINDOW + 8 * WINDOW), "at most 8 windows per block");
+        assert!(StrangerNotes::<Test>::contains_key(far, [1u8; 32]));
+        Pallet::<Test>::prune_stranger_notes(far + NOTE_TTL_SECS);
+        Pallet::<Test>::prune_stranger_notes(far + NOTE_TTL_SECS);
+        assert!(!StrangerNotes::<Test>::contains_key(far, [1u8; 32]));
+    });
+}
+
+#[test]
+fn pruning_never_touches_a_live_window() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let bytes: StrangerNote = note(1).try_into().unwrap();
+        StrangerNotes::<Test>::insert(WINDOW, [1u8; 32], bytes.clone());
+        StrangerNotes::<Test>::insert(2 * WINDOW, [2u8; 32], bytes);
+        PruneCursor::<Test>::put(WINDOW);
+        Pallet::<Test>::prune_stranger_notes(WINDOW + NOTE_TTL_SECS);
+        assert!(!StrangerNotes::<Test>::contains_key(WINDOW, [1u8; 32]));
+        assert!(StrangerNotes::<Test>::contains_key(2 * WINDOW, [2u8; 32]));
+    });
+}
+
+// ---- genesis ------------------------------------------------------------------------
+
+#[test]
+fn genesis_stores_a_validated_uncompressed_key() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let stored = DevVerifyingKey::<Test>::get().expect("stored");
+        assert!(stored.len() > keys().vk_bytes.len(), "uncompressed");
+        assert!(stored.len() <= MAX_VK_LEN as usize);
+    });
+}
+
+#[test]
+fn a_bad_verifying_key_is_refused() {
+    assert!(prepare_stored_key(&keys().vk_bytes).is_some());
+    let mut long = keys().vk_bytes.clone();
+    long.push(0);
+    assert!(prepare_stored_key(&long).is_none(), "trailing bytes");
+    assert!(prepare_stored_key(&keys().vk_bytes[1..]).is_none(), "truncated");
+    let mut short = keys().vk.clone();
+    short.gamma_abc_g1.pop();
+    assert!(prepare_stored_key(&compressed(&short)).is_none(), "wrong input count");
+}

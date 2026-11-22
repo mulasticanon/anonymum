@@ -52,6 +52,7 @@ to write that bounded statement is part of the request.
 | Issues found while modelling it | `docs/shielded-spec-v0-issues.md` | I1-I14 from modelling (open: I8 fee changes, I13 the derived refund, question 8); review findings H1-H7, M1-M4; I15-I27, questions raised while prototyping section 2a; R1-R12, the source review of cdad354 and their status |
 | Reference model of the rules | `crates/shielded-model` (about 1,100 lines plus tests) | Plain Rust, no proofs, no privacy. 61 tests including adversarial cases and a randomised conservation test. Entry point: `chain::Chain::submit` |
 | Prototype circuit | `crates/shielded-circuit` | **Unreviewed prototype, not audited, not for real value.** Groth16 over BLS12-381 (arkworks 0.4) for all six branches: Poseidon (width 5, `x^5`, 8 full and 60 partial rounds), depth-20 tree, 11 public inputs, 20,700 constraints. Keys come from an insecure single-process setup. Written before this review at the owner's request; if the spec changes, it changes |
+| Prototype shielded pallet | `substrate/pallets/anonymum-shielded` | **Unreviewed prototype, not for real value.** Verifies the circuit's Groth16 proofs inside the WebAssembly runtime (arkworks 0.4) and enforces the chain-side rules. Its verifying key comes from a **public seed**, so proofs can be forged under it. Runs on the local dev chain only |
 | Research report | `docs/Shielded_Payments_Technical_Research_2026-11-19.md` | 25,000 words, AI-written. Two claims spot-checked against primary sources (ZIP 257; Polkadot RFC-0163). The rest unchecked |
 | Alternative, heavier protocol | `docs/Shielded_Payments_Protocol_v0.1.md` | AI-written. Kept for comparison; section 8 of the spec lists the differences |
 | Messaging cryptography | `crates/crypto` (about 1,700 lines) | Working code, tested. Section 2a prototype: contact identities, cards and invitations; Noise IK with the authorisation check before any reply; the stranger's note opened with the inbox key alone. **Unreviewed (questions 11 and 12)** |
@@ -59,7 +60,7 @@ to write that bounded statement is part of the request.
 | Transparent prototype chain | `crates/core`, `substrate/` | Working. **Publishes the whole contact graph.** To be replaced by the shielded design; not a review priority |
 
 To run the tests: `cargo test` at the repository root (core, crypto, the
-shielded model and the prototype circuit), and `cargo test -p pallet-anonymum` inside `substrate/`.
+shielded model and the prototype circuit), and `cargo test -p pallet-anonymum -p pallet-anonymum-shielded` inside `substrate/`.
 
 ## 5. What we are asking you to review, in priority order
 
@@ -377,10 +378,10 @@ wallet synchronisation, and from the small population at launch.
 - A review of the transparent prototype chain. It is known to publish the
   contact graph and will be replaced.
 - Legal advice. The owner is taking that separately.
-- An audit of code that does not exist yet: there is no verifier
-  integration and no production wallet. The prototype circuit exists, and
-  we would value your view on whether its approach is sound, but it is not
-  the audit target until the spec is settled.
+- An audit of code that does not exist yet: there is no production wallet.
+  The prototype circuit and pallet exist, and we would value your view on
+  whether their approach is sound, but they are not the audit target until
+  the spec is settled.
 
 ## 8. Known weaknesses, so you need not rediscover them
 
@@ -390,7 +391,14 @@ wallet synchronisation, and from the small population at launch.
   tag; reducing a 256-bit BLAKE2s `sighash` into `Fr`; and relying on
   Groth16's binding of public inputs, given that proofs can be
   re-randomised for the same inputs. Its setup is insecure by design, and
-  the chain-side checks are not wired up.
+  the shielded pallet (below) is its only verifier.
+- The shielded pallet is unreviewed. Points we most want checked: unsigned
+  submission, where nobody pays for a bad proof, so a peer can make nodes
+  run pairings for free; verifying with arkworks 0.4 inside the runtime
+  rather than through host functions; whether nullifier tags in the pool
+  and the strict scalar and point decoding are sufficient; and storing the
+  verifying key uncompressed after validating it once at genesis. Shielded
+  value is not yet connected to the transparent balances.
 
 - The current chain publishes who contacts whom, who pays whom, and who
   blocks whom.

@@ -1,0 +1,42 @@
+[package]
+name = "pallet-anonymum-shielded"
+version = "0.1.0"
+description = "UNREVIEWED PROTOTYPE: shielded transaction pallet verifying Groth16 proofs. Dev-only keys. Not audited. Not for real value."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+codec = { workspace = true }
+scale-info = { workspace = true }
+polkadot-sdk = { workspace = true, features = ["experimental", "runtime"] }
+# The 0.4 line, matching crates/shielded-circuit. no_std: no parallel, no std.
+ark-bls12-381 = { version = "=0.4.0", default-features = false, features = ["curve"] }
+ark-crypto-primitives = { version = "=0.4.0", default-features = false, features = ["sponge"] }
+ark-ec = { version = "=0.4.2", default-features = false }
+ark-ff = { version = "=0.4.2", default-features = false }
+ark-groth16 = { version = "=0.4.0", default-features = false }
+ark-serialize = { version = "=0.4.2", default-features = false }
+blake2 = { version = "=0.10.6", default-features = false }
+
+[dev-dependencies]
+polkadot-sdk = { workspace = true, features = ["experimental", "runtime", "pallet-timestamp", "std"] }
+# Real proofs, and byte-for-byte checks against the circuit and the model.
+anonymum-shielded-circuit = { path = "../../../crates/shielded-circuit" }
+anonymum-shielded-model = { path = "../../../crates/shielded-model" }
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+
+[features]
+default = ["std"]
+std = [
+	"ark-bls12-381/std",
+	"ark-crypto-primitives/std",
+	"ark-ec/std",
+	"ark-ff/std",
+	"ark-groth16/std",
+	"ark-serialize/std",
+	"blake2/std",
+	"codec/std",
+	"polkadot-sdk/std",
+	"scale-info/std",
+]

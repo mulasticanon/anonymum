@@ -2,7 +2,7 @@
 //! verifier must use on untrusted bytes.
 //!
 //! RFC-0163's host functions do not check subgroup membership on decode, so
-//! Milestone 4B must decode here first. [`decode_proof`] uses canonical
+//! a chain must decode strictly first. [`decode_proof`] uses canonical
 //! compressed deserialization with validation, which checks that each point
 //! is on the curve and in the prime-order subgroup.
 

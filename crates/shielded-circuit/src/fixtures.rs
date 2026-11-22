@@ -2,12 +2,16 @@
 //! randomness: **never use these keys or blindings for anything real.**
 
 use ark_bls12_381::Fr;
+use ark_bls12_381::Bls12_381;
 use ark_ff::Zero;
+use ark_groth16::{ProvingKey, VerifyingKey};
+use ark_std::rand::{rngs::StdRng, SeedableRng};
 
 use crate::circuit::{CircuitParams, ShieldedCircuit};
 use crate::merkle::MerkleTree;
 use crate::objects::*;
 use crate::poseidon::hash;
+use crate::verifier::insecure_dev_setup;
 
 pub const BASE_FEE: u64 = 1_000;
 pub const SURCHARGE: u64 = 50_000;
@@ -142,11 +146,51 @@ pub fn escrow_note(reserve: u64) -> Note {
 /// top-up note, at positions 1, 2 and 3.
 fn world(reserve: u64) -> MerkleTree {
     let mut tree = MerkleTree::new();
-    tree.append(f("filler-leaf")).expect("room");
-    for note in [funding_note(), escrow_note(reserve), top_up_note()] {
-        tree.append(leaf(note.commitment(), CREATED_AT.into())).expect("room");
+    for l in leaves_for_reserve(reserve) {
+        tree.append(l).expect("room");
     }
     tree
+}
+
+fn leaves_for_reserve(reserve: u64) -> Vec<Fr> {
+    let mut leaves = vec![f("filler-leaf")];
+    for note in [funding_note(), escrow_note(reserve), top_up_note()] {
+        leaves.push(leaf(note.commitment(), CREATED_AT.into()));
+    }
+    leaves
+}
+
+/// The leaves a chain must start from for `case` to be spendable.
+pub fn world_leaves(case: Case) -> Vec<Fr> {
+    leaves_for_reserve(case.reserve())
+}
+
+/// **Dev only, and public on purpose.** Keys from a fixed seed, so anyone
+/// can reproduce the toxic waste and forge proofs. They exist so a dev chain
+/// and its tests share one verifying key.
+pub fn dev_keys() -> (ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>) {
+    let mut rng = StdRng::from_seed(*b"anonymum-INSECURE-dev-setup-seed");
+    insecure_dev_setup(PARAMS, &mut rng).expect("setup")
+}
+
+/// `case` as a transaction for a real chain: its id and version, a window
+/// starting at `not_before`, and `stranger_note` in the envelope.
+pub fn build_for_chain(
+    case: Case,
+    chain_id: u32,
+    version: u32,
+    not_before: u64,
+    window: u64,
+    stranger_note: &[u8],
+) -> Built {
+    let mut built = build(case);
+    built.envelope.chain_id = chain_id;
+    built.envelope.version = version;
+    built.envelope.stranger_note_hash = stranger_note_hash(stranger_note);
+    built.circuit.public.not_before = not_before.into();
+    built.circuit.public.not_after = (not_before + window).into();
+    built.reseal();
+    built
 }
 
 /// The valid transaction for `case`.

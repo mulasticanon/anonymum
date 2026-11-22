@@ -10,9 +10,10 @@
 //! - **No trusted setup.** [`verifier::insecure_dev_setup`] is one process
 //!   holding the toxic waste. Whoever holds it can forge proofs and mint.
 //! - **No privacy claim.** Nothing here has been analysed for leakage.
-//! - **No chain integration.** The chain-side checks (accepted root, unused
-//!   and distinct nullifiers, window grid, payload lengths) stay outside
-//!   the proof and are not wired up. `substrate/` does not depend on this.
+//! - **Chain-side checks live elsewhere.** The accepted root, unused and
+//!   distinct nullifiers, window grid and payload lengths stay outside the
+//!   proof, in `substrate/pallets/anonymum-shielded`, which uses this crate
+//!   only as a test dependency.
 //! - **Poseidon parameters are a proposal**, for the cryptographer to
 //!   confirm (see [`poseidon`]).
 //!

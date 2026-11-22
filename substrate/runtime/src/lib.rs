@@ -46,7 +46,7 @@ pub mod genesis_config_presets {
 	use crate::{
 		interface::{Balance, MinimumBalance},
 		sp_keyring::Sr25519Keyring,
-		BalancesConfig, RuntimeGenesisConfig, SudoConfig,
+		AnonymumShieldedConfig, BalancesConfig, RuntimeGenesisConfig, SudoConfig,
 	};
 
 	use alloc::{vec, vec::Vec};
@@ -65,6 +65,17 @@ pub mod genesis_config_presets {
 					.collect::<Vec<_>>(),
 			},
 			sudo: SudoConfig { key: Some(Sr25519Keyring::Alice.to_account_id()) },
+			// DEV ONLY, NEVER FOR REAL VALUE. This key comes from a public seed
+			// (`fixtures::dev_keys`), so anyone can forge proofs under it, and
+			// the leaves are fixture notes whose secrets are in the repository.
+			anonymum_shielded: AnonymumShieldedConfig {
+				dev_verifying_key: include_bytes!("../dev_shielded_vk.bin").to_vec(),
+				base_fee: SHIELDED_BASE_FEE,
+				initial_leaves: include_bytes!("../dev_shielded_leaves.bin")
+					.chunks_exact(32)
+					.map(|leaf| <[u8; 32]>::try_from(leaf).expect("chunks are 32 bytes; qed"))
+					.collect::<Vec<_>>(),
+			},
 		})
 	}
 
@@ -106,7 +117,8 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// plus Noise Xpsk0, hybrid post-quantum); 667-byte notes are refused.
 	// 7: contact notes grow to 1,795 bytes (the embedded card carries a signed
 	// sequence number, card format v4); 1,787-byte notes are refused.
-	spec_version: 7,
+	// 8: adds pallet-anonymum-shielded (unreviewed prototype, dev key only).
+	spec_version: 8,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -182,6 +194,10 @@ mod runtime {
 	/// Invites, paid contact requests, channels, blocks and fees.
 	#[runtime::pallet_index(5)]
 	pub type Anonymum = pallet_anonymum::Pallet<Runtime>;
+
+	/// UNREVIEWED PROTOTYPE: shielded transactions with a dev-only key.
+	#[runtime::pallet_index(6)]
+	pub type AnonymumShielded = pallet_anonymum_shielded::Pallet<Runtime>;
 }
 
 parameter_types! {
@@ -266,6 +282,29 @@ impl pallet_anonymum::Config for Runtime {
 	type InviteDeposit = ConstU128<{ COIN / 100 }>;
 	type BlockDeposit = ConstU128<{ COIN / 100 }>;
 	type KeyDeposit = ConstU128<{ COIN / 100 }>;
+}
+
+/// The dev chain's shielded base fee `F`, in base units (matches the
+/// circuit fixtures). Shielded value is not connected to `Balances`.
+pub const SHIELDED_BASE_FEE: u64 = 1_000;
+
+parameter_types! {
+	pub const ShieldedBurnShare: sp_runtime::Percent = sp_runtime::Percent::from_percent(50);
+	/// Placeholder, not a benchmark (see README).
+	pub const ShieldedSubmitWeight: Weight = Weight::from_parts(300_000_000_000, 64 * 1024);
+}
+
+impl pallet_anonymum_shielded::Config for Runtime {
+	type TimeProvider = Timestamp;
+	type ChainId = ConstU32<4242>;
+	type TxVersion = ConstU32<1>;
+	type WindowSecs = ConstU64<60>;
+	type FeeBurnPercent = ShieldedBurnShare;
+	type RootHistory = ConstU32<128>;
+	type MaxPrunePerBlock = ConstU32<64>;
+	type MaxPruneWindows = ConstU32<64>;
+	type UnsignedLongevity = ConstU64<10>;
+	type SubmitWeight = ShieldedSubmitWeight;
 }
 
 type Block = frame::runtime::types_common::BlockOf<Runtime, TxExtension>;

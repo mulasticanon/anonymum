@@ -3,7 +3,7 @@
 # dependency tree cannot disturb the pinned Nym crates in the main workspace.
 [workspace]
 resolver = "2"
-members = ["pallets/anonymum", "runtime"]
+members = ["pallets/anonymum", "pallets/anonymum-shielded", "runtime"]
 
 [workspace.package]
 edition = "2021"
@@ -16,3 +16,26 @@ codec = { version = "3.7.5", default-features = false, package = "parity-scale-c
 scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.132", default-features = false, features = ["alloc"] }
 pallet-anonymum = { path = "pallets/anonymum", default-features = false }
+pallet-anonymum-shielded = { path = "pallets/anonymum-shielded", default-features = false }
+
+# Proving in the shielded pallet's tests is unusably slow unoptimised.
+[profile.dev.package."ark-ff@0.4.2"]
+opt-level = 3
+[profile.dev.package."ark-ec@0.4.2"]
+opt-level = 3
+[profile.dev.package."ark-poly@0.4.2"]
+opt-level = 3
+[profile.dev.package."ark-bls12-381@0.4.0"]
+opt-level = 3
+[profile.dev.package."ark-groth16@0.4.0"]
+opt-level = 3
+[profile.dev.package."ark-relations@0.4.0"]
+opt-level = 3
+[profile.dev.package."ark-r1cs-std@0.4.0"]
+opt-level = 3
+[profile.dev.package."ark-crypto-primitives@0.4.0"]
+opt-level = 3
+[profile.dev.package.anonymum-shielded-circuit]
+opt-level = 2
+[profile.dev.package.pallet-anonymum-shielded]
+opt-level = 2

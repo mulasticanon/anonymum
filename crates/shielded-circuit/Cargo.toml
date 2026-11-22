@@ -31,3 +31,7 @@ anonymum-shielded-model = { path = "../shielded-model" }
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+
+[[example]]
+name = "dev_tool"
+path = "examples/dev_tool.rs"

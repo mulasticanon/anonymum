@@ -20,6 +20,7 @@ polkadot-sdk = { workspace = true, features = [
 	"sp-consensus-aura",
 ] }
 pallet-anonymum = { workspace = true }
+pallet-anonymum-shielded = { workspace = true }
 
 [build-dependencies]
 polkadot-sdk = { optional = true, workspace = true, features = ["substrate-wasm-builder"] }
@@ -29,6 +30,7 @@ default = ["std"]
 std = [
 	"codec/std",
 	"pallet-anonymum/std",
+	"pallet-anonymum-shielded/std",
 	"polkadot-sdk/std",
 	"scale-info/std",
 	"serde_json/std",

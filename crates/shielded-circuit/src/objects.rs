@@ -154,6 +154,18 @@ pub fn refund_blinding(seed: Fr, escrow_position: u64) -> Fr {
     hash("refund-blinding", &[seed, escrow_position.into()])
 }
 
+/// The stranger-note slot's permanent hash, byte for byte the model's
+/// `stranger_note_hash`: BLAKE2s with domain `stranger-note-slot`.
+pub fn stranger_note_hash(slot: &[u8]) -> [u8; 32] {
+    let tag: &[u8] = b"anonymum/shielded-model/v0/stranger-note-slot";
+    let mut hasher = Blake2s256::new();
+    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(tag);
+    hasher.update((slot.len() as u64).to_le_bytes());
+    hasher.update(slot);
+    hasher.finalize().into()
+}
+
 /// `ceil(price / 100)`.
 pub fn penalty(price: u64) -> u64 {
     price / 100 + u64::from(price % 100 != 0)
