@@ -59,6 +59,13 @@ parameter_types! {
     pub const TestWeight: Weight = Weight::from_parts(1_000_000, 0);
 }
 
+/// Low, so tests stay fast. Each test chain starts from this value.
+pub const TEST_POW_BITS: u32 = 4;
+
+parameter_types! {
+    pub static PowBits: u32 = TEST_POW_BITS;
+}
+
 impl pallet_anonymum_shielded::Config for Test {
     type TimeProvider = Timestamp;
     type ChainId = ConstU32<CHAIN_ID>;
@@ -69,6 +76,7 @@ impl pallet_anonymum_shielded::Config for Test {
     type MaxPrunePerBlock = ConstU32<2>;
     type MaxPruneWindows = ConstU32<8>;
     type PoolLongevity = ConstU64<10>;
+    type PowDifficulty = PowBits;
     type SubmitWeight = TestWeight;
     type AuthorizeWeight = TestWeight;
 }
@@ -96,6 +104,7 @@ pub fn new_test_ext(case: Case) -> TestState {
 }
 
 pub fn new_test_ext_with(case: Case, base_fee: u64, with_key: bool) -> TestState {
+    PowBits::set(TEST_POW_BITS);
     let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
     let leaves: Vec<[u8; 32]> = fixtures::world_leaves(case).iter().map(encode_fr).collect();
     pallet_anonymum_shielded::GenesisConfig::<Test> {

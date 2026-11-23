@@ -300,18 +300,30 @@ other rules already imply. Limits to know about:
 by `#[pallet::authorize]`, so it has no signer and no account appears on
 chain. Authorization runs in the transaction pool and again at inclusion,
 cheapest check first: note length, clock grid and time, accepted root,
-nullifiers, strict decoding of the 192-byte proof, and only then the sighash
-and the Groth16 pairing. Pool tags are the two nullifiers, never the proof
+nullifiers, strict decoding of the 192-byte proof, the sighash and a
+proof of work, and only then the Groth16 pairing. Pool tags are the two nullifiers, never the proof
 bytes, so a re-randomised copy conflicts with the original. Dispatch repeats
 the cheap checks without a second pairing, then records the nullifiers,
 appends three leaves to a depth-20 Poseidon tree, keeps the stranger note for
 24 hours, and splits the base fee between two counters.
 
-Measured 2026-11-22 (runtime `spec_version` 9): the runtime is 477,931 bytes
-compressed, up from 384,816 before the shielded pallet (+93,115, +24.2%).
-`shielded-smoke.mjs`, `smoke.mjs` and `e2e.mjs` passed on a dev node: the
-WebAssembly runtime verified a real proof, and a tampered note, malformed
-proof bytes, a short note and a re-randomised replay were refused.
+The proof of work is
+`BLAKE2s("anonymum/shielded-pow/v1" || sighash || root || nullifiers[0] ||
+nullifiers[1] || proof || pow_nonce_le)`, which must start with
+`PowDifficulty` zero bits (16 in the dev runtime, 0 turns it off, at most 64).
+Binding the proof bytes means one solution cannot be reused across different
+bad proofs, and binding the root limits precomputation. Clients solve it with
+`anonymum_shielded_circuit::pow::solve_pow`.
+
+Measured 2026-11-22 (runtime `spec_version` 10): the runtime is 478,254 bytes
+compressed, up from 384,816 before the shielded pallet (+93,438, +24.3%).
+Solving 16 bits on one CPU thread took a mean of 11.07 ms, median 7.51 ms,
+95th percentile 36.80 ms and maximum 65.16 ms over 500 solves. The time varies
+widely because the number of tries is random. `shielded-smoke.mjs`,
+`smoke.mjs` and `e2e.mjs` passed on a dev node: the WebAssembly runtime
+verified a real proof; a tampered note, a nonce reused on other proof bytes,
+a wrong proof with valid work, malformed proof bytes, a short note and a
+re-randomised replay were refused.
 Polkadot.js cannot build a general transaction, so `shielded-smoke.mjs`
 encodes it itself.
 
@@ -321,9 +333,12 @@ encodes it itself.
 
 Not solved, and each blocks any public network:
 
-- **Free verification.** Nobody pays for a bad proof, so a peer can make
-  nodes run pairings at no cost. It needs rate limiting or another
-  admission rule.
+- **Spam is priced, not stopped.** Bad-proof pairing spam now needs a
+  configurable proof of work per attempt, but still pays no fee. The 16-bit
+  default has not been tuned: its mean CPU cost (about 11 ms) is the same
+  order as one native verification (5.89 ms), the cost of a pairing inside
+  WebAssembly has not been compared with it, and GPUs solve BLAKE2s far
+  faster. Rate limiting peers remains a node and P2P concern and is not built.
 - **Shielded value is not connected to balances.** Genesis notes are not
   backed by `pallet-balances`, and `BurnedFees` and `NodeRewardPool` are
   counters that pay nothing out.

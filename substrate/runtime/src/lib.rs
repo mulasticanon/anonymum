@@ -120,7 +120,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 8: adds pallet-anonymum-shielded (unreviewed prototype, dev key only).
 	// 9: shielded transactions are general transactions authorized through
 	// `AuthorizeCall`; the bare (unsigned) form is no longer accepted.
-	spec_version: 9,
+	spec_version: 10,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -308,6 +308,7 @@ impl pallet_anonymum_shielded::Config for Runtime {
 	type MaxPrunePerBlock = ConstU32<64>;
 	type MaxPruneWindows = ConstU32<64>;
 	type PoolLongevity = ConstU64<10>;
+	type PowDifficulty = ConstU32<16>;
 	type SubmitWeight = ShieldedSubmitWeight;
 	type AuthorizeWeight = ShieldedAuthorizeWeight;
 }

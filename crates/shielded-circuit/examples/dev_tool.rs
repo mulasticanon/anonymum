@@ -2,10 +2,13 @@
 //!
 //!   dev_tool poseidon                    Poseidon constants as Rust source
 //!   dev_tool genesis <vk-file> <leaves>  write the dev verifying key and leaves
-//!   dev_tool tx <chain> <version> <now> <window>  prove a Transfer, print JSON
+//!   dev_tool tx <chain> <version> <now> <window> [pow-bits]  prove a Transfer
+//!                                        and solve its proof of work, print JSON
+//!   dev_tool pow-bench <bits> <samples>  time the proof of work
 
 use anonymum_shielded_circuit::fixtures::*;
 use anonymum_shielded_circuit::poseidon::config;
+use anonymum_shielded_circuit::pow::solve_pow;
 use anonymum_shielded_circuit::verifier::*;
 use anonymum_shielded_circuit::*;
 use ark_ff::PrimeField;
@@ -65,15 +68,54 @@ fn main() {
             let proof = encode_proof(&raw);
             // The same statement with different proof bytes, to test replay.
             let again = encode_proof(&Groth16::<Bls12_381>::rerandomize_proof(&vk, &raw, &mut OsRng));
+            // Well-formed points that the pairing refuses.
+            let mut negated = raw.clone();
+            negated.a = -negated.a;
+            let wrong = encode_proof(&negated);
             let p = built.circuit.public;
+            let bits = args.get(5).map_or(16, |b| b.parse::<u32>().unwrap());
+            let word = |x: &Fr| -> [u8; 32] { bytes(x).try_into().unwrap() };
+            let (sighash, root) = (word(&p.sighash), word(&p.root));
+            let spent = [word(&p.nullifiers[0]), word(&p.nullifiers[1])];
+            let solve = |proof: &[u8]| solve_pow(&sighash, &root, &spent, proof.try_into().unwrap(), bits);
+            let started = std::time::Instant::now();
+            let pow_nonce = solve(&proof);
+            let pow_micros = started.elapsed().as_micros();
+            let (again_nonce, wrong_nonce) = (solve(&again), solve(&wrong));
             let list = |xs: &[Fr]| xs.iter().map(|x| hex(&bytes(x))).collect::<Vec<_>>().join(",");
             println!(
-                "{{\"root\":{},\"nullifiers\":[{}],\"commitments\":[{}],\"admission\":{},\"notBefore\":{},\"notAfter\":{},\"coin\":[{},{}],\"note\":{},\"proof\":{},\"rerandomised\":{}}}",
+                "{{\"root\":{},\"nullifiers\":[{}],\"commitments\":[{}],\"admission\":{},\"notBefore\":{},\"notAfter\":{},\"coin\":[{},{}],\"note\":{},\"proof\":{},\"rerandomised\":{},\"wrongProof\":{},\"powBits\":{},\"powNonce\":\"{}\",\"rerandomisedPowNonce\":\"{}\",\"wrongProofPowNonce\":\"{}\",\"powMicros\":{}}}",
                 hex(&bytes(&p.root)), list(&p.nullifiers), list(&p.commitments), hex(&bytes(&p.admission)),
                 not_before, not_before + n(4),
-                hex(&built.envelope.coin_slots[0]), hex(&built.envelope.coin_slots[1]), hex(&note), hex(&proof), hex(&again)
+                hex(&built.envelope.coin_slots[0]), hex(&built.envelope.coin_slots[1]), hex(&note), hex(&proof), hex(&again),
+                hex(&wrong), bits, pow_nonce, again_nonce, wrong_nonce, pow_micros
             );
         }
-        _ => eprintln!("usage: dev_tool poseidon | genesis <vk> <leaves> | tx <chain> <version> <now> <window>"),
+        Some("pow-bench") => {
+            let (bits, samples) = (args[1].parse::<u32>().unwrap(), args[2].parse::<usize>().unwrap());
+            let mut micros = Vec::with_capacity(samples);
+            let mut tries = 0u128;
+            for _ in 0..samples {
+                let mut input = [0u8; 320];
+                OsRng.fill_bytes(&mut input);
+                let word = |at: usize| -> [u8; 32] { input[at..at + 32].try_into().unwrap() };
+                let proof: [u8; 192] = input[128..].try_into().unwrap();
+                let started = std::time::Instant::now();
+                let nonce = solve_pow(&word(0), &word(32), &[word(64), word(96)], &proof, bits);
+                micros.push(started.elapsed().as_micros());
+                tries += u128::from(nonce) + 1;
+            }
+            micros.sort_unstable();
+            let mean = micros.iter().sum::<u128>() / samples as u128;
+            println!(
+                "{bits} bits, {samples} solves: mean {:.2} ms, median {:.2} ms, p95 {:.2} ms, max {:.2} ms, mean tries {}",
+                mean as f64 / 1000.0,
+                micros[samples / 2] as f64 / 1000.0,
+                micros[samples * 95 / 100] as f64 / 1000.0,
+                micros[samples - 1] as f64 / 1000.0,
+                tries / samples as u128
+            );
+        }
+        _ => eprintln!("usage: dev_tool poseidon | genesis <vk> <leaves> | tx <chain> <version> <now> <window> [pow-bits] | pow-bench <bits> <samples>"),
     }
 }

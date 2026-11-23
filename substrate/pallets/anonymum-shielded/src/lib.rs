@@ -9,9 +9,10 @@
 //!   Anyone can forge proofs under it and mint shielded value.
 //! - Shielded value is not connected to `pallet-balances`. `BurnedFees` and
 //!   `NodeRewardPool` are counters; nothing pays out.
-//! - `submit_shielded` has no signer, so nobody pays to have a *bad* proof
-//!   checked. Cheap checks run first, but a peer can still make nodes do a
-//!   pairing for free. This needs rate limiting before any public network.
+//! - `submit_shielded` has no signer, so nobody pays a fee for a *bad* proof.
+//!   A BLAKE2s proof of work (`PowDifficulty`) must be solved before a node
+//!   runs the pairing. It raises the cost of spam and does not remove it:
+//!   per-peer rate limiting is still a node and P2P concern.
 //! - The weights are placeholders, not benchmarks.
 //!
 //! The call is a *general* transaction (extrinsic format 5) authorized by
@@ -83,6 +84,9 @@ pub mod pallet {
         /// How many blocks a valid transaction may wait in the pool.
         #[pallet::constant]
         type PoolLongevity: Get<u64>;
+        /// Leading zero bits the proof-of-work hash needs; 0 disables it.
+        #[pallet::constant]
+        type PowDifficulty: Get<u32>;
         /// Placeholder weight of the dispatch: the state updates.
         #[pallet::constant]
         type SubmitWeight: Get<Weight>;
@@ -230,6 +234,8 @@ pub mod pallet {
         MalformedProof,
         /// The proof does not verify.
         InvalidProof,
+        /// The proof-of-work hash has too few leading zero bits.
+        InsufficientPow,
     }
 
     impl<T> Error<T> {
@@ -248,6 +254,7 @@ pub mod pallet {
                 Error::NoVerifyingKey => 10,
                 Error::MalformedProof => 11,
                 Error::InvalidProof => 12,
+                Error::InsufficientPow => 13,
                 _ => 0,
             }
         }
@@ -277,6 +284,7 @@ pub mod pallet {
             assert!(window > 0 && NOTE_TTL_SECS % window == 0, "the window must divide 24 hours");
             assert!(T::RootHistory::get() > 0, "at least one root must be accepted");
             assert!(T::MaxPruneWindows::get() > 0 && T::MaxPrunePerBlock::get() > 0, "pruning must progress");
+            assert!(T::PowDifficulty::get() <= MAX_POW_DIFFICULTY, "the nonce is a u64");
         }
     }
 
@@ -300,8 +308,11 @@ pub mod pallet {
             coin_payloads: [[u8; COIN_PAYLOAD_LEN]; 2],
             stranger_note: StrangerNote,
             proof: [u8; PROOF_LEN],
+            pow_nonce: u64,
         ) -> DispatchResult {
             ensure_authorized(origin)?;
+            // Checked in authorization, which is what grants this origin.
+            let _ = pow_nonce;
             let tx = TxRef {
                 root: &root,
                 nullifiers: &nullifiers,
@@ -369,7 +380,8 @@ pub mod pallet {
 
         /// Authorization, in strict order: (1) note length, (2) clock grid
         /// and block time, (3) root, (4) nullifiers, each in `check_cheap`;
-        /// (5) strict proof decoding; (6) only then the sighash and pairing.
+        /// (5) strict proof decoding; (6) the sighash and proof of work;
+        /// (7) only then the pairing.
         /// Tags are the nullifiers, never the proof, so a re-randomised copy
         /// conflicts with the original in the pool.
         #[allow(clippy::too_many_arguments)]
@@ -384,6 +396,7 @@ pub mod pallet {
             coin_payloads: &[[u8; COIN_PAYLOAD_LEN]; 2],
             stranger_note: &StrangerNote,
             proof: &[u8; PROOF_LEN],
+            pow_nonce: &u64,
         ) -> TransactionValidityWithRefund {
             let tx = TxRef {
                 root,
@@ -410,9 +423,13 @@ pub mod pallet {
             };
 
             let checked = Self::check_cheap(&tx, rule).map_err(refuse)?;
-            let key = DevVerifyingKey::<T>::get().ok_or(Error::<T>::NoVerifyingKey).map_err(refuse)?;
             let decoded = decode_proof(tx.proof).ok_or(Error::<T>::MalformedProof).map_err(refuse)?;
             let digests = Self::digests(&tx, &checked);
+            let work = pow_hash(&digests.sighash, tx.root, tx.nullifiers, tx.proof, *pow_nonce);
+            if leading_zero_bits(&work) < T::PowDifficulty::get() {
+                return Err(refuse(Error::<T>::InsufficientPow));
+            }
+            let key = DevVerifyingKey::<T>::get().ok_or(Error::<T>::NoVerifyingKey).map_err(refuse)?;
             if !verify(&key, &decoded, &digests.inputs) {
                 return Err(refuse(Error::<T>::InvalidProof));
             }

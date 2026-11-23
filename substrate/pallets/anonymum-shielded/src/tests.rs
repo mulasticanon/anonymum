@@ -41,9 +41,54 @@ struct Tx {
     coin: [[u8; 200]; 2],
     note: Vec<u8>,
     proof: [u8; 192],
+    /// `None` solves the proof of work for the current fields.
+    pow_nonce: Option<u64>,
 }
 
 impl Tx {
+    /// The sighash the chain would compute, if every field is canonical.
+    fn sighash(&self) -> Option<Bytes32> {
+        let fields: [Fr; N_PUBLIC - 1] = [
+            decode_fr(&self.root)?,
+            decode_fr(&self.nullifiers[0])?,
+            decode_fr(&self.nullifiers[1])?,
+            decode_fr(&self.commitments[0])?,
+            decode_fr(&self.commitments[1])?,
+            decode_fr(&self.commitments[2])?,
+            decode_fr(&self.admission)?,
+            Fr::from(BaseFee::<Test>::get()),
+            Fr::from(self.not_before),
+            Fr::from(self.not_after),
+        ];
+        Some(encode_fr(&compute_sighash(&SighashInputs {
+            chain_id: CHAIN_ID,
+            version: TX_VERSION,
+            fields: &fields,
+            coin_slots: &self.coin,
+            stranger_note_hash: &stranger_note_hash(&self.note),
+        })))
+    }
+
+    fn nonce(&self) -> u64 {
+        self.pow_nonce.unwrap_or_else(|| {
+            self.sighash().map_or(0, |s| {
+                circuit::pow::solve_pow(&s, &self.root, &self.nullifiers, &self.proof, PowBits::get())
+            })
+        })
+    }
+
+    fn with_nonce(&self, nonce: u64) -> Tx {
+        Tx { pow_nonce: Some(nonce), ..self.clone() }
+    }
+
+    /// The first nonce whose hash has exactly `bits` leading zero bits.
+    fn nonce_with_exactly(&self, bits: u32) -> u64 {
+        let s = self.sighash().unwrap();
+        (0u64..1 << 16)
+            .find(|n| leading_zero_bits(&pow_hash(&s, &self.root, &self.nullifiers, &self.proof, *n)) == bits)
+            .expect("a nonce with this many zero bits within the search bound")
+    }
+
     fn bounded_note(&self) -> StrangerNote {
         self.note.clone().try_into().expect("test notes fit the bound")
     }
@@ -76,6 +121,7 @@ impl Tx {
             coin_payloads: self.coin,
             stranger_note: self.bounded_note(),
             proof: self.proof,
+            pow_nonce: self.nonce(),
         }
     }
 }
@@ -98,6 +144,7 @@ fn pallet_error(refused: TransactionValidityError) -> E {
             10 => E::NoVerifyingKey,
             11 => E::MalformedProof,
             12 => E::InvalidProof,
+            13 => E::InsufficientPow,
             other => panic!("unknown refusal code {other}"),
         },
         other => panic!("unexpected refusal {other:?}"),
@@ -121,6 +168,7 @@ fn from_built(built: &Built, note: Vec<u8>) -> Tx {
         ],
         note,
         proof: encode_proof(&proof).try_into().unwrap(),
+        pow_nonce: None,
     }
 }
 
@@ -634,6 +682,7 @@ fn only_the_authorized_origin_can_dispatch() {
                     tx.coin,
                     tx.bounded_note(),
                     tx.proof,
+                    0,
                 ),
                 DispatchError::BadOrigin
             );
@@ -843,7 +892,9 @@ fn the_checks_run_cheapest_first() {
         refused_by_pool(&tx, 11); // proof encoding
         tx.proof = good.proof;
         tx.coin[0][0] ^= 1;
-        refused_by_pool(&tx, 12); // sighash and pairing
+        let unsolved = tx.nonce_with_exactly(0);
+        refused_by_pool(&tx.with_nonce(unsolved), 13); // proof of work
+        refused_by_pool(&tx, 12); // pairing
     });
 }
 
@@ -913,6 +964,7 @@ fn the_dispatch_repeats_the_state_checks() {
             tx.coin,
             tx.bounded_note(),
             tx.proof,
+            0,
         )
     };
     new_test_ext(Case::Transfer).execute_with(|| {
@@ -929,11 +981,167 @@ fn the_dispatch_repeats_the_state_checks() {
 
 #[test]
 fn authorization_and_dispatch_carry_their_own_weights() {
-    let tx = transfer();
+    let tx = Tx { pow_nonce: Some(0), ..transfer() };
     let call = tx.call();
     assert_eq!(call.weight_of_authorize(), Weight::from_parts(1_000_000, 0));
     let info = call.get_dispatch_info();
     assert_eq!(info.call_weight, Weight::from_parts(1_000_000, 0));
+}
+
+// ---- proof of work ----------------------------------------------------------------
+
+#[test]
+fn the_pow_hash_is_the_specified_concatenation_and_matches_the_client() {
+    use blake2::{Blake2s256, Digest};
+    let (sighash, root, nullifiers, proof) = ([1u8; 32], [2u8; 32], [[3u8; 32], [4u8; 32]], [5u8; 192]);
+    let nonce = 0x0102_0304_0506_0708u64;
+    let mut message = b"anonymum/shielded-pow/v1".to_vec();
+    for part in [&sighash[..], &root, &nullifiers[0], &nullifiers[1], &proof, &nonce.to_le_bytes()] {
+        message.extend_from_slice(part);
+    }
+    let expected: Bytes32 = Blake2s256::digest(&message).into();
+    assert_eq!(pow_hash(&sighash, &root, &nullifiers, &proof, nonce), expected);
+    assert_eq!(circuit::pow::pow_hash(&sighash, &root, &nullifiers, &proof, nonce), expected);
+
+    let solved = circuit::pow::solve_pow(&sighash, &root, &nullifiers, &proof, 10);
+    assert!(leading_zero_bits(&pow_hash(&sighash, &root, &nullifiers, &proof, solved)) >= 10);
+}
+
+#[test]
+fn leading_zero_bits_are_counted_exactly() {
+    assert_eq!(leading_zero_bits(&[0; 32]), 256);
+    for bits in 0..256usize {
+        let mut hash = [0u8; 32];
+        hash[bits / 8] = 0x80 >> (bits % 8);
+        hash[31] |= (bits < 248) as u8; // bits after the first one do not count
+        assert_eq!(leading_zero_bits(&hash), bits as u32);
+        assert_eq!(circuit::pow::leading_zero_bits(&hash), bits as u32);
+    }
+}
+
+#[test]
+fn the_pow_hash_covers_every_bound_field() {
+    let (sighash, root, nullifiers, proof) = ([1u8; 32], [2u8; 32], [[3u8; 32], [4u8; 32]], [5u8; 192]);
+    let base = pow_hash(&sighash, &root, &nullifiers, &proof, 7);
+    let flip = |mut x: Bytes32| {
+        x[31] ^= 1;
+        x
+    };
+    let mut other_proof = proof;
+    other_proof[191] ^= 1;
+    assert_ne!(base, pow_hash(&flip(sighash), &root, &nullifiers, &proof, 7), "sighash");
+    assert_ne!(base, pow_hash(&sighash, &flip(root), &nullifiers, &proof, 7), "root");
+    assert_ne!(base, pow_hash(&sighash, &root, &[flip(nullifiers[0]), nullifiers[1]], &proof, 7), "first nullifier");
+    assert_ne!(base, pow_hash(&sighash, &root, &[nullifiers[0], flip(nullifiers[1])], &proof, 7), "second nullifier");
+    assert_ne!(base, pow_hash(&sighash, &root, &nullifiers, &other_proof, 7), "proof");
+    assert_ne!(base, pow_hash(&sighash, &root, &nullifiers, &proof, 8), "nonce");
+    assert_ne!(base, pow_hash(&sighash, &root, &[nullifiers[1], nullifiers[0]], &proof, 7), "nullifier order");
+}
+
+#[test]
+fn a_bad_nonce_is_refused_before_the_pairing_with_no_state_change() {
+    let good = transfer();
+    let wrong_proof = real_tx(Case::Invited).proof;
+    new_test_ext(Case::Transfer).execute_with(|| {
+        PowBits::set(8);
+        let bad = good.with_nonce(good.nonce_with_exactly(7));
+        refused_by_pool(&bad, 13);
+        assert_noop!(bad.submit(), E::InsufficientPow);
+
+        // A proof the pairing would refuse reports the proof of work first,
+        // and reaches the pairing only once the work is done.
+        let mut wrong = good.clone();
+        wrong.proof = wrong_proof;
+        refused_by_pool(&wrong.with_nonce(wrong.nonce_with_exactly(7)), 13);
+        refused_by_pool(&wrong, 12);
+
+        // The check runs before the verifying key is even read.
+        DevVerifyingKey::<Test>::kill();
+        refused_by_pool(&bad, 13);
+        refused_by_pool(&good, 10);
+    });
+}
+
+#[test]
+fn a_solved_nonce_does_not_carry_over_to_a_changed_transaction() {
+    let base = transfer();
+    let other_proof = rerandomised(&base);
+    new_test_ext(Case::Transfer).execute_with(|| {
+        PowBits::set(8);
+        let other_root = fr_bytes(&(decode_fr(&base.root).unwrap() + Fr::one()));
+        AcceptedRoots::<Test>::insert(other_root, ());
+
+        let change = |f: &dyn Fn(&mut Tx)| {
+            let mut tx = base.clone();
+            f(&mut tx);
+            tx
+        };
+        let bump = |x: &Bytes32| fr_bytes(&(decode_fr(x).unwrap() + Fr::one()));
+        let changed = [
+            change(&|t| t.proof = other_proof),      // the proof bytes
+            change(&|t| t.coin[0][0] ^= 1),          // the sighash alone
+            change(&|t| t.root = other_root),        // the root
+            change(&|t| t.nullifiers[0] = bump(&t.nullifiers[0])),
+            change(&|t| t.nullifiers[1] = bump(&t.nullifiers[1])),
+        ];
+
+        // At 8 bits a changed transaction passes by luck 1 time in 256, so
+        // use a nonce that solves the original and none of the others.
+        let digest = |t: &Tx| (t.sighash().unwrap(), t.root, t.nullifiers, t.proof);
+        let solves = |d: &(Bytes32, Bytes32, [Bytes32; 2], [u8; 192]), n: u64| {
+            leading_zero_bits(&pow_hash(&d.0, &d.1, &d.2, &d.3, n)) >= 8
+        };
+        let original = digest(&base);
+        let others: Vec<_> = changed.iter().map(digest).collect();
+        // Bounded: if the hash ignored a field, no such nonce would exist.
+        let nonce = (0u64..1 << 16)
+            .find(|n| solves(&original, *n) && others.iter().all(|d| !solves(d, *n)))
+            .expect("every changed field changes the hash");
+
+        assert_ok!(base.with_nonce(nonce).authorize(TransactionSource::External));
+        for tx in &changed {
+            refused_by_pool(&tx.with_nonce(nonce), 13);
+        }
+    });
+}
+
+#[test]
+fn the_difficulty_boundary_is_exact() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        for difficulty in [1, 4, 8] {
+            PowBits::set(difficulty);
+            refused_by_pool(&tx.with_nonce(tx.nonce_with_exactly(difficulty - 1)), 13);
+            let exact = tx.with_nonce(tx.nonce_with_exactly(difficulty));
+            assert!(exact.authorize(TransactionSource::External).is_ok(), "difficulty {difficulty}");
+        }
+        PowBits::set(8);
+        assert_ok!(tx.with_nonce(tx.nonce_with_exactly(8)).submit());
+    });
+}
+
+#[test]
+fn the_highest_difficulty_a_u64_nonce_allows_passes_the_startup_check() {
+    PowBits::set(MAX_POW_DIFFICULTY);
+    <Shielded as Hooks<u64>>::integrity_test();
+}
+
+#[test]
+#[should_panic(expected = "the nonce is a u64")]
+fn a_difficulty_above_that_fails_the_startup_check() {
+    PowBits::set(MAX_POW_DIFFICULTY + 1);
+    <Shielded as Hooks<u64>>::integrity_test();
+}
+
+#[test]
+fn difficulty_zero_disables_the_check() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        PowBits::set(0);
+        let any = tx.with_nonce(tx.nonce_with_exactly(0));
+        assert_ok!(any.authorize(TransactionSource::External));
+        assert_ok!(any.submit());
+    });
 }
 
 // ---- 24-hour pruning ---------------------------------------------------------------

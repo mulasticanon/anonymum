@@ -154,6 +154,38 @@ pub fn compute_sighash(tx: &SighashInputs) -> Fr {
     Fr::from_le_bytes_mod_order(&hasher.finalize())
 }
 
+/// Domain label of the anti-spam proof of work.
+pub const POW_DOMAIN: &[u8] = b"anonymum/shielded-pow/v1";
+/// Highest allowed difficulty: the nonce is a `u64`.
+pub const MAX_POW_DIFFICULTY: u32 = 64;
+
+/// The proof-of-work hash. It covers the proof bytes, so one solution cannot
+/// be reused across many different invalid proofs, and the root, so work
+/// cannot be done long in advance.
+pub fn pow_hash(sighash: &Bytes32, root: &Bytes32, nullifiers: &[Bytes32; 2], proof: &[u8; PROOF_LEN], nonce: u64) -> Bytes32 {
+    let mut hasher = Blake2s256::new();
+    hasher.update(POW_DOMAIN);
+    hasher.update(sighash);
+    hasher.update(root);
+    hasher.update(nullifiers[0]);
+    hasher.update(nullifiers[1]);
+    hasher.update(proof);
+    hasher.update(nonce.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Zero bits at the start of `hash`, from the first byte's high bit.
+pub fn leading_zero_bits(hash: &Bytes32) -> u32 {
+    let mut bits = 0;
+    for byte in hash {
+        bits += byte.leading_zeros();
+        if *byte != 0 {
+            break;
+        }
+    }
+    bits
+}
+
 /// A canonical scalar: a value at or above the modulus is refused, never
 /// reduced, so one nullifier cannot have two encodings.
 pub fn decode_fr(bytes: &Bytes32) -> Option<Fr> {

@@ -27,6 +27,7 @@ pub mod fixtures;
 pub mod merkle;
 pub mod objects;
 pub mod poseidon;
+pub mod pow;
 pub mod verifier;
 
 pub use ark_bls12_381::{Bls12_381, Fr};

@@ -15,7 +15,8 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const TOOL = resolve(here, '../../target/release/examples', process.platform === 'win32' ? 'dev_tool.exe' : 'dev_tool');
 const [CHAIN_ID, VERSION, WINDOW, FEE] = [4242, 1, 60, 1000n];
-const SPEC_VERSION = 9;
+const SPEC_VERSION = 10;
+const POW_BITS = 16;
 
 function check(ok, message) {
   if (!ok) {
@@ -38,9 +39,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * 0x45 (format 5, general), 0x00 (extension version), then the extensions
  * that carry data, in pipeline order: era 0x00 (immortal), nonce 0, tip 0.
  */
-function general(t, note = t.note, proof = t.proof) {
+function general(t, note = t.note, proof = t.proof, powNonce = t.powNonce) {
   const method = api.tx.anonymumShielded.submitShielded(
-    t.root, t.nullifiers, t.commitments, t.admission, t.notBefore, t.notAfter, t.coin, note, proof,
+    t.root, t.nullifiers, t.commitments, t.admission, t.notBefore, t.notAfter, t.coin, note, proof, powNonce,
   ).method.toU8a();
   return u8aToHex(compactAddLength(u8aConcat(new Uint8Array([0x45, 0x00, 0x00, 0x00, 0x00]), method)));
 }
@@ -74,21 +75,29 @@ async function shieldedEvent(from) {
 
 console.log(`Connected, spec_version ${api.runtimeVersion.specVersion}`);
 check(api.runtimeVersion.specVersion.toNumber() === SPEC_VERSION, `runtime spec_version is ${SPEC_VERSION}`);
+check(api.consts.anonymumShielded.powDifficulty.toNumber() === POW_BITS, `the runtime requires ${POW_BITS} bits of proof of work`);
 check((await q.baseFee()).toBigInt() === FEE, 'dev base fee is in genesis');
 check((await q.nextIndex()).toNumber() === 4, 'the tree starts with the 4 fixture leaves');
 const startRoot = (await q.currentRoot()).toHex();
 
+// Genesis has timestamp 0, so wait for a real block time before proving.
+while ((await nowSecs()) === 0) await sleep(1000);
 // Prove for a window with time left, so the block lands inside it.
 while (WINDOW - ((await nowSecs()) % WINDOW) < 30) await sleep(2000);
 const started = Date.now();
-const t = JSON.parse(execFileSync(TOOL, ['tx', CHAIN_ID, VERSION, await nowSecs(), WINDOW].map(String), { encoding: 'utf8' }));
+const t = JSON.parse(execFileSync(TOOL, ['tx', CHAIN_ID, VERSION, await nowSecs(), WINDOW, POW_BITS].map(String), { encoding: 'utf8' }));
 console.log(`\nProved a Transfer in ${Date.now() - started} ms (includes regenerating the dev keys).`);
+console.log(`Solved its ${t.powBits}-bit proof of work in ${(t.powMicros / 1000).toFixed(2)} ms (nonce ${t.powNonce}).`);
 check(t.root === startRoot, 'proved against the on-chain root');
 
 // Refusals by authorization, before anything is pooled.
 const tampered = `0x${t.note.startsWith('0xff') ? '00' : 'ff'}${t.note.slice(4)}`;
 let why = await refused(general(t, tampered));
-check(why?.includes('Custom error: 12'), `the pool refuses a tampered stranger note (${why})`);
+check(why?.includes('Custom error: 13'), `a tampered stranger note fails the proof of work (${why})`);
+why = await refused(general(t, t.note, t.rerandomised));
+check(why?.includes('Custom error: 13'), `a solved nonce does not carry over to other proof bytes (${why})`);
+why = await refused(general(t, t.note, t.wrongProof, t.wrongProofPowNonce));
+check(why?.includes('Custom error: 12'), `a wrong proof with valid work is refused by the pairing (${why})`);
 const garbage = `0x${'ff'.repeat(192)}`;
 why = await refused(general(t, t.note, garbage));
 check(why?.includes('Custom error: 11'), `the pool refuses malformed proof bytes (${why})`);
@@ -100,8 +109,8 @@ await send(general(t));
 check(true, 'the pool accepted the general transaction, with no signer');
 // Same nullifiers, different proof bytes: refused while the first is pooled
 // (a tag conflict) or once it is included (a spent nullifier).
-why = await refused(general(t, t.note, t.rerandomised));
-check(why !== null, `a re-randomised copy is refused at once (${why})`);
+why = await refused(general(t, t.note, t.rerandomised, t.rerandomisedPowNonce));
+check(why !== null, `a re-randomised copy with its own work is refused at once (${why})`);
 
 const { found, failed } = await shieldedEvent(before);
 check(found && !failed, 'the WebAssembly runtime verified the proof and accepted the transaction');
@@ -117,7 +126,7 @@ const stored = await q.strangerNotes(windowStart, sighash);
 check(stored.isSome && stored.unwrap().length === 1795, 'the 1,795-byte note is in the 24-hour buffer');
 check(noteHash.toHex().length === 66, 'the note hash is in the event');
 
-why = await refused(general(t, t.note, t.rerandomised));
+why = await refused(general(t, t.note, t.rerandomised, t.rerandomisedPowNonce));
 check(why?.includes('Custom error: 7'), `a re-randomised replay is refused as a spent nullifier (${why})`);
 
 // The pool may answer an identical resubmission in its own way, so the check

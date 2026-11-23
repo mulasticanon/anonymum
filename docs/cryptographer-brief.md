@@ -394,8 +394,15 @@ wallet synchronisation, and from the small population at launch.
   the shielded pallet (below) is its only verifier.
 - The shielded pallet is unreviewed. Points we most want checked:
   submission as a general transaction with no signer, authorized by
-  `#[pallet::authorize]` in the pool and at inclusion, where nobody pays for
-  a bad proof, so a peer can make nodes run pairings for free; verifying with arkworks 0.4 inside the runtime
+  `#[pallet::authorize]` in the pool and at inclusion, where nobody pays a
+  fee for a bad proof. Bad-proof pairing spam is now gated by a configurable
+  BLAKE2s proof of work (`PowDifficulty`, 16 bits in the dev runtime) over
+  the sighash, root, nullifiers, proof bytes and nonce, checked after strict
+  proof decoding and before the pairing. It raises the cost of spam and does
+  not remove it: mean CPU solve time is about 11 ms against 5.89 ms for a
+  native verification, GPUs are faster, and the difficulty is untuned. True
+  network-level peer rate limiting remains a node/P2P concern and is not
+  built. Also: verifying with arkworks 0.4 inside the runtime
   rather than through host functions; whether nullifier tags in the pool
   and the strict scalar and point decoding are sufficient; and storing the
   verifying key uncompressed after validating it once at genesis. Shielded
