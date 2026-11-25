@@ -15,8 +15,8 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const TOOL = resolve(here, '../../target/release/examples', process.platform === 'win32' ? 'dev_tool.exe' : 'dev_tool');
 const [CHAIN_ID, VERSION, WINDOW, FEE] = [4242, 1, 60, 1000n];
-const SPEC_VERSION = 10;
-const POW_BITS = 16;
+const SPEC_VERSION = 11;
+const POW_BITS = 20;
 
 function check(ok, message) {
   if (!ok) {

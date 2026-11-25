@@ -56,7 +56,6 @@ impl pallet_timestamp::Config for Test {}
 
 parameter_types! {
     pub const BurnShare: Percent = Percent::from_percent(30);
-    pub const TestWeight: Weight = Weight::from_parts(1_000_000, 0);
 }
 
 /// Low, so tests stay fast. Each test chain starts from this value.
@@ -64,11 +63,12 @@ pub const TEST_POW_BITS: u32 = 4;
 
 parameter_types! {
     pub static PowBits: u32 = TEST_POW_BITS;
+    pub static MockChainId: u32 = CHAIN_ID;
 }
 
 impl pallet_anonymum_shielded::Config for Test {
     type TimeProvider = Timestamp;
-    type ChainId = ConstU32<CHAIN_ID>;
+    type ChainId = MockChainId;
     type TxVersion = ConstU32<TX_VERSION>;
     type WindowSecs = ConstU64<WINDOW>;
     type FeeBurnPercent = BurnShare;
@@ -77,8 +77,26 @@ impl pallet_anonymum_shielded::Config for Test {
     type MaxPruneWindows = ConstU32<8>;
     type PoolLongevity = ConstU64<10>;
     type PowDifficulty = PowBits;
-    type SubmitWeight = TestWeight;
-    type AuthorizeWeight = TestWeight;
+    type WeightInfo = ();
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = TestTime;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct TestTime;
+#[cfg(feature = "runtime-benchmarks")]
+impl crate::BenchmarkHelper for TestTime {
+    fn set_time_ms(ms: u64) {
+        pallet_timestamp::Now::<Test>::put(ms);
+    }
+}
+
+/// The benchmarks' fixture is proved for the dev runtime's chain id.
+#[cfg(feature = "runtime-benchmarks")]
+pub fn bench_ext() -> TestState {
+    let ext = new_test_ext(Case::Transfer);
+    MockChainId::set(4242);
+    ext
 }
 
 pub struct Keys {
@@ -105,6 +123,7 @@ pub fn new_test_ext(case: Case) -> TestState {
 
 pub fn new_test_ext_with(case: Case, base_fee: u64, with_key: bool) -> TestState {
     PowBits::set(TEST_POW_BITS);
+    MockChainId::set(CHAIN_ID);
     let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
     let leaves: Vec<[u8; 32]> = fixtures::world_leaves(case).iter().map(encode_fr).collect();
     pallet_anonymum_shielded::GenesisConfig::<Test> {

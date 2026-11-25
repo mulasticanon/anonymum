@@ -416,6 +416,7 @@ dependencies = [
 name = "anonymum-runtime"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking 50.0.0",
  "pallet-anonymum",
  "pallet-anonymum-shielded",
  "parity-scale-codec",
@@ -7905,6 +7906,7 @@ dependencies = [
  "ark-groth16",
  "ark-serialize 0.4.2",
  "blake2",
+ "frame-benchmarking 50.0.0",
  "parity-scale-codec",
  "polkadot-sdk",
  "rand_core 0.6.4",

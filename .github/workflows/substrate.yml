@@ -30,7 +30,8 @@ jobs:
         with:
           workspaces: substrate
       - run: cargo test --locked -p pallet-anonymum
-      - run: cargo test --locked -p pallet-anonymum-shielded
+      # With the benchmarks, which run against the mock as tests too.
+      - run: cargo test --locked -p pallet-anonymum-shielded --features runtime-benchmarks
 
   wasm-runtime:
     runs-on: ubuntu-latest

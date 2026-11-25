@@ -21,6 +21,8 @@ polkadot-sdk = { workspace = true, features = [
 ] }
 pallet-anonymum = { workspace = true }
 pallet-anonymum-shielded = { workspace = true }
+# Only with `runtime-benchmarks`; the version the SDK umbrella already locks.
+frame-benchmarking = { version = "=50.0.0", default-features = false, optional = true }
 
 [build-dependencies]
 polkadot-sdk = { optional = true, workspace = true, features = ["substrate-wasm-builder"] }
@@ -34,4 +36,9 @@ std = [
 	"polkadot-sdk/std",
 	"scale-info/std",
 	"serde_json/std",
+	"frame-benchmarking?/std",
+]
+runtime-benchmarks = [
+	"frame-benchmarking/runtime-benchmarks",
+	"pallet-anonymum-shielded/runtime-benchmarks",
 ]

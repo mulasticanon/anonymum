@@ -120,7 +120,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 8: adds pallet-anonymum-shielded (unreviewed prototype, dev key only).
 	// 9: shielded transactions are general transactions authorized through
 	// `AuthorizeCall`; the bare (unsigned) form is no longer accepted.
-	spec_version: 10,
+	spec_version: 11,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -292,10 +292,16 @@ pub const SHIELDED_BASE_FEE: u64 = 1_000;
 
 parameter_types! {
 	pub const ShieldedBurnShare: sp_runtime::Percent = sp_runtime::Percent::from_percent(50);
-	/// Placeholders, not benchmarks (see README). Together they keep the
-	/// 300 ms per transaction set from the dev-node measurements.
-	pub const ShieldedSubmitWeight: Weight = Weight::from_parts(60_000_000_000, 32 * 1024);
-	pub const ShieldedAuthorizeWeight: Weight = Weight::from_parts(240_000_000_000, 32 * 1024);
+}
+
+/// Lets the shielded pallet's benchmarks set the block time.
+#[cfg(feature = "runtime-benchmarks")]
+pub struct ShieldedBenchmarkTime;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_anonymum_shielded::BenchmarkHelper for ShieldedBenchmarkTime {
+	fn set_time_ms(ms: u64) {
+		pallet_timestamp::Now::<Runtime>::put(ms);
+	}
 }
 
 impl pallet_anonymum_shielded::Config for Runtime {
@@ -308,9 +314,18 @@ impl pallet_anonymum_shielded::Config for Runtime {
 	type MaxPrunePerBlock = ConstU32<64>;
 	type MaxPruneWindows = ConstU32<64>;
 	type PoolLongevity = ConstU64<10>;
-	type PowDifficulty = ConstU32<16>;
-	type SubmitWeight = ShieldedSubmitWeight;
-	type AuthorizeWeight = ShieldedAuthorizeWeight;
+	/// Calibrated 2026-11-25: a 20-bit solve takes 237 ms on average on one CPU
+	/// thread, about 3.5x the 67 ms median cost of authorization (including the
+	/// pairing) in the release WebAssembly runtime. See the pallet's weights.rs.
+	type PowDifficulty = ConstU32<20>;
+	type WeightInfo = pallet_anonymum_shielded::weights::SubstrateWeight<Runtime>;
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = ShieldedBenchmarkTime;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benches {
+	frame_benchmarking::define_benchmarks!([pallet_anonymum_shielded, AnonymumShielded]);
 }
 
 type Block = frame::runtime::types_common::BlockOf<Runtime, TxExtension>;
@@ -430,6 +445,32 @@ impl_runtime_apis! {
 
 		fn authorities() -> Vec<sp_consensus_aura::sr25519::AuthorityId> {
 			Vec::new()
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	impl frame_benchmarking::Benchmark<Block> for Runtime {
+		fn benchmark_metadata(extra: bool) -> (
+			Vec<frame_benchmarking::BenchmarkList>,
+			Vec<frame_support::traits::StorageInfo>,
+		) {
+			use frame_benchmarking::BenchmarkList;
+			use frame_support::traits::StorageInfoTrait;
+			let mut list = Vec::<BenchmarkList>::new();
+			list_benchmarks!(list, extra);
+			(list, AllPalletsWithSystem::storage_info())
+		}
+
+		fn dispatch_benchmark(
+			config: frame_benchmarking::BenchmarkConfig,
+		) -> Result<Vec<frame_benchmarking::BenchmarkBatch>, alloc::string::String> {
+			use frame_benchmarking::BenchmarkBatch;
+			use frame_support::traits::WhitelistedStorageKeys;
+			let whitelist = AllPalletsWithSystem::whitelisted_storage_keys();
+			let mut batches = Vec::<BenchmarkBatch>::new();
+			let params = (&config, &whitelist);
+			add_benchmarks!(params, batches);
+			Ok(batches)
 		}
 	}
 

@@ -4,6 +4,8 @@
 //!   dev_tool genesis <vk-file> <leaves>  write the dev verifying key and leaves
 //!   dev_tool tx <chain> <version> <now> <window> [pow-bits]  prove a Transfer
 //!                                        and solve its proof of work, print JSON
+//!   dev_tool bench-fixture <chain> <version> <now> <window> <pow-bits> <dir>
+//!                                        one proved Transfer for the pallet benchmarks
 //!   dev_tool pow-bench <bits> <samples>  time the proof of work
 
 use anonymum_shielded_circuit::fixtures::*;
@@ -90,6 +92,43 @@ fn main() {
                 hex(&built.envelope.coin_slots[0]), hex(&built.envelope.coin_slots[1]), hex(&note), hex(&proof), hex(&again),
                 hex(&wrong), bits, pow_nonce, again_nonce, wrong_nonce, pow_micros
             );
+        }
+        Some("bench-fixture") => {
+            // One real Transfer for the pallet's benchmarks, as raw bytes:
+            // root, nullifiers[2], commitments[3], admission (32 each),
+            // not_before, not_after (u64 LE), coin slots (2 x 200), note (1,795),
+            // proof (192), pow nonce (u64 LE), base fee (u64 LE), chain id,
+            // version (u32 LE), pow bits (u32 LE). The key goes to `vk.bin`.
+            let n = |i: usize| args[i].parse::<u64>().unwrap();
+            let (chain, version, now, window, bits) = (n(1) as u32, n(2) as u32, n(3), n(4), n(5) as u32);
+            let out = std::path::Path::new(&args[6]);
+            let not_before = now - now % window;
+            let mut note = vec![0u8; 1795];
+            OsRng.fill_bytes(&mut note);
+            let built = build_for_chain(Case::Transfer, chain, version, not_before, window, &note);
+            let (pk, vk) = dev_keys();
+            let proof = encode_proof(&prove(&pk, built.circuit.clone(), &mut OsRng).unwrap());
+            let p = built.circuit.public;
+            let word = |x: &Fr| -> [u8; 32] { bytes(x).try_into().unwrap() };
+            let spent = [word(&p.nullifiers[0]), word(&p.nullifiers[1])];
+            let nonce = solve_pow(&word(&p.sighash), &word(&p.root), &spent, proof.as_slice().try_into().unwrap(), bits);
+            let mut tx = Vec::new();
+            tx.extend(word(&p.root));
+            p.nullifiers.iter().chain(&p.commitments).chain([&p.admission]).for_each(|x| tx.extend(word(x)));
+            tx.extend(not_before.to_le_bytes());
+            tx.extend((not_before + window).to_le_bytes());
+            tx.extend(&built.envelope.coin_slots[0]);
+            tx.extend(&built.envelope.coin_slots[1]);
+            tx.extend(&note);
+            tx.extend(&proof);
+            tx.extend(nonce.to_le_bytes());
+            tx.extend(BASE_FEE.to_le_bytes());
+            tx.extend(chain.to_le_bytes());
+            tx.extend(version.to_le_bytes());
+            tx.extend(bits.to_le_bytes());
+            std::fs::write(out.join("tx.bin"), &tx).unwrap();
+            std::fs::write(out.join("vk.bin"), bytes(&vk)).unwrap();
+            println!("wrote {} + {} bytes, nonce {nonce}", tx.len(), bytes(&vk).len());
         }
         Some("pow-bench") => {
             let (bits, samples) = (args[1].parse::<u32>().unwrap(), args[2].parse::<usize>().unwrap());

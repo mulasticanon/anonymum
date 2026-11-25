@@ -396,11 +396,13 @@ wallet synchronisation, and from the small population at launch.
   submission as a general transaction with no signer, authorized by
   `#[pallet::authorize]` in the pool and at inclusion, where nobody pays a
   fee for a bad proof. Bad-proof pairing spam is now gated by a configurable
-  BLAKE2s proof of work (`PowDifficulty`, 16 bits in the dev runtime) over
+  BLAKE2s proof of work (`PowDifficulty`, 20 bits in the dev runtime) over
   the sighash, root, nullifiers, proof bytes and nonce, checked after strict
-  proof decoding and before the pairing. It raises the cost of spam and does
-  not remove it: mean CPU solve time is about 11 ms against 5.89 ms for a
-  native verification, GPUs are faster, and the difficulty is untuned. True
+  proof decoding and before the pairing. Benchmarked in the release
+  WebAssembly runtime on one laptop, authorization takes a median 67 ms
+  (p95 87 ms, about 11x native verification) and a 20-bit solve 237 ms on
+  average on one CPU thread. It raises the cost of spam and does not remove
+  it: GPUs solve BLAKE2s far faster. True
   network-level peer rate limiting remains a node/P2P concern and is not
   built. Also: verifying with arkworks 0.4 inside the runtime
   rather than through host functions; whether nullifier tags in the pool

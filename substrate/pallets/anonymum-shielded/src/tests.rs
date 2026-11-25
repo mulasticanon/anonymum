@@ -18,7 +18,6 @@ use frame::deps::frame_support::{assert_noop, assert_ok, traits::Hooks};
 use frame::deps::sp_runtime::transaction_validity::{InvalidTransaction, TransactionSource};
 use frame::deps::frame_support::dispatch::GetDispatchInfo;
 use frame::deps::frame_support::traits::Authorize;
-use frame::deps::frame_support::weights::Weight;
 use frame::deps::sp_runtime::traits::DispatchTransaction;
 use frame::deps::sp_runtime::transaction_validity::{TransactionValidityError, ValidTransaction};
 use frame::deps::sp_runtime::DispatchError;
@@ -980,12 +979,30 @@ fn the_dispatch_repeats_the_state_checks() {
 }
 
 #[test]
-fn authorization_and_dispatch_carry_their_own_weights() {
+fn authorization_and_dispatch_carry_their_benchmarked_weights() {
     let tx = Tx { pow_nonce: Some(0), ..transfer() };
     let call = tx.call();
-    assert_eq!(call.weight_of_authorize(), Weight::from_parts(1_000_000, 0));
+    assert_eq!(call.weight_of_authorize(), <() as crate::WeightInfo>::authorize_submit_shielded());
     let info = call.get_dispatch_info();
-    assert_eq!(info.call_weight, Weight::from_parts(1_000_000, 0));
+    assert_eq!(info.call_weight, <() as crate::WeightInfo>::submit_shielded());
+    // The measured WebAssembly costs with their margin (weights.rs), so a
+    // weight lowered below them fails here.
+    const MS: u64 = 1_000_000_000;
+    assert!(call.weight_of_authorize().ref_time() >= 175 * MS);
+    assert!(info.call_weight.ref_time() >= 115 * MS);
+    assert!(<() as crate::WeightInfo>::prune_stranger_notes(64, 64).ref_time() >= 2_860 * MS / 1_000);
+}
+
+#[test]
+fn on_initialize_reserves_the_pruning_bound_only_when_notes_may_expire() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        use frame::deps::frame_support::traits::Get;
+        use frame::deps::frame_support::weights::RuntimeDbWeight;
+        let reads = <<Test as polkadot_sdk::frame_system::Config>::DbWeight as Get<RuntimeDbWeight>>::get().reads(1);
+        assert_eq!(Shielded::on_initialize(1), reads);
+        PruneCursor::<Test>::put(0);
+        assert_eq!(Shielded::on_initialize(1), <() as crate::WeightInfo>::prune_stranger_notes(2, 8));
+    });
 }
 
 // ---- proof of work ----------------------------------------------------------------

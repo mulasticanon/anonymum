@@ -13,7 +13,8 @@
 //!   A BLAKE2s proof of work (`PowDifficulty`) must be solved before a node
 //!   runs the pairing. It raises the cost of spam and does not remove it:
 //!   per-peer rate limiting is still a node and P2P concern.
-//! - The weights are placeholders, not benchmarks.
+//! - Weights come from benchmarks of the release WebAssembly runtime on one
+//!   developer laptop (`weights.rs`), not from reference hardware.
 //!
 //! The call is a *general* transaction (extrinsic format 5) authorized by
 //! `#[pallet::authorize]` through `frame_system::AuthorizeCall`. That runs
@@ -31,6 +32,17 @@ pub use pallet::*;
 
 pub mod poseidon_constants;
 pub mod primitives;
+pub mod weights;
+pub use weights::WeightInfo;
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+
+/// Lets the benchmarks set the block time.
+#[cfg(feature = "runtime-benchmarks")]
+pub trait BenchmarkHelper {
+    fn set_time_ms(ms: u64);
+}
 
 #[cfg(test)]
 mod mock;
@@ -87,12 +99,10 @@ pub mod pallet {
         /// Leading zero bits the proof-of-work hash needs; 0 disables it.
         #[pallet::constant]
         type PowDifficulty: Get<u32>;
-        /// Placeholder weight of the dispatch: the state updates.
-        #[pallet::constant]
-        type SubmitWeight: Get<Weight>;
-        /// Placeholder weight of authorization: decoding and the pairing.
-        #[pallet::constant]
-        type AuthorizeWeight: Get<Weight>;
+        /// Benchmarked weights (`weights.rs`).
+        type WeightInfo: WeightInfo;
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: crate::BenchmarkHelper;
     }
 
     #[pallet::pallet]
@@ -265,10 +275,7 @@ pub mod pallet {
         fn on_initialize(_n: BlockNumberFor<T>) -> Weight {
             // Reserve what `on_finalize` may use.
             if PruneCursor::<T>::exists() {
-                T::DbWeight::get().reads_writes(
-                    u64::from(T::MaxPruneWindows::get()) + 1,
-                    u64::from(T::MaxPrunePerBlock::get()) + 1,
-                )
+                T::WeightInfo::prune_stranger_notes(T::MaxPrunePerBlock::get(), T::MaxPruneWindows::get())
             } else {
                 T::DbWeight::get().reads(1)
             }
@@ -293,9 +300,9 @@ pub mod pallet {
         /// Submit one shielded transaction. No account appears: the call
         /// authorizes itself with its proof.
         #[pallet::call_index(0)]
-        #[pallet::weight((T::SubmitWeight::get(), DispatchClass::Normal, Pays::No))]
+        #[pallet::weight((T::WeightInfo::submit_shielded(), DispatchClass::Normal, Pays::No))]
         #[pallet::authorize(Self::authorize_submit)]
-        #[pallet::weight_of_authorize(T::AuthorizeWeight::get())]
+        #[pallet::weight_of_authorize(T::WeightInfo::authorize_submit_shielded())]
         #[allow(clippy::too_many_arguments)]
         pub fn submit_shielded(
             origin: OriginFor<T>,

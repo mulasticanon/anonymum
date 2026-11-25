@@ -310,17 +310,38 @@ appends three leaves to a depth-20 Poseidon tree, keeps the stranger note for
 The proof of work is
 `BLAKE2s("anonymum/shielded-pow/v1" || sighash || root || nullifiers[0] ||
 nullifiers[1] || proof || pow_nonce_le)`, which must start with
-`PowDifficulty` zero bits (16 in the dev runtime, 0 turns it off, at most 64).
+`PowDifficulty` zero bits (20 in the dev runtime, 0 turns it off, at most 64).
 Binding the proof bytes means one solution cannot be reused across different
 bad proofs, and binding the root limits precomputation. Clients solve it with
 `anonymum_shielded_circuit::pow::solve_pow`.
 
-Measured 2026-11-22 (runtime `spec_version` 10): the runtime is 478,254 bytes
-compressed, up from 384,816 before the shielded pallet (+93,438, +24.3%).
-Solving 16 bits on one CPU thread took a mean of 11.07 ms, median 7.51 ms,
-95th percentile 36.80 ms and maximum 65.16 ms over 500 solves. The time varies
-widely because the number of tries is random. `shielded-smoke.mjs`,
-`smoke.mjs` and `e2e.mjs` passed on a dev node: the WebAssembly runtime
+Benchmarked 2026-11-25 with FRAME benchmarking (`benchmarking.rs`) run by
+`polkadot-omni-node benchmark pallet` in the release WebAssembly runtime,
+50 repeats, on one laptop (Intel Core i5-1035G1 in WSL2, not reference
+hardware):
+
+| Path | mean | median | p95 | max | weight |
+|---|---|---|---|---|---|
+| Authorization, including the Groth16 pairing | 70.09 ms | 67.00 ms | 87.40 ms | 142.71 ms | 175 ms |
+| Dispatch: 3 leaves at depth 20, nullifiers, note, root ring full | 57.57 ms | 54.59 ms | 78.84 ms | 95.03 ms | 115 ms |
+| Pruning, 64 notes over 64 windows (the per-block bound) | 1.23 ms | 1.22 ms | 1.36 ms | 1.49 ms | 2.86 ms |
+
+Weights are 1.2 x the slowest repeat, rounded up to 5 ms, plus database
+reads and writes charged through `DbWeight`. Authorization in WebAssembly is
+about 11 times the 5.89 ms native verification. The benchmarks use one real
+proved Transfer as a fixture (`dev_tool bench-fixture`); verification time
+does not depend on the branch. They run as tests against the mock too
+(`--features runtime-benchmarks`).
+
+`PowDifficulty` is set from these numbers: at 20 bits one CPU thread solves
+in 237 ms on average (median 168 ms, p95 721 ms, max 1.92 s over 500 solves),
+about 3.5 times the median authorization and 2.7 times its p95. At 19 bits
+the mean was 120 ms, under twice the median. The solve time varies widely
+because the number of tries is random.
+
+Measured 2026-11-25 (runtime `spec_version` 11): the runtime is 477,871 bytes
+compressed. `shielded-smoke.mjs`, `smoke.mjs` and `e2e.mjs` passed on a dev
+node: the WebAssembly runtime
 verified a real proof; a tampered note, a nonce reused on other proof bytes,
 a wrong proof with valid work, malformed proof bytes, a short note and a
 re-randomised replay were refused.
@@ -333,18 +354,17 @@ encodes it itself.
 
 Not solved, and each blocks any public network:
 
-- **Spam is priced, not stopped.** Bad-proof pairing spam now needs a
-  configurable proof of work per attempt, but still pays no fee. The 16-bit
-  default has not been tuned: its mean CPU cost (about 11 ms) is the same
-  order as one native verification (5.89 ms), the cost of a pairing inside
-  WebAssembly has not been compared with it, and GPUs solve BLAKE2s far
-  faster. Rate limiting peers remains a node and P2P concern and is not built.
+- **Spam is priced, not stopped.** Bad-proof pairing spam needs a proof
+  of work per attempt, but still pays no fee. At 20 bits a CPU thread spends
+  about 3.5 times what the node spends, but GPUs and dedicated hardware solve
+  BLAKE2s far faster, so the ratio is far lower for a well-equipped attacker.
+  Rate limiting peers remains a node and P2P concern and is not built.
 - **Shielded value is not connected to balances.** Genesis notes are not
   backed by `pallet-balances`, and `BurnedFees` and `NodeRewardPool` are
   counters that pay nothing out.
-- **The weights are placeholders** (240 ms to authorize plus 60 ms to
-  dispatch), not benchmarks, which allow about five shielded transactions
-  per block.
+- **The weights come from one laptop**, not from validator hardware
+  (175 ms to authorize plus 115 ms to dispatch, about five shielded
+  transactions per block). They must be rerun on reference hardware.
 - **Unchecked by a specialist:** the pallet, the circuit and the spec.
 
 ## What is real and what is not
