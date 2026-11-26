@@ -7,8 +7,16 @@
 //!
 //! - The verifying key in genesis is a **dev key from a public seed**.
 //!   Anyone can forge proofs under it and mint shielded value.
-//! - Shielded value is not connected to `pallet-balances`. `BurnedFees` and
-//!   `NodeRewardPool` are counters; nothing pays out.
+//! - Shielded value is backed one to one by real balance in the pool account
+//!   (`ShieldedPoolId`): `shield` moves balance in and inserts a note whose
+//!   commitment the chain computes itself; every `submit_shielded` burns the
+//!   base fee's burn share from that account (lowering total issuance) and
+//!   moves the rest to the reward account (`RewardPoolId`). Nothing pays the
+//!   reward account out yet, and there is no unshielding: value cannot leave
+//!   the pool except as fees.
+//! - Value retired inside the pool (the stranger surcharge, decline
+//!   penalties) is unspendable but stays in the pool account, so total
+//!   issuance still counts it: burning it publicly would reveal the amount.
 //! - `submit_shielded` has no signer, so nobody pays a fee for a *bad* proof.
 //!   A BLAKE2s proof of work (`PowDifficulty`) must be solved before a node
 //!   runs the pairing. It raises the cost of spam and does not remove it:
@@ -63,14 +71,29 @@ pub mod pallet {
         InvalidTransaction, TransactionSource, TransactionValidityError, ValidTransaction,
     };
     use polkadot_sdk::frame_system::ensure_authorized;
+    use frame::deps::frame_support::PalletId;
+    use frame::deps::sp_runtime::traits::AccountIdConversion;
     use frame::deps::sp_runtime::Percent;
     use frame::prelude::*;
+    use frame::traits::fungible::{Inspect, Mutate};
+    use frame::traits::tokens::{Fortitude, Precision, Preservation};
+
+    pub type BalanceOf<T> =
+        <<T as Config>::Currency as Inspect<<T as frame_system::Config>::AccountId>>::Balance;
 
     /// The pallet's whole transaction, as submitted.
     pub type StrangerNote = BoundedVec<u8, ConstU32<STRANGER_NOTE_LEN>>;
 
     #[pallet::config]
     pub trait Config: polkadot_sdk::frame_system::Config<RuntimeEvent: From<Event<Self>>> {
+        /// The real balances behind shielded value.
+        type Currency: Mutate<Self::AccountId, Balance: From<u64>>;
+        /// The account holding the balance behind every shielded note.
+        #[pallet::constant]
+        type ShieldedPoolId: Get<PalletId>;
+        /// The account collecting the node-reward share of base fees.
+        #[pallet::constant]
+        type RewardPoolId: Get<PalletId>;
         /// Block time in milliseconds.
         type TimeProvider: Time<Moment = u64>;
         /// Bound into every sighash, so a proof cannot move between chains.
@@ -148,7 +171,7 @@ pub mod pallet {
     pub type NextIndex<T> = StorageValue<_, u64, ValueQuery>;
 
     /// Stranger notes by `(window_start, sighash)`, kept 24 hours from the
-    /// window start. Their hash stays in the `Shielded` event.
+    /// window start. Their hash stays in the `Transacted` event.
     #[pallet::storage]
     pub type StrangerNotes<T> =
         StorageDoubleMap<_, Twox64Concat, u64, Blake2_128Concat, Bytes32, StrangerNote, OptionQuery>;
@@ -157,10 +180,12 @@ pub mod pallet {
     #[pallet::storage]
     pub type PruneCursor<T> = StorageValue<_, u64, OptionQuery>;
 
+    /// Telemetry: everything burned. Total issuance falls by the same amount.
     #[pallet::storage]
     pub type BurnedFees<T> = StorageValue<_, u128, ValueQuery>;
 
-    /// A counter: nothing pays this out yet.
+    /// Telemetry: everything credited to the reward account. The balance
+    /// itself is in `RewardPoolId`; nothing pays it out yet.
     #[pallet::storage]
     pub type NodeRewardPool<T> = StorageValue<_, u128, ValueQuery>;
 
@@ -172,6 +197,10 @@ pub mod pallet {
         pub base_fee: u64,
         /// Leaves the tree starts with.
         pub initial_leaves: Vec<Bytes32>,
+        /// The total value of the notes behind `initial_leaves`. Minted into
+        /// the pool account, so the reserve matches the pool from block 0.
+        /// The chain cannot check it: the leaves hide their values.
+        pub initial_supply: u64,
         #[serde(skip)]
         pub _marker: core::marker::PhantomData<T>,
     }
@@ -199,15 +228,36 @@ pub mod pallet {
             Frontier::<T>::put(frontier.map(|x| encode_fr(&x)));
             NextIndex::<T>::put(self.initial_leaves.len() as u64);
             Pallet::<T>::accept_root(encode_fr(&root));
+
+            // Each account also holds the existential deposit, which no
+            // transfer out of it may touch (`Preservation::Preserve`).
+            let floor = T::Currency::minimum_balance();
+            let reserve = BalanceOf::<T>::from(self.initial_supply).saturating_add(floor);
+            if !reserve.is_zero() {
+                T::Currency::mint_into(&Pallet::<T>::pool_account(), reserve).expect("genesis pool reserve");
+            }
+            if !floor.is_zero() {
+                T::Currency::mint_into(&Pallet::<T>::reward_account(), floor).expect("genesis reward account");
+            }
         }
     }
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
+        /// Public balance entered the pool as a new note. Spending it needs
+        /// `leaf_index` and `window_start` (the leaf's creation time).
+        Shielded {
+            who: T::AccountId,
+            amount: u64,
+            commitment: Bytes32,
+            leaf_index: u64,
+            window_start: u64,
+            new_root: Bytes32,
+        },
         /// A shielded transaction was accepted. The stranger note's hash and
         /// the sighash stay here after the note itself is pruned.
-        Shielded {
+        Transacted {
             sighash: Bytes32,
             stranger_note_hash: Bytes32,
             window_start: u64,
@@ -246,6 +296,11 @@ pub mod pallet {
         InvalidProof,
         /// The proof-of-work hash has too few leading zero bits.
         InsufficientPow,
+        /// The pool account cannot pay the base fee: shielded value would
+        /// exceed the balance behind it.
+        PoolUnderfunded,
+        /// A shield of zero value.
+        ZeroAmount,
     }
 
     impl<T> Error<T> {
@@ -265,6 +320,7 @@ pub mod pallet {
                 Error::MalformedProof => 11,
                 Error::InvalidProof => 12,
                 Error::InsufficientPow => 13,
+                Error::PoolUnderfunded => 14,
                 _ => 0,
             }
         }
@@ -292,6 +348,7 @@ pub mod pallet {
             assert!(T::RootHistory::get() > 0, "at least one root must be accepted");
             assert!(T::MaxPruneWindows::get() > 0 && T::MaxPrunePerBlock::get() > 0, "pruning must progress");
             assert!(T::PowDifficulty::get() <= MAX_POW_DIFFICULTY, "the nonce is a u64");
+            assert!(Self::pool_account() != Self::reward_account(), "the pool and reward accounts must differ");
         }
     }
 
@@ -336,7 +393,53 @@ pub mod pallet {
             // of it before the first write.
             let checked = Self::check_cheap(&tx, TimeRule::InBlock(Self::now_secs()))?;
             let digests = Self::digests(&tx, &checked);
+            Self::pay_fee(&checked)?;
             Self::apply(&tx, checked, digests, stranger_note.clone());
+            Ok(())
+        }
+
+        /// Move `amount` of the caller's balance into the pool as a new
+        /// ordinary note owned by `authority` (`H("authority", secret)`).
+        ///
+        /// The chain computes the commitment itself, so the note's value is
+        /// exactly what was paid in. Everything about this note is public:
+        /// the amount, owner and blinding, and so its commitment. Spending it
+        /// later reveals nothing more, since the nullifier needs the secret
+        /// and the proof hides which leaf is spent. Use a fresh `authority`
+        /// for each shield.
+        #[pallet::call_index(1)]
+        #[pallet::weight(T::WeightInfo::shield())]
+        pub fn shield(origin: OriginFor<T>, authority: Bytes32, amount: u64, blinding: Bytes32) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(amount > 0, Error::<T>::ZeroAmount);
+            let owner = decode_fr(&authority).ok_or(Error::<T>::NonCanonicalField)?;
+            let blinding = decode_fr(&blinding).ok_or(Error::<T>::NonCanonicalField)?;
+            let index = NextIndex::<T>::get();
+            ensure!(index < 1u64 << TREE_DEPTH, Error::<T>::TreeFull);
+
+            let window = T::WindowSecs::get();
+            let now = Self::now_secs();
+            let window_start = now - now % window;
+            let poseidon = Poseidon::new();
+            let commitment = poseidon.ordinary_commitment(amount, owner, blinding);
+            let leaf = poseidon.leaf(commitment, window_start);
+            let zero = EmptySubtrees::<T>::get().map(|b| decode_fr(&b).expect("stored canonically; qed"));
+            let mut frontier = Frontier::<T>::get().map(|b| decode_fr(&b).expect("stored canonically; qed"));
+            let new_root = encode_fr(&poseidon.append(&mut frontier, &zero, index, leaf));
+
+            // The only fallible step, before any write.
+            T::Currency::transfer(&who, &Self::pool_account(), amount.into(), Preservation::Preserve)?;
+            Frontier::<T>::put(frontier.map(|x| encode_fr(&x)));
+            NextIndex::<T>::put(index + 1);
+            Self::accept_root(new_root);
+            Self::deposit_event(Event::Shielded {
+                who,
+                amount,
+                commitment: encode_fr(&commitment),
+                leaf_index: index,
+                window_start,
+                new_root,
+            });
             Ok(())
         }
     }
@@ -370,6 +473,9 @@ pub mod pallet {
         fields: [Fr; N_PUBLIC - 1],
         burned: u128,
         reward: u128,
+        /// This transaction's base fee, split.
+        burn_share: u64,
+        reward_share: u64,
         first_position: u64,
     }
 
@@ -383,6 +489,38 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         fn now_secs() -> u64 {
             T::TimeProvider::now() / 1_000
+        }
+
+        /// Holds the balance behind every shielded note, plus the existential
+        /// deposit.
+        pub fn pool_account() -> T::AccountId {
+            T::ShieldedPoolId::get().into_account_truncating()
+        }
+
+        pub fn reward_account() -> T::AccountId {
+            T::RewardPoolId::get().into_account_truncating()
+        }
+
+        /// What the pool account can pay without touching its existential
+        /// deposit.
+        pub fn pool_reserve() -> BalanceOf<T> {
+            T::Currency::reducible_balance(&Self::pool_account(), Preservation::Preserve, Fortitude::Polite)
+        }
+
+        /// Burn the burn share from the pool account and move the reward
+        /// share to the reward account. The dispatch is transactional, so a
+        /// failure here leaves nothing behind.
+        fn pay_fee(checked: &Checked) -> DispatchResult {
+            let pool = Self::pool_account();
+            T::Currency::burn_from(
+                &pool,
+                checked.burn_share.into(),
+                Preservation::Preserve,
+                Precision::Exact,
+                Fortitude::Polite,
+            )?;
+            T::Currency::transfer(&pool, &Self::reward_account(), checked.reward_share.into(), Preservation::Preserve)?;
+            Ok(())
         }
 
         /// Authorization, in strict order: (1) note length, (2) clock grid
@@ -480,11 +618,14 @@ pub mod pallet {
             ensure!(first_position.saturating_add(3) <= 1u64 << TREE_DEPTH, Error::<T>::TreeFull);
 
             let fee = BaseFee::<T>::get();
-            let burned = T::FeeBurnPercent::get().mul_floor(fee);
-            let to_pool = fee.checked_sub(burned).ok_or(Error::<T>::FeeOverflow)?;
-            let burned = BurnedFees::<T>::get().checked_add(u128::from(burned)).ok_or(Error::<T>::FeeOverflow)?;
+            // The turnstile: the pool account always backs every shielded
+            // note, so it must be able to pay the fee those notes give up.
+            ensure!(Self::pool_reserve() >= BalanceOf::<T>::from(fee), Error::<T>::PoolUnderfunded);
+            let burn_share = T::FeeBurnPercent::get().mul_floor(fee);
+            let reward_share = fee.checked_sub(burn_share).ok_or(Error::<T>::FeeOverflow)?;
+            let burned = BurnedFees::<T>::get().checked_add(u128::from(burn_share)).ok_or(Error::<T>::FeeOverflow)?;
             let reward =
-                NodeRewardPool::<T>::get().checked_add(u128::from(to_pool)).ok_or(Error::<T>::FeeOverflow)?;
+                NodeRewardPool::<T>::get().checked_add(u128::from(reward_share)).ok_or(Error::<T>::FeeOverflow)?;
 
             let field = |bytes: &Bytes32| decode_fr(bytes).ok_or(Error::<T>::NonCanonicalField);
             let fields: [Fr; N_PUBLIC - 1] = [
@@ -499,7 +640,7 @@ pub mod pallet {
                 Fr::from(tx.not_before),
                 Fr::from(tx.not_after),
             ];
-            Ok(Checked { fields, burned, reward, first_position })
+            Ok(Checked { fields, burned, reward, burn_share, reward_share, first_position })
         }
 
         /// The stranger-note hash and the sighash, computed outside the circuit.
@@ -543,7 +684,7 @@ pub mod pallet {
             BurnedFees::<T>::put(checked.burned);
             NodeRewardPool::<T>::put(checked.reward);
 
-            Self::deposit_event(Event::Shielded {
+            Self::deposit_event(Event::Transacted {
                 sighash: digests.sighash,
                 stranger_note_hash: digests.note_hash,
                 window_start,

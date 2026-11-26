@@ -15,6 +15,8 @@ use frame::deps::frame_support::traits::Authorize;
 use frame::deps::sp_runtime::transaction_validity::TransactionSource;
 use frame_benchmarking::v2::*;
 use polkadot_sdk::frame_system::RawOrigin;
+use ark_bls12_381::Fr;
+use frame::traits::fungible::{Inspect, Mutate};
 
 const TX: &[u8] = include_bytes!("benchmark_fixture/tx.bin");
 const VK: &[u8] = include_bytes!("benchmark_fixture/vk.bin");
@@ -165,6 +167,23 @@ mod benchmarks {
         }
         assert_eq!(StrangerNotes::<T>::iter_key_prefix(last).count(), 0);
         assert_eq!(PruneCursor::<T>::get(), Some(last + step));
+    }
+
+    /// A deposit: the balance transfer, the commitment and leaf hashes,
+    /// one leaf at depth 20, a root replacing the oldest.
+    #[benchmark]
+    fn shield() {
+        let fx = fixture();
+        setup::<T>(&fx);
+        let caller: T::AccountId = whitelisted_caller();
+        let amount: u64 = 1_000_000;
+        let funds = BalanceOf::<T>::from(amount).saturating_mul(4u32.into());
+        T::Currency::set_balance(&caller, funds.saturating_add(T::Currency::minimum_balance()));
+        let owner = encode_fr(&Fr::from(11u64));
+        let blinding = encode_fr(&Fr::from(13u64));
+        #[extrinsic_call]
+        shield(RawOrigin::Signed(caller), owner, amount, blinding);
+        assert_eq!(NextIndex::<T>::get(), 5);
     }
 
     impl_benchmark_test_suite!(Pallet, crate::mock::bench_ext(), crate::mock::Test);

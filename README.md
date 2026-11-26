@@ -305,7 +305,35 @@ proof of work, and only then the Groth16 pairing. Pool tags are the two nullifie
 bytes, so a re-randomised copy conflicts with the original. Dispatch repeats
 the cheap checks without a second pairing, then records the nullifiers,
 appends three leaves to a depth-20 Poseidon tree, keeps the stranger note for
-24 hours, and splits the base fee between two counters.
+24 hours, and pays the base fee in real balance (below).
+
+**Real balances (runtime `spec_version` 12).** Shielded value is backed one
+to one by `pallet-balances`, Zcash-turnstile style:
+
+- The pool account (`PalletId` `anm/shld`) holds the balance behind every
+  shielded note, plus its existential deposit. Genesis mints the value of
+  the genesis notes into it (`initial_supply`, 1,013,001 units on the dev
+  chain); the chain cannot check that figure, since leaves hide values.
+- `shield(authority, amount, blinding)` is a signed call that moves `amount`
+  from the caller into the pool account and inserts an ordinary note. The
+  chain computes the commitment itself, with the circuit's Poseidon
+  commitment, stamps the leaf with the current grid window, and accepts the
+  new root, so a caller cannot pay 1 unit for a note worth 1,000,000. It
+  refuses a zero amount and non-canonical field encodings before moving
+  anything. The circuit is unchanged. The deposit is public: the amount,
+  owner, blinding and commitment are all on chain. Spending the note later
+  reveals no more than any other spend.
+- Every `submit_shielded` burns the base fee's burn share from the pool
+  account, which lowers total issuance, and moves the rest to the reward
+  account (`anm/rewd`). `BurnedFees` and `NodeRewardPool` remain as
+  telemetry counters. If the pool account cannot pay the base fee without
+  touching its existential deposit, the transaction is refused (pool code
+  14, `PoolUnderfunded`) and nothing changes.
+- There is no unshielding: value leaves the pool only as fees. That needs
+  circuit work and is left out on purpose. Value retired inside the pool
+  (the stranger surcharge, decline penalties) is unspendable but stays in
+  the pool account and in total issuance: burning it publicly would reveal
+  the amount. Nothing pays the reward account out yet.
 
 The proof of work is
 `BLAKE2s("anonymum/shielded-pow/v1" || sighash || root || nullifiers[0] ||
@@ -325,6 +353,14 @@ hardware):
 | Authorization, including the Groth16 pairing | 70.09 ms | 67.00 ms | 87.40 ms | 142.71 ms | 175 ms |
 | Dispatch: 3 leaves at depth 20, nullifiers, note, root ring full | 57.57 ms | 54.59 ms | 78.84 ms | 95.03 ms | 115 ms |
 | Pruning, 64 notes over 64 windows (the per-block bound) | 1.23 ms | 1.22 ms | 1.36 ms | 1.49 ms | 2.86 ms |
+| `shield`, loaded machine (see below) | 78.75 ms | 80.50 ms | 93.46 ms | 132.36 ms | 160 ms |
+
+The `shield` row comes from a second run (spec 12) while a VirtualBox VM
+used about half of the CPU, so every benchmark in it was 2.8 to 10 times
+slower than the first run. Only `shield` was taken from it, which makes its
+weight generous. The other rows keep the first run's times, with that run's
+read and write counts updated for the balance moves. All of them need a
+rerun on a quiet machine.
 
 Weights are 1.2 x the slowest repeat, rounded up to 5 ms, plus database
 reads and writes charged through `DbWeight`. Authorization in WebAssembly is
@@ -339,10 +375,14 @@ about 3.5 times the median authorization and 2.7 times its p95. At 19 bits
 the mean was 120 ms, under twice the median. The solve time varies widely
 because the number of tries is random.
 
-Measured 2026-11-25 (runtime `spec_version` 11): the runtime is 477,871 bytes
+Measured 2026-11-25 (runtime `spec_version` 12): the runtime is 481,970 bytes
 compressed. `shielded-smoke.mjs`, `smoke.mjs` and `e2e.mjs` passed on a dev
-node: the WebAssembly runtime
-verified a real proof; a tampered note, a nonce reused on other proof bytes,
+node. The pool account held the genesis supply plus its existential deposit.
+Alice shielded 5,000,000 units, paid exactly that plus her transaction fee,
+and the chain's commitment matched the circuit's. A real proof spending that
+note lowered total issuance by the 500-unit burn share, raised the reward
+account by 500 and the pool account fell by 1,000. The WebAssembly runtime
+also verified the fixture proof; a tampered note, a nonce reused on other proof bytes,
 a wrong proof with valid work, malformed proof bytes, a short note and a
 re-randomised replay were refused.
 Polkadot.js cannot build a general transaction, so `shielded-smoke.mjs`
@@ -359,9 +399,15 @@ Not solved, and each blocks any public network:
   about 3.5 times what the node spends, but GPUs and dedicated hardware solve
   BLAKE2s far faster, so the ratio is far lower for a well-equipped attacker.
   Rate limiting peers remains a node and P2P concern and is not built.
-- **Shielded value is not connected to balances.** Genesis notes are not
-  backed by `pallet-balances`, and `BurnedFees` and `NodeRewardPool` are
-  counters that pay nothing out.
+- **No unshielding and no reward payout.** Shielded value is backed by real
+  balance, but it can leave the pool only as fees, and nothing pays the
+  reward account out. With the public dev key, anyone can forge proofs and
+  create shielded value; the turnstile bounds what such value can take out
+  of the pool account, which today means fees only. Unshielding must check
+  the same reserve.
+- **Tree capacity.** The tree holds 2^20 leaves in total. `shield` costs a
+  transaction fee and one leaf, so filling the tree is priced only by
+  transaction fees.
 - **The weights come from one laptop**, not from validator hardware
   (175 ms to authorize plus 115 ms to dispatch, about five shielded
   transactions per block). They must be rerun on reference hardware.

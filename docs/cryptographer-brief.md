@@ -407,8 +407,16 @@ wallet synchronisation, and from the small population at launch.
   built. Also: verifying with arkworks 0.4 inside the runtime
   rather than through host functions; whether nullifier tags in the pool
   and the strict scalar and point decoding are sufficient; and storing the
-  verifying key uncompressed after validating it once at genesis. Shielded
-  value is not yet connected to the transparent balances.
+  verifying key uncompressed after validating it once at genesis. Since
+  spec 12 shielded value is backed one to one by real balance in a pool
+  account (a turnstile): the signed `shield` call moves balance in and the
+  chain computes the ordinary note's commitment itself (circuit unchanged,
+  the deposit's amount, owner and blinding public); each transaction burns
+  the fee's burn share from the pool account and pays the rest to a reward
+  account, refused if the pool cannot pay. Please check that a public
+  deposit with a published blinding gives nothing away when the note is
+  later spent, and how unshielding should enforce the reserve. There is no
+  unshielding yet.
 
 - The current chain publishes who contacts whom, who pays whom, and who
   blocks whom.

@@ -160,6 +160,13 @@ fn leaves_for_reserve(reserve: u64) -> Vec<Fr> {
     leaves
 }
 
+/// The total value of the notes in `case`'s world: the funding note, the
+/// escrow (price and reserve) and the top-up note. The filler leaf holds no
+/// note. A chain starting from these leaves backs them with this much.
+pub fn world_value(case: Case) -> u64 {
+    FUNDING + PRICE + case.reserve() + TOP_UP_VALUE
+}
+
 /// The leaves a chain must start from for `case` to be spendable.
 pub fn world_leaves(case: Case) -> Vec<Fr> {
     leaves_for_reserve(case.reserve())

@@ -9,7 +9,8 @@ use ark_groth16::{ProvingKey, VerifyingKey};
 use ark_serialize::CanonicalSerialize;
 use frame::deps::sp_runtime::{BuildStorage, Percent};
 use frame::testing_prelude::*;
-use polkadot_sdk::pallet_timestamp;
+use frame::deps::frame_support::PalletId;
+use polkadot_sdk::{pallet_balances, pallet_timestamp};
 use polkadot_sdk::polkadot_sdk_frame as frame;
 use std::sync::OnceLock;
 
@@ -20,6 +21,9 @@ pub const TX_VERSION: u32 = 1;
 pub const WINDOW: u64 = fixtures::WINDOW;
 pub const BASE_FEE: u64 = fixtures::BASE_FEE;
 pub const ROOT_HISTORY: u32 = 4;
+/// A funded account for `shield`.
+pub const ALICE: u64 = 1;
+pub const ALICE_FUNDS: u128 = 10_000_000;
 
 #[frame_construct_runtime]
 mod runtime {
@@ -43,19 +47,42 @@ mod runtime {
     #[runtime::pallet_index(1)]
     pub type Timestamp = pallet_timestamp::Pallet<Test>;
     #[runtime::pallet_index(2)]
+    pub type Balances = pallet_balances::Pallet<Test>;
+    #[runtime::pallet_index(3)]
     pub type Shielded = pallet_anonymum_shielded::Pallet<Test>;
 }
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
     type Block = Block;
+    type AccountData = pallet_balances::AccountData<u128>;
+}
+
+pub const ED: u128 = 5;
+
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+impl pallet_balances::Config for Test {
+    type Balance = u128;
+    type AccountStore = System;
+    type ExistentialDeposit = ConstU128<ED>;
+}
+
+parameter_types! {
+    // Accounts here are `u64`: an id keeps only "modl" and its first four
+    // bytes, so the two ids must differ there (the runtime's need not).
+    pub const PoolId: PalletId = PalletId(*b"shld/anm");
+}
+
+parameter_types! {
+    /// Settable so a test can make it collide with the pool id.
+    pub static RewardId: PalletId = PalletId(*b"rewd/anm");
 }
 
 #[derive_impl(pallet_timestamp::config_preludes::TestDefaultConfig)]
 impl pallet_timestamp::Config for Test {}
 
 parameter_types! {
-    pub const BurnShare: Percent = Percent::from_percent(30);
+    pub static BurnShare: Percent = Percent::from_percent(30);
 }
 
 /// Low, so tests stay fast. Each test chain starts from this value.
@@ -67,6 +94,9 @@ parameter_types! {
 }
 
 impl pallet_anonymum_shielded::Config for Test {
+    type Currency = Balances;
+    type ShieldedPoolId = PoolId;
+    type RewardPoolId = RewardId;
     type TimeProvider = Timestamp;
     type ChainId = MockChainId;
     type TxVersion = ConstU32<TX_VERSION>;
@@ -124,12 +154,21 @@ pub fn new_test_ext(case: Case) -> TestState {
 pub fn new_test_ext_with(case: Case, base_fee: u64, with_key: bool) -> TestState {
     PowBits::set(TEST_POW_BITS);
     MockChainId::set(CHAIN_ID);
+    BurnShare::set(Percent::from_percent(30));
+    RewardId::set(PalletId(*b"rewd/anm"));
     let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+    pallet_balances::GenesisConfig::<Test> {
+        balances: vec![(ALICE, ALICE_FUNDS)],
+        ..Default::default()
+    }
+    .assimilate_storage(&mut storage)
+    .unwrap();
     let leaves: Vec<[u8; 32]> = fixtures::world_leaves(case).iter().map(encode_fr).collect();
     pallet_anonymum_shielded::GenesisConfig::<Test> {
         dev_verifying_key: if with_key { keys().vk_bytes.clone() } else { Vec::new() },
         base_fee,
         initial_leaves: leaves,
+        initial_supply: fixtures::world_value(case),
         _marker: Default::default(),
     }
     .assimilate_storage(&mut storage)

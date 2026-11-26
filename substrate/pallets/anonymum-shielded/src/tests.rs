@@ -144,6 +144,7 @@ fn pallet_error(refused: TransactionValidityError) -> E {
             11 => E::MalformedProof,
             12 => E::InvalidProof,
             13 => E::InsufficientPow,
+            14 => E::PoolUnderfunded,
             other => panic!("unknown refusal code {other}"),
         },
         other => panic!("unexpected refusal {other:?}"),
@@ -1178,7 +1179,7 @@ fn a_note_is_pruned_at_24_hours_and_everything_else_stays() {
         let (sighash, note_hash) = System::events()
             .iter()
             .find_map(|r| match &r.event {
-                RuntimeEvent::Shielded(Event::Shielded { sighash, stranger_note_hash, .. }) => {
+                RuntimeEvent::Shielded(Event::Transacted { sighash, stranger_note_hash, .. }) => {
                     Some((*sighash, *stranger_note_hash))
                 }
                 _ => None,
@@ -1209,7 +1210,7 @@ fn a_note_is_pruned_at_24_hours_and_everything_else_stays() {
         assert!(
             System::events().iter().any(|r| matches!(
                 &r.event,
-                RuntimeEvent::Shielded(Event::Shielded { stranger_note_hash: h, sighash: s, .. })
+                RuntimeEvent::Shielded(Event::Transacted { stranger_note_hash: h, sighash: s, .. })
                     if *h == note_hash && *s == sighash
             )),
             "the note's hash and the sighash stay in the event log"
@@ -1287,4 +1288,280 @@ fn a_bad_verifying_key_is_refused() {
     let mut short = keys().vk.clone();
     short.gamma_abc_g1.pop();
     assert!(prepare_stored_key(&compressed(&short)).is_none(), "wrong input count");
+}
+
+// ---- real balances: the pool reserve, fees and shield ------------------------------
+
+use frame::traits::fungible::{Inspect, Mutate};
+
+fn balance(who: &u64) -> u128 {
+    Balances::balance(who)
+}
+
+fn pool() -> u64 {
+    Pallet::<Test>::pool_account()
+}
+
+fn reward() -> u64 {
+    Pallet::<Test>::reward_account()
+}
+
+#[test]
+fn the_pool_and_reward_accounts_are_distinct_and_pass_the_integrity_test() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ne!(pool(), reward());
+        <Shielded as Hooks<u64>>::integrity_test();
+    });
+}
+
+#[test]
+#[should_panic(expected = "the pool and reward accounts must differ")]
+fn the_integrity_test_refuses_one_account_for_pool_and_rewards() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        crate::mock::RewardId::set(<Test as Config>::ShieldedPoolId::get());
+        assert_eq!(pool(), reward());
+        <Shielded as Hooks<u64>>::integrity_test();
+    });
+}
+
+#[test]
+fn the_ordinary_commitment_matches_the_circuit() {
+    let p = Poseidon::new();
+    let (owner, blinding) = (circuit::authority(fixtures::f("o")), fixtures::f("b"));
+    for value in [1u64, 1_000, u64::MAX] {
+        assert_eq!(p.ordinary_commitment(value, owner, blinding), circuit::Note::ordinary(value, owner, blinding).commitment());
+    }
+}
+
+#[test]
+fn genesis_backs_the_initial_notes_with_real_balance() {
+    // FUNDING + PRICE + reserve + TOP_UP_VALUE for the Transfer world.
+    assert_eq!(fixtures::world_value(Case::Transfer), 1_000_000 + 10_101 + 2_000 + 900);
+    for case in [Case::Transfer, Case::ClaimExactFee, Case::ClaimTopUp] {
+        new_test_ext(case).execute_with(|| {
+            let supply = u128::from(fixtures::world_value(case));
+            assert_eq!(balance(&pool()), supply + ED);
+            assert_eq!(Pallet::<Test>::pool_reserve(), supply, "the existential deposit is not spendable");
+            assert_eq!(balance(&reward()), ED);
+            assert_eq!(Balances::total_issuance(), ALICE_FUNDS + supply + 2 * ED);
+        });
+    }
+}
+
+#[test]
+fn a_transaction_burns_and_pays_out_real_balance() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let (issuance, pool_before, reward_before) = (Balances::total_issuance(), balance(&pool()), balance(&reward()));
+        assert_ok!(tx.submit());
+        // 30% of 1,000 burned, 70% to the reward account.
+        assert_eq!(Balances::total_issuance(), issuance - 300);
+        assert_eq!(balance(&reward()), reward_before + 700);
+        assert_eq!(balance(&pool()), pool_before - u128::from(BASE_FEE));
+        assert_eq!((BurnedFees::<Test>::get(), NodeRewardPool::<Test>::get()), (300, 700));
+    });
+}
+
+#[test]
+fn every_burn_share_moves_exactly_the_base_fee() {
+    let tx = transfer();
+    for percent in [0u8, 1, 50, 100] {
+        new_test_ext(Case::Transfer).execute_with(|| {
+            BurnShare::set(frame::deps::sp_runtime::Percent::from_percent(percent));
+            let (issuance, pool_before, reward_before) =
+                (Balances::total_issuance(), balance(&pool()), balance(&reward()));
+            assert_ok!(tx.submit());
+            let burned = u128::from(BASE_FEE) * u128::from(percent) / 100;
+            assert_eq!(Balances::total_issuance(), issuance - burned, "{percent}%");
+            assert_eq!(balance(&reward()) - reward_before, u128::from(BASE_FEE) - burned, "{percent}%");
+            assert_eq!(pool_before - balance(&pool()), u128::from(BASE_FEE), "{percent}%");
+        });
+    }
+    BurnShare::set(frame::deps::sp_runtime::Percent::from_percent(30));
+}
+
+#[test]
+fn an_underfunded_pool_refuses_the_transaction_and_changes_nothing() {
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        // One unit short of the fee above the existential deposit.
+        Balances::set_balance(&pool(), ED + u128::from(BASE_FEE) - 1);
+        refused_by_pool(&tx, 14);
+        assert_noop!(tx.submit(), E::PoolUnderfunded);
+        assert!(!Nullifiers::<Test>::contains_key(tx.nullifiers[0]));
+        assert_eq!(NextIndex::<Test>::get(), 4);
+        // Exactly enough: accepted, and the existential deposit is left.
+        Balances::set_balance(&pool(), ED + u128::from(BASE_FEE));
+        assert_ok!(tx.submit());
+        assert_eq!(balance(&pool()), ED);
+    });
+}
+
+#[test]
+fn the_dispatch_rechecks_the_reserve() {
+    // Authorized while funded; the reserve then drains before inclusion.
+    let tx = transfer();
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ok!(tx.authorize(TransactionSource::External));
+        Balances::set_balance(&pool(), ED);
+        let authorized = RuntimeOrigin::from(polkadot_sdk::frame_system::Origin::<Test>::Authorized);
+        assert_noop!(
+            Shielded::submit_shielded(
+                authorized,
+                tx.root,
+                tx.nullifiers,
+                tx.commitments,
+                tx.admission,
+                tx.not_before,
+                tx.not_after,
+                tx.coin,
+                tx.bounded_note(),
+                tx.proof,
+                0,
+            ),
+            E::PoolUnderfunded
+        );
+    });
+}
+
+const SHIELD_AMOUNT: u64 = 50_000;
+
+fn shield_owner() -> Fr {
+    circuit::authority(fixtures::f("shielder"))
+}
+
+fn shield_blinding() -> Fr {
+    fixtures::f("shield/blinding")
+}
+
+#[test]
+fn shield_moves_balance_in_and_the_note_is_spendable_with_a_real_proof() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        // Off the grid, so the leaf's time is the window's start.
+        set_time(fixtures::NOT_BEFORE + 17);
+        let (issuance, pool_before) = (Balances::total_issuance(), balance(&pool()));
+        assert_ok!(Shielded::shield(
+            RuntimeOrigin::signed(ALICE),
+            fr_bytes(&shield_owner()),
+            SHIELD_AMOUNT,
+            fr_bytes(&shield_blinding()),
+        ));
+        assert_eq!(balance(&ALICE), ALICE_FUNDS - u128::from(SHIELD_AMOUNT));
+        assert_eq!(balance(&pool()), pool_before + u128::from(SHIELD_AMOUNT));
+        assert_eq!(Balances::total_issuance(), issuance, "a shield mints and burns nothing");
+
+        let shielded = circuit::Note::ordinary(SHIELD_AMOUNT, shield_owner(), shield_blinding());
+        let mut tree = circuit_tree(Case::Transfer);
+        tree.append(circuit::leaf(shielded.commitment(), fixtures::NOT_BEFORE.into())).unwrap();
+        let root = fr_bytes(&tree.root());
+        assert_eq!(CurrentRoot::<Test>::get(), root);
+        assert!(AcceptedRoots::<Test>::contains_key(root));
+        assert_eq!(NextIndex::<Test>::get(), 5);
+        assert_eq!(
+            System::events().last().unwrap().event,
+            RuntimeEvent::Shielded(Event::Shielded {
+                who: ALICE,
+                amount: SHIELD_AMOUNT,
+                commitment: fr_bytes(&shielded.commitment()),
+                leaf_index: 4,
+                window_start: fixtures::NOT_BEFORE,
+                new_root: root,
+            })
+        );
+
+        // Spend it: the circuit's own Merkle path for leaf 4.
+        let n = note(0x31);
+        let mut built = fixtures::build_for_chain(Case::Transfer, CHAIN_ID, TX_VERSION, fixtures::NOT_BEFORE, WINDOW, &n);
+        let w = &mut built.circuit.witness;
+        w.inputs[0] =
+            circuit::InputWitness::real(&tree, shielded, fixtures::NOT_BEFORE, 4, fixtures::f("shielder"));
+        w.inputs[1] = circuit::InputWitness::dummy(fixtures::f("shield-dummy"));
+        w.outputs = [
+            circuit::Note::ordinary(SHIELD_AMOUNT - BASE_FEE - 10_000, circuit::authority(fixtures::f("payee")), fixtures::f("s0")),
+            circuit::Note::ordinary(10_000, shield_owner(), fixtures::f("s1")),
+            circuit::Note::retired(0, fixtures::f("s2")),
+        ];
+        built.circuit.public.root = tree.root();
+        built.reseal();
+        let spend = from_built(&built, n);
+        let (issuance, pool_before, reward_before) = (Balances::total_issuance(), balance(&pool()), balance(&reward()));
+        assert_ok!(spend.submit());
+        assert_eq!(Balances::total_issuance(), issuance - 300);
+        assert_eq!(balance(&reward()), reward_before + 700);
+        assert_eq!(balance(&pool()), pool_before - u128::from(BASE_FEE));
+        assert_eq!(NextIndex::<Test>::get(), 8);
+        // The spend's leaves went on top of the frontier the shield saved.
+        for c in built.circuit.public.commitments {
+            tree.append(circuit::leaf(c, fixtures::NOT_BEFORE.into())).unwrap();
+        }
+        assert_eq!(CurrentRoot::<Test>::get(), fr_bytes(&tree.root()));
+    });
+}
+
+#[test]
+fn the_shielded_leaf_commits_to_the_amount_paid() {
+    // A note claiming more than was paid is not the leaf the chain inserted.
+    new_test_ext(Case::Transfer).execute_with(|| {
+        assert_ok!(Shielded::shield(RuntimeOrigin::signed(ALICE), fr_bytes(&shield_owner()), 1, fr_bytes(&shield_blinding())));
+        let window = fixtures::NOT_BEFORE;
+        let honest = circuit::leaf(circuit::Note::ordinary(1, shield_owner(), shield_blinding()).commitment(), window.into());
+        let inflated =
+            circuit::leaf(circuit::Note::ordinary(1_000_000, shield_owner(), shield_blinding()).commitment(), window.into());
+        let with = |leaf| {
+            let mut tree = circuit_tree(Case::Transfer);
+            tree.append(leaf).unwrap();
+            fr_bytes(&tree.root())
+        };
+        assert_eq!(CurrentRoot::<Test>::get(), with(honest));
+        assert!(!AcceptedRoots::<Test>::contains_key(with(inflated)));
+    });
+}
+
+#[test]
+fn shield_refusals_change_nothing() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let (owner, blinding) = (fr_bytes(&shield_owner()), fr_bytes(&shield_blinding()));
+        let shield = |o: Bytes32, amount: u64, b: Bytes32| Shielded::shield(RuntimeOrigin::signed(ALICE), o, amount, b);
+        assert_noop!(shield(owner, 0, blinding), E::ZeroAmount);
+        // The modulus itself: the smallest non-canonical encoding.
+        let modulus: Bytes32 = Fr::MODULUS.to_bytes_le().try_into().unwrap();
+        assert_noop!(shield(modulus, SHIELD_AMOUNT, blinding), E::NonCanonicalField);
+        assert_noop!(shield(owner, SHIELD_AMOUNT, modulus), E::NonCanonicalField);
+        assert_noop!(shield([0xFF; 32], SHIELD_AMOUNT, blinding), E::NonCanonicalField);
+        // More than the caller can pay while keeping the existential deposit.
+        let all = u64::try_from(ALICE_FUNDS).unwrap();
+        assert!(shield(owner, all, blinding).is_err());
+        assert_eq!(balance(&ALICE), ALICE_FUNDS);
+        assert_noop!(
+            Shielded::shield(RuntimeOrigin::signed(42), owner, SHIELD_AMOUNT, blinding),
+            frame::deps::sp_runtime::TokenError::FundsUnavailable
+        );
+        assert_noop!(Shielded::shield(RuntimeOrigin::none(), owner, SHIELD_AMOUNT, blinding), DispatchError::BadOrigin);
+        NextIndex::<Test>::put(1u64 << TREE_DEPTH);
+        assert_noop!(shield(owner, SHIELD_AMOUNT, blinding), E::TreeFull);
+        NextIndex::<Test>::put((1u64 << TREE_DEPTH) - 1);
+        assert_ok!(shield(owner, SHIELD_AMOUNT, blinding));
+    });
+}
+
+#[test]
+fn the_largest_shield_keeps_the_existential_deposit() {
+    new_test_ext(Case::Transfer).execute_with(|| {
+        let most = u64::try_from(ALICE_FUNDS - ED).unwrap();
+        let (owner, blinding) = (fr_bytes(&shield_owner()), fr_bytes(&shield_blinding()));
+        assert!(Shielded::shield(RuntimeOrigin::signed(ALICE), owner, most + 1, blinding).is_err());
+        assert_ok!(Shielded::shield(RuntimeOrigin::signed(ALICE), owner, most, blinding));
+        assert_eq!(balance(&ALICE), ED);
+    });
+}
+
+#[test]
+fn shield_charges_its_weight_and_a_fee() {
+    use frame::deps::frame_support::dispatch::Pays;
+    let call = Call::<Test>::shield { authority: [0; 32], amount: 1, blinding: [0; 32] };
+    let info = call.get_dispatch_info();
+    assert_eq!(info.call_weight, <() as crate::WeightInfo>::shield());
+    assert_eq!(info.pays_fee, Pays::Yes);
+    // The measured cost with its margin (weights.rs).
+    assert!(info.call_weight.ref_time() >= 160 * 1_000_000_000);
 }

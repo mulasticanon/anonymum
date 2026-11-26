@@ -71,6 +71,8 @@ pub mod genesis_config_presets {
 			anonymum_shielded: AnonymumShieldedConfig {
 				dev_verifying_key: include_bytes!("../dev_shielded_vk.bin").to_vec(),
 				base_fee: SHIELDED_BASE_FEE,
+				// Minted into the shielded pool account, which backs the leaves.
+				initial_supply: SHIELDED_GENESIS_SUPPLY,
 				initial_leaves: include_bytes!("../dev_shielded_leaves.bin")
 					.chunks_exact(32)
 					.map(|leaf| <[u8; 32]>::try_from(leaf).expect("chunks are 32 bytes; qed"))
@@ -120,7 +122,10 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	// 8: adds pallet-anonymum-shielded (unreviewed prototype, dev key only).
 	// 9: shielded transactions are general transactions authorized through
 	// `AuthorizeCall`; the bare (unsigned) form is no longer accepted.
-	spec_version: 11,
+	// 10: proof of work before the pairing. 11: benchmarked weights.
+	// 12: shielded value backed by `Balances` (pool and reward accounts,
+	// fees burned for real) and the signed `shield` call.
+	spec_version: 12,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -287,10 +292,17 @@ impl pallet_anonymum::Config for Runtime {
 }
 
 /// The dev chain's shielded base fee `F`, in base units (matches the
-/// circuit fixtures). Shielded value is not connected to `Balances`.
+/// circuit fixtures).
 pub const SHIELDED_BASE_FEE: u64 = 1_000;
 
+/// The value of the dev genesis notes (`dev_shielded_leaves.bin`, the
+/// circuit fixtures' Transfer world): funding 1,000,000 + escrow 10,101 and
+/// reserve 2,000 + top-up 900. `fixtures::world_value(Case::Transfer)`.
+pub const SHIELDED_GENESIS_SUPPLY: u64 = 1_013_001;
+
 parameter_types! {
+	pub const ShieldedPoolId: frame_support::PalletId = frame_support::PalletId(*b"anm/shld");
+	pub const ShieldedRewardId: frame_support::PalletId = frame_support::PalletId(*b"anm/rewd");
 	pub const ShieldedBurnShare: sp_runtime::Percent = sp_runtime::Percent::from_percent(50);
 }
 
@@ -305,6 +317,9 @@ impl pallet_anonymum_shielded::BenchmarkHelper for ShieldedBenchmarkTime {
 }
 
 impl pallet_anonymum_shielded::Config for Runtime {
+	type Currency = Balances;
+	type ShieldedPoolId = ShieldedPoolId;
+	type RewardPoolId = ShieldedRewardId;
 	type TimeProvider = Timestamp;
 	type ChainId = ConstU32<4242>;
 	type TxVersion = ConstU32<1>;

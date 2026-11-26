@@ -70,6 +70,13 @@ impl Poseidon {
         self.hash("leaf", &[commitment, Fr::from(created_at)])
     }
 
+    /// The commitment of an ordinary note, `H("commit", 0, value, 0, owner,
+    /// 0, 0, 0, blinding)`: the circuit's `Note::ordinary(..).commitment()`.
+    pub fn ordinary_commitment(&self, value: u64, owner: Fr, blinding: Fr) -> Fr {
+        let z = Fr::from(0u64);
+        self.hash("commit", &[z, Fr::from(value), z, owner, z, z, z, blinding])
+    }
+
     pub fn node(&self, level: usize, left: Fr, right: Fr) -> Fr {
         self.hash(&format!("merkle/{level}"), &[left, right])
     }

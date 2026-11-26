@@ -4,6 +4,9 @@
 //!   dev_tool genesis <vk-file> <leaves>  write the dev verifying key and leaves
 //!   dev_tool tx <chain> <version> <now> <window> [pow-bits]  prove a Transfer
 //!                                        and solve its proof of work, print JSON
+//!   dev_tool shield-note                 the smoke script's shield arguments, JSON
+//!   dev_tool shield-tx <chain> <version> <now> <window> <pow-bits> <amount> <created-at>
+//!                                        spend the smoke script's shielded note
 //!   dev_tool bench-fixture <chain> <version> <now> <window> <pow-bits> <dir>
 //!                                        one proved Transfer for the pallet benchmarks
 //!   dev_tool pow-bench <bits> <samples>  time the proof of work
@@ -34,6 +37,38 @@ fn limbs(x: &Fr) -> String {
     format!("[{:#018x}, {:#018x}, {:#018x}, {:#018x}]", l[0], l[1], l[2], l[3])
 }
 
+/// Prove `built`, solve its proof of work at `bits`, and print it as JSON
+/// for the smoke script, with `extra` fields appended.
+fn print_tx(built: &Built, note: &[u8], bits: u32, extra: &str) {
+    let (pk, vk) = dev_keys();
+    let raw = prove(&pk, built.circuit.clone(), &mut OsRng).unwrap();
+    let proof = encode_proof(&raw);
+    // The same statement with different proof bytes, to test replay.
+    let again = encode_proof(&Groth16::<Bls12_381>::rerandomize_proof(&vk, &raw, &mut OsRng));
+    // Well-formed points that the pairing refuses.
+    let mut negated = raw.clone();
+    negated.a = -negated.a;
+    let wrong = encode_proof(&negated);
+    let p = built.circuit.public;
+    let word = |x: &Fr| -> [u8; 32] { bytes(x).try_into().unwrap() };
+    let (sighash, root) = (word(&p.sighash), word(&p.root));
+    let spent = [word(&p.nullifiers[0]), word(&p.nullifiers[1])];
+    let solve = |proof: &[u8]| solve_pow(&sighash, &root, &spent, proof.try_into().unwrap(), bits);
+    let started = std::time::Instant::now();
+    let pow_nonce = solve(&proof);
+    let pow_micros = started.elapsed().as_micros();
+    let (again_nonce, wrong_nonce) = (solve(&again), solve(&wrong));
+    let list = |xs: &[Fr]| xs.iter().map(|x| hex(&bytes(x))).collect::<Vec<_>>().join(",");
+    let int = |x: Fr| x.into_bigint().0[0];
+    println!(
+        "{{\"root\":{},\"nullifiers\":[{}],\"commitments\":[{}],\"admission\":{},\"notBefore\":{},\"notAfter\":{},\"coin\":[{},{}],\"note\":{},\"proof\":{},\"rerandomised\":{},\"wrongProof\":{},\"powBits\":{},\"powNonce\":\"{}\",\"rerandomisedPowNonce\":\"{}\",\"wrongProofPowNonce\":\"{}\",\"powMicros\":{}{}}}",
+        hex(&bytes(&p.root)), list(&p.nullifiers), list(&p.commitments), hex(&bytes(&p.admission)),
+        int(p.not_before), int(p.not_after),
+        hex(&built.envelope.coin_slots[0]), hex(&built.envelope.coin_slots[1]), hex(note), hex(&proof), hex(&again),
+        hex(&wrong), bits, pow_nonce, again_nonce, wrong_nonce, pow_micros, extra
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -58,6 +93,8 @@ fn main() {
             std::fs::write(&args[1], bytes(&vk)).unwrap();
             let leaves: Vec<u8> = world_leaves(Case::Transfer).iter().flat_map(bytes).collect();
             std::fs::write(&args[2], leaves).unwrap();
+            // The runtime's SHIELDED_GENESIS_SUPPLY must equal this.
+            println!("genesis supply {}", world_value(Case::Transfer));
         }
         Some("tx") => {
             let n = |i: usize| args[i].parse::<u64>().unwrap();
@@ -65,33 +102,46 @@ fn main() {
             let mut note = vec![0u8; 1795];
             OsRng.fill_bytes(&mut note);
             let built = build_for_chain(Case::Transfer, n(1) as u32, n(2) as u32, not_before, n(4), &note);
-            let (pk, vk) = dev_keys();
-            let raw = prove(&pk, built.circuit.clone(), &mut OsRng).unwrap();
-            let proof = encode_proof(&raw);
-            // The same statement with different proof bytes, to test replay.
-            let again = encode_proof(&Groth16::<Bls12_381>::rerandomize_proof(&vk, &raw, &mut OsRng));
-            // Well-formed points that the pairing refuses.
-            let mut negated = raw.clone();
-            negated.a = -negated.a;
-            let wrong = encode_proof(&negated);
-            let p = built.circuit.public;
-            let bits = args.get(5).map_or(16, |b| b.parse::<u32>().unwrap());
-            let word = |x: &Fr| -> [u8; 32] { bytes(x).try_into().unwrap() };
-            let (sighash, root) = (word(&p.sighash), word(&p.root));
-            let spent = [word(&p.nullifiers[0]), word(&p.nullifiers[1])];
-            let solve = |proof: &[u8]| solve_pow(&sighash, &root, &spent, proof.try_into().unwrap(), bits);
-            let started = std::time::Instant::now();
-            let pow_nonce = solve(&proof);
-            let pow_micros = started.elapsed().as_micros();
-            let (again_nonce, wrong_nonce) = (solve(&again), solve(&wrong));
-            let list = |xs: &[Fr]| xs.iter().map(|x| hex(&bytes(x))).collect::<Vec<_>>().join(",");
-            println!(
-                "{{\"root\":{},\"nullifiers\":[{}],\"commitments\":[{}],\"admission\":{},\"notBefore\":{},\"notAfter\":{},\"coin\":[{},{}],\"note\":{},\"proof\":{},\"rerandomised\":{},\"wrongProof\":{},\"powBits\":{},\"powNonce\":\"{}\",\"rerandomisedPowNonce\":\"{}\",\"wrongProofPowNonce\":\"{}\",\"powMicros\":{}}}",
-                hex(&bytes(&p.root)), list(&p.nullifiers), list(&p.commitments), hex(&bytes(&p.admission)),
-                not_before, not_before + n(4),
-                hex(&built.envelope.coin_slots[0]), hex(&built.envelope.coin_slots[1]), hex(&note), hex(&proof), hex(&again),
-                hex(&wrong), bits, pow_nonce, again_nonce, wrong_nonce, pow_micros
+            print_tx(&built, &note, args.get(5).map_or(16, |b| b.parse::<u32>().unwrap()), "");
+        }
+        Some("shield-note") => {
+            // The owner and blinding the smoke script shields with.
+            let (secret, blinding) = (f("smoke-shielder"), f("smoke-shield/blinding"));
+            println!("{{\"authority\":{},\"blinding\":{}}}", hex(&bytes(&authority(secret))), hex(&bytes(&blinding)));
+        }
+        Some("shield-tx") => {
+            // Spend the note `shield` inserted at position 4 (right after the
+            // genesis leaves) with leaf time `created_at`.
+            let n = |i: usize| args[i].parse::<u64>().unwrap();
+            let (window, amount, created_at) = (n(4), n(6), n(7));
+            let not_before = n(3) - n(3) % window;
+            let (secret, blinding) = (f("smoke-shielder"), f("smoke-shield/blinding"));
+            let shielded = Note::ordinary(amount, authority(secret), blinding);
+            let mut tree = MerkleTree::new();
+            for l in world_leaves(Case::Transfer) {
+                tree.append(l).unwrap();
+            }
+            tree.append(leaf(shielded.commitment(), created_at.into())).unwrap();
+            let mut note = vec![0u8; 1795];
+            OsRng.fill_bytes(&mut note);
+            let mut built = build_for_chain(Case::Transfer, n(1) as u32, n(2) as u32, not_before, window, &note);
+            let w = &mut built.circuit.witness;
+            w.inputs[0] = InputWitness::real(&tree, shielded, created_at, 4, secret);
+            w.inputs[1] = InputWitness::dummy(f("smoke-shield/dummy"));
+            w.outputs = [
+                Note::ordinary(amount - BASE_FEE, authority(f("smoke-payee")), f("smoke-shield/out0")),
+                Note::retired(0, f("smoke-shield/out1")),
+                Note::retired(0, f("smoke-shield/out2")),
+            ];
+            built.circuit.public.root = tree.root();
+            built.reseal();
+            let extra = format!(
+                ",\"authority\":{},\"blinding\":{},\"shieldCommitment\":{}",
+                hex(&bytes(&authority(secret))),
+                hex(&bytes(&blinding)),
+                hex(&bytes(&shielded.commitment()))
             );
+            print_tx(&built, &note, n(5) as u32, &extra);
         }
         Some("bench-fixture") => {
             // One real Transfer for the pallet's benchmarks, as raw bytes:
@@ -155,6 +205,6 @@ fn main() {
                 tries / samples as u128
             );
         }
-        _ => eprintln!("usage: dev_tool poseidon | genesis <vk> <leaves> | tx <chain> <version> <now> <window> [pow-bits] | pow-bench <bits> <samples>"),
+        _ => eprintln!("usage: dev_tool poseidon | genesis <vk> <leaves> | tx <chain> <version> <now> <window> [pow-bits] | shield-tx <chain> <version> <now> <window> <pow-bits> <amount> <created-at> | bench-fixture ... | pow-bench <bits> <samples>"),
     }
 }
