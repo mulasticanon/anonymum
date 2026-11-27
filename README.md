@@ -551,3 +551,18 @@ Not solved, and each blocks any public network:
 6. Double ratchet (prototyped 2026-11-21, unreviewed) and post-quantum key
    exchange.
 7. Node staking, reward payout, fee simulation, external audit.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in this work, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.
+
+The license grants no warranty. Nothing here is audited; see the status
+tables above before relying on any of it.

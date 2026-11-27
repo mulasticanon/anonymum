@@ -3,7 +3,7 @@ name = "anonymum-shielded-circuit"
 version = "0.1.0"
 edition = "2021"
 description = "UNREVIEWED PROTOTYPE: Groth16 / BLS12-381 circuit for the shielded rules in docs/shielded-spec-v0.md. Not audited. Not for real value."
-license = "MIT OR Apache-2.0"
+license.workspace = true
 publish = false
 
 # The 0.4 line is the arkworks version already pinned in the workspace

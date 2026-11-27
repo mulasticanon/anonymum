@@ -3,7 +3,7 @@ name = "anonymum-shielded-model"
 version = "0.1.0"
 edition = "2021"
 description = "Plain-Rust reference model of the shielded-money rules in docs/shielded-spec-v0.md. For review only: not private, not secure, no proofs."
-license = "MIT OR Apache-2.0"
+license.workspace = true
 publish = false
 
 [dependencies]

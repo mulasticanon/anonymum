@@ -3,7 +3,7 @@ name = "anonymum-nym"
 version = "0.1.0"
 edition = "2021"
 description = "Anonymum over the Nym mixnet: encrypted chat between two wallets"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [dependencies]
 anonymum-core = { path = "../core" }

@@ -5,6 +5,7 @@
 resolver = "2"
 members = ["pallets/anonymum", "pallets/anonymum-shielded", "runtime"]
 
+# Dual-licensed; the texts are LICENSE-MIT and LICENSE-APACHE at the repo root.
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"

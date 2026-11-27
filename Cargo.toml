@@ -6,6 +6,10 @@ exclude = ["substrate"]
 # The Nym crate pulls in several hundred dependencies; keep everyday builds fast.
 default-members = ["crates/core", "crates/crypto", "crates/shielded-model", "crates/shielded-circuit"]
 
+# Dual-licensed; the texts are LICENSE-MIT and LICENSE-APACHE at the root.
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 # Proving is unusably slow unoptimised. These overrides only change how the
 # arkworks crates and the circuit crate are compiled in dev and test builds.
 [profile.dev.package.ark-ff]
